@@ -92,6 +92,8 @@ export function installTestHook(
       const shown = latticePreviewOf(app).getSnapshot();
       return { triangles: (shown?.walls.indices.length ?? 0) / 3, opacity: material?.opacity ?? null };
     },
+    /** The status bar's notice that an action cannot be undone (#281), or null. */
+    historyNotice: () => app.getSnapshot().historyNotice?.text ?? null,
     /** What the mesh's list picture cost, and how many were started and finished. */
     meshPreview: (name: string) => meshPreviewStats(find(name).mesh),
     /** Draws the mesh's list picture again now, as an edit would after its quiet time. */

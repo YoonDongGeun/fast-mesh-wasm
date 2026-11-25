@@ -1214,8 +1214,18 @@ enum Op {
     Undo,
     Redo,
     Clear,
+    Budget(usize),
     Take { second: bool },
     Flush,
+}
+
+/// Budgets of a few steps, of some meshes, and without a limit.
+fn budget() -> impl Strategy<Value = usize> {
+    prop_oneof![
+        3 => Just(usize::MAX),
+        1 => 200usize..6000,
+        3 => 6000usize..200_000,
+    ]
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -1239,6 +1249,7 @@ fn op() -> impl Strategy<Value = Op> {
         9 => Just(Op::Undo),
         7 => Just(Op::Redo),
         1 => Just(Op::Clear),
+        2 => budget().prop_map(Op::Budget),
         4 => any::<bool>().prop_map(|second| Op::Take { second }),
         3 => Just(Op::Flush),
     ]
@@ -1474,6 +1485,8 @@ struct Run {
     ids: BTreeSet<MeshId>,
     fields: Vec<(FieldId, MeshId)>,
     budget: usize,
+    /// The budget has had no limit so far: no step was evicted.
+    unlimited: bool,
 }
 
 impl Run {
@@ -1675,6 +1688,12 @@ impl Run {
                 self.scene.clear_history().unwrap();
                 self.model = Model::default();
             }
+            Op::Budget(bytes) => {
+                self.scene.set_history_budget(bytes).unwrap();
+                self.budget = bytes;
+                self.unlimited &= bytes == usize::MAX;
+                assert_eq!(self.scene.history_budget(), bytes);
+            }
             Op::Take { second } => {
                 let s = second.then_some(self.second);
                 self.mirrors[usize::from(second)].take(&mut self.scene, s);
@@ -1711,7 +1730,7 @@ impl Run {
         // Evicted: the oldest steps go first, on both stacks.
         let (undo, redo) = (self.scene.history.undo_len(), self.scene.history.redo_len());
         assert!(undo <= self.model.undo.len() && redo <= self.model.redo.len());
-        if self.budget == usize::MAX {
+        if self.unlimited {
             assert_eq!((undo, redo), (self.model.undo.len(), self.model.redo.len()));
         }
         self.model.undo.drain(..self.model.undo.len() - undo);
@@ -1748,11 +1767,7 @@ proptest! {
     #[test]
     fn random_sequences_match_the_model(
         ops in prop::collection::vec(op(), 1..70),
-        budget in prop_oneof![
-            3 => Just(usize::MAX),
-            1 => 200usize..6000,
-            3 => 6000usize..200_000,
-        ],
+        budget in budget(),
     ) {
         let mut scene = Scene::new(SceneOptions { history_budget: budget });
         let second = scene.subscribe();
@@ -1765,6 +1780,7 @@ proptest! {
             ids: BTreeSet::new(),
             fields: Vec::new(),
             budget,
+            unlimited: budget == usize::MAX,
         };
         for op in &ops {
             run.apply(op);

@@ -6,6 +6,7 @@
 // a microtask while no frame loop runs), the last value per frame winning.
 import type { Indices, PlacementInput, Positions64, Vec3 } from "../api.js";
 import { FastMeshError, reportListenerError } from "../core.js";
+import type { PermanentListener } from "../history.js";
 import type {
   ColorRule,
   DragSession,
@@ -265,6 +266,16 @@ function sameKeys(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((k, i) => k === b[i]);
 }
 
+/** Options of {@link createSceneStore}. */
+export interface SceneStoreOptions {
+  /**
+   * The most bytes the scene's undo history may hold, set on the scene as by
+   * {@link SceneStore.setHistoryBudget}. The scene's own by default (256 MiB
+   * unless it was given another).
+   */
+  historyBudget?: number;
+}
+
 /**
  * An observable store over a scene. Read with {@link getSnapshot} and
  * {@link subscribe}; change through its actions. Call {@link commitFrame}
@@ -337,10 +348,13 @@ export class SceneStore {
   #flushQueued = false;
   #disposed = false;
 
-  constructor(scene: Scene | WorkerScene) {
+  constructor(scene: Scene | WorkerScene, options: SceneStoreOptions = {}) {
     this.#host = hostOf(scene);
     this.scene = this.#host.scene;
     this.mode = this.#host.mode;
+    if (options.historyBudget !== undefined) {
+      this.#host.setHistoryBudget(options.historyBudget);
+    }
     // Scene events in one task make one snapshot, on a microtask; reading
     // the snapshot before then refreshes it (see `getSnapshot`).
     const event = (): void => {
@@ -471,7 +485,8 @@ export class SceneStore {
    * puts it back into the sections that cut it, and colours again the meshes
    * that were coloured by distance to it (unless their colouring was changed
    * since). It does not rejoin its contact groups: set them again with
-   * {@link setContactGroup}.
+   * {@link setContactGroup}. A removal larger than {@link historyBudget} is
+   * permanent: {@link onPermanent} tells.
    */
   removeMesh(mesh: MeshHandle, options?: RemoveMeshOptions): void {
     this.#alive();
@@ -948,6 +963,44 @@ export class SceneStore {
     this.#host.cancelStep();
     this.#followHistory();
     this.#update();
+  }
+
+  /** The most bytes the undo history may hold: 256 MiB unless it was set. */
+  get historyBudget(): number {
+    return this.#host.historyBudget();
+  }
+
+  /**
+   * Changes the most bytes the undo history may hold. A smaller budget is met
+   * at once, the oldest steps first; a mesh only a dropped step could bring
+   * back is gone for good.
+   *
+   * @throws `INVALID_ARGUMENT` for anything but a number, 0 or more.
+   */
+  setHistoryBudget(bytes: number): void {
+    this.#alive();
+    this.#host.setHistoryBudget(bytes);
+    this.#followHistory();
+    this.#update();
+  }
+
+  /**
+   * Registers a listener called with each step the history could not keep,
+   * since it is larger than the whole budget: an action that is permanent, or
+   * one just undone that cannot be redone; see the scene's `onPermanent`.
+   * Returns the function that removes it.
+   *
+   * @example
+   * ```ts
+   * store.onPermanent(({ lost, gone }) => {
+   *   if (lost === "undo" && gone.includes(mesh)) {
+   *     notify("Removed for good: it is larger than the undo memory.");
+   *   }
+   * });
+   * ```
+   */
+  onPermanent(listener: PermanentListener): () => void {
+    return this.#host.onPermanent(listener);
   }
 
   // ---- Display ----
@@ -1945,8 +1998,8 @@ export class SceneStore {
 }
 
 /** A store over `scene` (a `Scene` or a `WorkerScene`). */
-export function createSceneStore(scene: Scene | WorkerScene): SceneStore {
-  return new SceneStore(scene);
+export function createSceneStore(scene: Scene | WorkerScene, options?: SceneStoreOptions): SceneStore {
+  return new SceneStore(scene, options);
 }
 
 /** Test-only, not exported from `fast-mesh-wasm/store`: the number of subscribed listeners. */

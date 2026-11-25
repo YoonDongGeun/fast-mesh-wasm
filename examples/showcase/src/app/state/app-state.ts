@@ -4,7 +4,7 @@
 // external store, so the loader (outside React) and the components share it;
 // read it with `useApp`.
 import type { Analysis, DyntopoMode, MeshHandle, SectionHandle, SectionPlane } from "fast-mesh-wasm";
-import type { SceneStore } from "fast-mesh-wasm/store";
+import type { PermanentStep, SceneStore } from "fast-mesh-wasm/store";
 import { useSyncExternalStore } from "react";
 import * as THREE from "three";
 import type { Vec3 } from "../../io/mesh-data";
@@ -35,6 +35,7 @@ import {
 } from "../../shared/ux/settings";
 import { meshOrigin } from "../../shared/ux/mesh-center";
 import { type ImportScale, type LengthUnit, NO_IMPORT_SCALE } from "../../shared/ux/units";
+import { describePermanent } from "../ux/history-notice";
 import { createDefaultWave6State, type Wave6State } from "./wave6-state";
 import { DEFAULT_PLACEMENT_TOOL, type PlacementToolState } from "../../features/transform/ux/placement-picks";
 import { type AlignToolState, DEFAULT_ALIGN_TOOL } from "../../features/transform/ux/align-state";
@@ -418,6 +419,8 @@ export interface AppSnapshot {
   polylines: readonly Polyline[];
   /** The selected polylines' ids, in click order: what the polyline tools work on (#268). */
   polylineSelection: readonly number[];
+  /** The latest action that cannot be undone (or redone), in words, until it is dismissed (#281). */
+  historyNotice: { readonly text: string } | null;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -510,6 +513,7 @@ export class AppState {
     buildPlate: DEFAULT_BUILD_PLATE,
     polylines: [],
     polylineSelection: [],
+    historyNotice: null,
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -578,12 +582,30 @@ export class AppState {
    * Keeps the list in step with the store as undoable adds and removals are
    * undone and redone: a mesh that left the scene leaves the list, and one
    * that is back is listed again as the item it was (name, colour, material,
-   * place, groups, and the selection when nothing else is selected). Returns
-   * the function that stops it.
+   * place, groups, and the selection when nothing else is selected). It also
+   * notes the actions that cannot be undone. Returns the function that stops
+   * it.
    */
   follow(store: SceneStore): () => void {
     this.syncMeshes(store);
-    return store.subscribe(() => this.syncMeshes(store));
+    const stop = [
+      store.subscribe(() => this.syncMeshes(store)),
+      store.onPermanent((step) => this.#notePermanent(store, step)),
+    ];
+    return () => stop.forEach((f) => f());
+  }
+
+  /** Says that a step cannot be undone, or redone (#281). */
+  #notePermanent(store: SceneStore, step: PermanentStep): void {
+    // Still listed, or just off the list: told before the list follows.
+    const nameOf = (mesh: MeshHandle) =>
+      (this.#snap.items.find((i) => i.mesh === mesh) ?? this.#parked.get(mesh)?.item)?.name;
+    this.#set({ historyNotice: { text: describePermanent(step, nameOf, store.historyBudget) } });
+  }
+
+  /** Sets the notice of an action that cannot be undone; `null` dismisses it (#281). */
+  setHistoryNotice(text: string | null): void {
+    this.#set({ historyNotice: text === null ? null : { text } });
   }
 
   /** {@link AppState.follow}, once. */

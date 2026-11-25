@@ -55,7 +55,8 @@
 //!   [`Scene::begin_step`] / [`Scene::end_step`] group edits and placement
 //!   changes (otherwise each is its own step); [`Scene::undo`],
 //!   [`Scene::redo`] and [`Scene::cancel_step`] are all-or-nothing per step.
-//!   [`SceneOptions::history_budget`] evicts the oldest steps.
+//!   [`SceneOptions::history_budget`] evicts the oldest steps;
+//!   [`Scene::take_permanent`] reports the steps larger than it.
 //! - BVH state: each mesh's [`UpdateMode`] says when its BVH follows the
 //!   mesh; [`Scene::set_mode`], [`Scene::update`], [`Scene::flush`] and
 //!   [`Scene::is_current`].
@@ -127,6 +128,8 @@ mod fields;
 mod geodesic;
 mod height_map;
 mod history;
+#[cfg(test)]
+mod history_tests;
 mod hull;
 mod id;
 mod join;
@@ -174,6 +177,7 @@ pub use fields::{
 };
 pub use geodesic::GeodesicJob;
 pub use height_map::{HeightMapFrame, HeightMapOptions, HeightfieldReport, MAX_HEIGHT_MAP_PIXELS};
+pub use history::{HistorySide, PermanentStep};
 pub use hull::ConvexHullReport;
 pub use id::MeshId;
 pub use join::{JoinOptions, JoinReport};

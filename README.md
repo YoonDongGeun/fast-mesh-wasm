@@ -217,6 +217,14 @@ scene.redo(); // and back
 scene.removeMesh(copy, { undoable: true });
 scene.undo();
 
+// The history holds at most 256 MiB, or what you say here (or pass to
+// `new Scene({ historyBudget })`); past it the oldest steps go. An action
+// larger than all of it, like the removal of a huge mesh, is permanent.
+scene.setHistoryBudget(1024 ** 3);
+scene.onPermanent(({ lost, gone }) => {
+  if (lost === "undo") console.log("cannot be undone", gone);
+});
+
 // Queries are in world space.
 const hit = scene.raycast([0, 0, 50], [0, 0, -1]); // nearest hit over all meshes, or null
 const closest = scene.meshDistance(upper, lower); // { distance, a, b, ... }
@@ -545,7 +553,7 @@ export function App() {
 }
 ```
 
-**The store.** `store.getSnapshot()` returns a frozen `SceneSnapshot` (meshes, sections, history, selection and an overall status), replaced on every change, with unchanged parts shared between versions. `store.subscribe(listener)` notifies after each new snapshot: at once for an action, and once per task for the scene's events (on a microtask; `getSnapshot()` is up to date before then). An update re-derives only the meshes and sections it touches. What still grows with the scene is one copy of the snapshot's mesh map per change: a native `Map` copy, about 45 µs at 1500 meshes. The snapshot follows undoable adds and removals: an undone add leaves it, and a mesh that is back has the display and sections it had, with the colourings measured to it applied again (`store.isRestorable(mesh)` tells whether undo or redo can still bring one back). Actions mirror the scene: `addMesh`, `removeMesh`, `setPlacement`, `drag`, `edit`, `repair`, `undo`, `redo`, `addSection`, `removeSection` and `restart` (Worker only). The declarative ones are new:
+**The store.** `store.getSnapshot()` returns a frozen `SceneSnapshot` (meshes, sections, history, selection and an overall status), replaced on every change, with unchanged parts shared between versions. `store.subscribe(listener)` notifies after each new snapshot: at once for an action, and once per task for the scene's events (on a microtask; `getSnapshot()` is up to date before then). An update re-derives only the meshes and sections it touches. What still grows with the scene is one copy of the snapshot's mesh map per change: a native `Map` copy, about 45 µs at 1500 meshes. The snapshot follows undoable adds and removals: an undone add leaves it, and a mesh that is back has the display and sections it had, with the colourings measured to it applied again (`store.isRestorable(mesh)` tells whether undo or redo can still bring one back). Actions mirror the scene: `addMesh`, `removeMesh`, `setPlacement`, `drag`, `edit`, `repair`, `undo`, `redo`, `addSection`, `removeSection` and `restart` (Worker only). `createSceneStore(scene, { historyBudget })` and `store.setHistoryBudget(bytes)` set the history's memory budget, and `store.onPermanent(listener)` tells of an action too large for it. The declarative ones are new:
 
 - `setDisplay(mesh, { coloring?, opacity?, visible? })`. A `coloring` colours the mesh by its distance to `distanceTo`: one mesh, or a list of them (the smallest signed distance over them; see [Contact groups](#contact-groups-fields-to-several-meshes)). The store owns the distance field behind it: one per coloured mesh, named `fast-mesh-store:<n>`, kept while the colouring is off, reused when it comes back with the same `distanceTo` (as a set: the order does not matter), `maxDistance` and `sign`, and replaced only when one of them changes. `opacity` (in [0, 1], default 1) and `visible` (default true) live only in the store; the engine never sees them. Display changes never enter the undo history.
 - `setContactGroup(id, { meshes, pairs?, coloring } | null)` colours a group of meshes by contact. Each member gets `coloring` with its partners as `distanceTo`: the members it is paired with in `pairs` (either way round), or every other member with `pairs: "all"` (the default). `coloring` is a `DistanceColoring` without `distanceTo`, so any preset spreads into it. Moving a member recomputes only its own field and its partners'. Setting the group again updates the members; a member dropped from it, or all of them with `null`, is uncoloured and its store-owned field removed. A member the app has coloured itself since (with `setDisplay`) is left alone by those changes. A removed mesh leaves its groups: the others keep their remaining partners, and a member left with none is uncoloured. The colouring is checked when the group is set (`INVALID_ARGUMENT`). Groups are not in the snapshot: the members' `display` and `desired` colourings show them.

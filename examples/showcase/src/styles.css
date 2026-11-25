@@ -1528,6 +1528,16 @@ input[type="range"] {
   text-overflow: ellipsis;
   color: var(--error);
 }
+.statusbar .history-notice {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.statusbar .history-notice .warn {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .busy,
 .warn {
   color: var(--warn);

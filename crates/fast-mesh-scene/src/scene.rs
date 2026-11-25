@@ -10,7 +10,7 @@ use fast_mesh_store::{
 
 use crate::fields::{ColorState, CurvField, Field, FieldHook, FieldUnit, ThickField};
 use crate::geodesic::GeodesicCache;
-use crate::history::{Change, Done, History};
+use crate::history::{Change, Done, History, PermanentStep};
 use crate::id::SlotMap;
 use crate::normals::{NormalBuild, NormalState};
 use crate::presence::ParkedLinks;
@@ -61,7 +61,12 @@ pub struct MeshOptions {
 /// Options for a [`Scene`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneOptions {
-    /// Most bytes the shared undo history may hold.
+    /// Most bytes the shared undo history may hold, 256 MiB by default. What
+    /// counts are patches of edits, placement changes, and meshes out of the
+    /// scene that undo or redo can bring back. Past it the oldest undo steps
+    /// go; a step larger than the whole budget goes as soon as it closes,
+    /// which makes it permanent ([`Scene::take_permanent`] tells). Change it
+    /// later with [`Scene::set_history_budget`].
     pub history_budget: usize,
 }
 
@@ -878,7 +883,7 @@ pub struct Scene {
 
 // Every public `&mut self` method of `Scene`, in this file and the others,
 // starts by dropping an open field step unit with `drop_field_unit` (the
-// step calls aside), and is listed in the test
+// step calls and `take_permanent` aside), and is listed in the test
 // `fields::tests::mutating_calls_abandon_open_unit`. New ones must do both.
 impl Scene {
     /// An empty scene.
@@ -1233,6 +1238,59 @@ impl Scene {
     /// True if [`Scene::redo`] would redo something.
     pub fn can_redo(&self) -> bool {
         self.history.can_redo()
+    }
+
+    /// The most bytes the history may hold (see
+    /// [`SceneOptions::history_budget`]).
+    pub fn history_budget(&self) -> usize {
+        self.history.budget()
+    }
+
+    /// Changes the most bytes the history may hold. A smaller budget is met
+    /// at once: the oldest undo steps go first, then the redo steps furthest
+    /// from being redone. An open step is kept, and meets the budget when it
+    /// closes. The meshes in the scene are not changed; those out of it that
+    /// a dropped step held are freed.
+    ///
+    /// # Errors
+    /// None at present; the `Result` leaves room for future checks.
+    pub fn set_history_budget(&mut self, bytes: usize) -> Result<()> {
+        self.drop_field_unit();
+        self.history.set_budget(&mut self.entries, bytes);
+        Ok(())
+    }
+
+    /// The bytes the history holds now: its undo and redo steps and the open
+    /// one.
+    pub fn history_bytes(&self) -> u64 {
+        self.history.held()
+    }
+
+    /// About the bytes an undoable removal of the mesh would hold
+    /// ([`Scene::remove_mesh_undoable`]): one larger than
+    /// [`Scene::history_budget`] is permanent.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn removal_bytes(&self, id: MeshId) -> Result<u64> {
+        Ok(self.entry(id)?.byte_size() as u64 + self.links_byte_size(id) as u64)
+    }
+
+    /// Takes the steps the history let go of as they were made, undone or
+    /// redone since the last call, oldest first: they are larger than the
+    /// budget, so the step cannot be undone (or, just undone, not redone).
+    /// Steps dropped later, to make room for others, are not among them, nor
+    /// are those [`Scene::set_history_budget`] and [`Scene::clear_history`]
+    /// drop. At most the latest 256 are kept for this call.
+    // Draining reports changes nothing a field step unit looks at: unlike
+    // the other `&mut self` methods, it leaves the open one alone.
+    pub fn take_permanent(&mut self) -> Vec<PermanentStep> {
+        self.history.take_permanent()
+    }
+
+    /// Whether [`Scene::take_permanent`] would return any.
+    pub fn has_permanent(&self) -> bool {
+        self.history.has_permanent()
     }
 
     /// Closes an open step, then drops every undo and redo step, releasing

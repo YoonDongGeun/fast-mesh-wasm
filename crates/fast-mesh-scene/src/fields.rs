@@ -689,18 +689,21 @@ impl ParkedFields {
     /// Approximate heap memory held, beside the values, which are channels
     /// of the mesh.
     pub(crate) fn byte_size(&self) -> usize {
-        self.fields
-            .iter()
-            .map(|f| {
-                size_of::<Field>()
-                    + f.nearest.capacity() * 4
-                    + f.finite.capacity() * 4
-                    + f.referenced.capacity()
-                    + f.live.stamps.capacity() * 4
-            })
-            .sum::<usize>()
+        self.fields.iter().map(Field::byte_size).sum::<usize>()
             + self.thick.len() * size_of::<ThickField>()
             + self.curv.len() * size_of::<CurvField>()
+    }
+}
+
+impl Field {
+    /// Approximate memory held, beside the values, which are a channel of
+    /// the mesh it is on.
+    fn byte_size(&self) -> usize {
+        size_of::<Field>()
+            + self.nearest.capacity() * 4
+            + self.finite.capacity() * 4
+            + self.referenced.capacity()
+            + self.live.stamps.capacity() * 4
     }
 }
 
@@ -2627,6 +2630,16 @@ impl Scene {
             }
         }
         parked
+    }
+
+    /// [`ParkedFields::byte_size`] of what [`Scene::park_fields_of`] would
+    /// take.
+    pub(crate) fn fields_byte_size(&self, mesh: MeshId) -> usize {
+        let on = |m: MeshId| usize::from(m == mesh);
+        let fields = self.fields.iter().filter(|f| f.desc.on == mesh);
+        fields.map(Field::byte_size).sum::<usize>()
+            + self.thick.iter().map(|t| on(t.desc.on)).sum::<usize>() * size_of::<ThickField>()
+            + self.curv.iter().map(|c| on(c.desc.on)).sum::<usize>() * size_of::<CurvField>()
     }
 
     /// Puts the fields of a restored mesh (`mesh`, live again) back, each at
@@ -7025,7 +7038,7 @@ mod tests {
         type Call = fn(&mut Scene, &Ctx);
         // Every public `&mut self` method of `Scene` but the three step
         // calls.
-        let calls: [(&str, Call); 59] = [
+        let calls: [(&str, Call); 60] = [
             ("add_mesh", |s, _| {
                 s.add_mesh(sheet(1, 1.0), MeshOptions::default()).unwrap();
             }),
@@ -7057,6 +7070,9 @@ mod tests {
                 s.redo().unwrap();
             }),
             ("clear_history", |s, _| s.clear_history().unwrap()),
+            ("set_history_budget", |s, _| {
+                s.set_history_budget(1 << 20).unwrap()
+            }),
             ("set_mode", |s, x| {
                 s.set_mode(x.c, UpdateMode::Lazy).unwrap()
             }),

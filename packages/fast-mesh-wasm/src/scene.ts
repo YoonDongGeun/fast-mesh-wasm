@@ -129,6 +129,7 @@ import {
   type SyncSculptDomain,
 } from "./domains/index.js";
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "./handles.js";
+import { checkHistoryBudget, decodePermanent, type PermanentListener, tellPermanent } from "./history.js";
 import { checkInteractionPoints, copyRule, encodeRule } from "./rule.js";
 import type { SceneLike } from "./scene-like.js";
 import {
@@ -486,6 +487,23 @@ export interface SceneOptions {
    * `debug`, views are plain typed arrays with no overhead.
    */
   debug?: boolean;
+  /**
+   * The most bytes the undo history may hold: {@link DEFAULT_HISTORY_BUDGET}
+   * (256 MiB) by default. What counts are the patches of edits, placement
+   * changes, and meshes out of the scene that undo or redo can bring back
+   * (about 60 bytes a triangle). Past it the oldest steps go. A step larger
+   * than the whole budget goes as soon as it closes: the action is then
+   * permanent, and {@link Scene.onPermanent} tells. A number, 0 or more;
+   * at most 4 GiB, so `Infinity` means that. Change it later with
+   * {@link Scene.setHistoryBudget}.
+   *
+   * @example
+   * ```ts
+   * // Removing a mesh of 10M triangles stays undoable.
+   * const scene = new Scene({ historyBudget: 1024 ** 3 });
+   * ```
+   */
+  historyBudget?: number;
 }
 
 /** A ray hit from {@link Scene.raycast}, in world coordinates. */
@@ -3391,6 +3409,9 @@ export class Scene implements SceneLike {
   readonly #fields = new Map<number, FieldHandle>();
   readonly #sections = new Map<number, SectionHandle>();
   readonly #listeners = new Set<(changes: MeshChange[]) => void>();
+  readonly #permanentListeners = new Set<PermanentListener>();
+  /** A {@link Scene.#settleHistory} is queued on a microtask. */
+  #settleQueued = false;
   /** History step nesting depth, mirrored from the calls made through this class. */
   #stepDepth = 0;
   #drag: ActiveDrag | undefined;
@@ -3538,7 +3559,12 @@ export class Scene implements SceneLike {
 
   constructor(options: SceneOptions = {}) {
     ensureInitialized("new Scene()");
-    this.#raw = call(() => new RawScene());
+    const budget = options.historyBudget === undefined ? undefined : checkHistoryBudget(options.historyBudget);
+    const raw = call(() => new RawScene());
+    this.#raw = raw;
+    if (budget !== undefined) {
+      call(() => raw.set_history_budget(budget));
+    }
     this.#guard = options.debug ? new ViewGuard() : undefined;
     finalizer.register(this, this.#raw, this);
   }
@@ -3565,7 +3591,34 @@ export class Scene implements SceneLike {
   #scene(): WasmScene {
     const s = this.#peek();
     this.#guard?.bump();
+    if (!this.#settleQueued && this.#permanentListeners.size > 0) {
+      // Whatever the call records, its listeners hear of it soon.
+      this.#settleQueued = true;
+      queueMicrotask(() => {
+        this.#settleQueued = false;
+        try {
+          this.#settleHistory();
+        } catch {
+          // A poisoned instance: nothing more to tell.
+        }
+      });
+    }
     return s;
+  }
+
+  /** Tells the listeners what the history did since the last call. */
+  #settleHistory(): void {
+    const s = this.#raw;
+    if (s === undefined || !call(() => s.has_permanent())) {
+      return;
+    }
+    this.#guard?.bump();
+    const msg = call(() => s.take_permanent());
+    const handle = (index: number, generation: number) => {
+      const key = `${index}:${generation}`;
+      return this.#meshes.get(key) ?? this.#removed.get(key);
+    };
+    tellPermanent(this.#permanentListeners, decodePermanent(msg, handle));
   }
 
   /** The live raw scene, for a read-only call that leaves every view valid. */
@@ -3702,7 +3755,9 @@ export class Scene implements SceneLike {
    * meshes is cut as by any removal and does not come back: fields on other
    * meshes measured to it, and its section entries. The kept mesh counts
    * against the history's memory budget, and is freed once the history drops
-   * the step (see {@link Scene.isRestorable}).
+   * the step (see {@link Scene.isRestorable}). A removal larger than the
+   * whole budget is permanent: {@link Scene.removalBytes} tells before,
+   * {@link Scene.onPermanent} after.
    */
   removeMesh(mesh: MeshHandle, options: RemoveMeshOptions = {}): void {
     const { index, generation } = this.#id(mesh);
@@ -3713,6 +3768,7 @@ export class Scene implements SceneLike {
     if (options.undoable === true) {
       // Its handle stays known, for the way back.
       call(() => this.#scene().remove_mesh_undoable(index, generation));
+      this.#settleHistory();
       this.#prune = true;
       return;
     }
@@ -3737,6 +3793,22 @@ export class Scene implements SceneLike {
   isRestorable(mesh: MeshHandle): boolean {
     const { index, generation } = this.#id(mesh);
     return this.#peek().is_restorable(index, generation);
+  }
+
+  /**
+   * About the bytes of history an undoable {@link Scene.removeMesh} of `mesh`
+   * takes. One larger than {@link Scene.historyBudget} is permanent.
+   *
+   * @example
+   * ```ts
+   * if (scene.removalBytes(mesh) <= scene.historyBudget() || confirm("Remove for good?")) {
+   *   scene.removeMesh(mesh, { undoable: true });
+   * }
+   * ```
+   */
+  removalBytes(mesh: MeshHandle): number {
+    const { index, generation } = this.#id(mesh);
+    return call(() => this.#peek().removal_bytes(index, generation));
   }
 
   /**
@@ -3768,6 +3840,7 @@ export class Scene implements SceneLike {
     const r = call(() =>
       this.#scene().join(ta.index, ta.generation, sb.index, sb.generation, Uint32Array.from(loops), maxEdges),
     );
+    this.#settleHistory();
     // Its handle stays known, for the way back.
     this.#prune = true;
     return { verticesAdded: r[0], trianglesAdded: r[1], bridgeTrianglesAdded: r[2] };
@@ -4707,6 +4780,8 @@ export class Scene implements SceneLike {
     // A coalesced drag's latest pose lands first, so the frame reports it.
     this.#drag?.applyPending();
     const s = this.#scene();
+    // Before the handles of meshes that are gone are dropped.
+    this.#settleHistory();
     const raw = decodeChanges(call(() => s.take_changes()));
     const out = raw.map(
       (c): MeshChange => ({
@@ -4801,6 +4876,7 @@ export class Scene implements SceneLike {
     this.#prune = true;
     const done = call(() => s.undo());
     this.#stepDepth = 0;
+    this.#settleHistory();
     return done;
   }
 
@@ -4811,6 +4887,7 @@ export class Scene implements SceneLike {
     this.#prune = true;
     const done = call(() => s.redo());
     this.#stepDepth = 0;
+    this.#settleHistory();
     return done;
   }
 
@@ -4833,6 +4910,64 @@ export class Scene implements SceneLike {
     this.#prune = true;
     call(() => s.clear_history());
     this.#stepDepth = 0;
+    this.#settleHistory();
+  }
+
+  /** The most bytes the history may hold; see {@link SceneOptions.historyBudget}. */
+  historyBudget(): number {
+    return call(() => this.#peek().history_budget());
+  }
+
+  /**
+   * Changes the most bytes the history may hold
+   * ({@link SceneOptions.historyBudget}). A smaller budget is met at once:
+   * the oldest steps go first, then the undone steps furthest from being
+   * redone. The meshes in the scene stay as they are, and an open step is
+   * kept until it closes.
+   *
+   * @throws `INVALID_ARGUMENT` for anything but a number, 0 or more.
+   */
+  setHistoryBudget(bytes: number): void {
+    const budget = checkHistoryBudget(bytes);
+    const s = this.#scene();
+    this.#prune = true;
+    call(() => s.set_history_budget(budget));
+    this.#settleHistory();
+  }
+
+  /** The bytes the history holds now, the open step included. */
+  historyBytes(): number {
+    return call(() => this.#peek().history_bytes());
+  }
+
+  /**
+   * Registers a listener called with each step the history could not keep,
+   * since it is larger than the whole budget: an action that is permanent, or
+   * one just undone that cannot be redone. Steps dropped later, to make room
+   * for newer ones or by {@link Scene.setHistoryBudget}, are not reported.
+   * It is called by the history calls themselves (`removeMesh`, `join`,
+   * `endStep`, `undo`, ...), and within a microtask of any other. Returns a
+   * function that unregisters it.
+   *
+   * @example
+   * ```ts
+   * scene.onPermanent(({ lost, gone }) => {
+   *   if (lost === "undo") {
+   *     notify(gone.length > 0 ? "The removal cannot be undone." : "The change cannot be undone.");
+   *   }
+   * });
+   * ```
+   */
+  onPermanent(listener: PermanentListener): () => void {
+    this.#scene();
+    if (this.#permanentListeners.size === 0) {
+      // What was reported to no one.
+      call(() => this.#peek().take_permanent());
+    }
+    this.#permanentListeners.add(listener);
+    return () => {
+      this.#permanentListeners.delete(listener);
+    };
   }
 
   /**
@@ -4861,6 +4996,7 @@ export class Scene implements SceneLike {
     if (this.#drag !== undefined && this.#stepDepth < this.#drag.depth) {
       this.#drag.abandon();
     }
+    this.#settleHistory();
   }
 
   /** Reverts and discards the open step, however deeply nested. Throws `STEP_NOT_OPEN` when none is open. */

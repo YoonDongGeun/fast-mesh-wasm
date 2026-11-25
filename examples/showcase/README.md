@@ -97,6 +97,8 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   They cover added and removed meshes too: undo takes a created mesh, hull, boolean result or copy off
   the list again, and brings a removed one back with its name, colour, place in the list and groups
   (`AppState.follow` keeps the list in step with the store). Opening files and projects is not undone.
+  An action larger than the whole undo memory (256 MiB; removing a mesh of about 4M triangles, say)
+  is permanent: the status bar says so as it happens (`store.onPermanent`), and Join's report too.
 - **Placement.** The Transform panel's helpers place the selected mesh in one click each, one undo
   step each: *Centre to Origin* and *Bottom to Origin* move its world bounding box centre (or the
   centre of its bottom) to the origin; *Lay Flat* takes a clicked face, turns the mesh about its box
@@ -231,6 +233,7 @@ URL options:
 | `?local` | The synchronous `Scene` on the main thread instead of the Worker scene: queries, repairs and `analyze` (the repair panel's, and the collision warnings') then run on the main thread, so they block the page on a large mesh. The exact depth (the default) recomputes every coloured vertex on the main thread on every drag frame, so dragging large meshes stutters: use *Fast mode* there |
 | `?big` | Demo meshes A and B at about a million triangles each; `?big=N` at about N |
 | `?threads=N` | Ask for N engine threads |
+| `?history=N` | Undo memory of N MiB (256 by default). A step larger than all of it cannot be undone; a small N shows what the app then says without a huge mesh |
 
 The dev and preview servers send the cross-origin isolation headers (COOP/COEP, a middleware in
 `vite.config.ts`), so the Worker scene runs its multithreaded engine.

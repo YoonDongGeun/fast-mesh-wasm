@@ -45,6 +45,13 @@ import {
   hullNormals,
   hullPointsBuffer,
 } from "../hull.js";
+import {
+  checkHistoryBudget,
+  DEFAULT_HISTORY_BUDGET,
+  type PermanentListener,
+  type PermanentStep,
+  tellPermanent,
+} from "../history.js";
 import { checkRegisterOptions } from "../register.js";
 import {
   checkLatticeOptions,
@@ -310,6 +317,22 @@ export interface WorkerSceneOptions {
    * batch's result. A number, 0 or more.
    */
   backgroundAddTriangles?: number;
+  /**
+   * The most bytes the undo history may hold, as `Scene`'s `historyBudget`:
+   * 256 MiB by default. Change it later with
+   * {@link WorkerScene.setHistoryBudget}.
+   *
+   * @example
+   * ```ts
+   * const scene = await createWorkerScene({ historyBudget: 1024 ** 3 });
+   * scene.onPermanent(({ lost }) => {
+   *   if (lost === "undo") {
+   *     notify("That cannot be undone.");
+   *   }
+   * });
+   * ```
+   */
+  historyBudget?: number;
 }
 
 /** The state of a request key, from {@link WorkerScene.status}. */
@@ -339,6 +362,7 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
   if (background !== undefined && (typeof background !== "number" || Number.isNaN(background) || background < 0)) {
     throw invalid(`backgroundAddTriangles must be a number, 0 or more (got ${String(background)})`);
   }
+  const budget = options.historyBudget === undefined ? undefined : checkHistoryBudget(options.historyBudget);
   // Called again by `restart()`.
   const make = (): WorkerLike =>
     options.createWorker?.() ??
@@ -356,6 +380,7 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
       threads: skipped ? 1 : threads,
       debug,
       ...(background === undefined ? {} : { backgroundAddTriangles: background }),
+      ...(budget === undefined ? {} : { historyBudget: budget }),
     },
   });
   try {
@@ -673,7 +698,9 @@ function sortOf(req: Request): Sorted {
     req.kind === "drag" ||
     req.kind === "coloring" ||
     req.kind === "field" ||
-    req.kind === "section"
+    req.kind === "section" ||
+    // The init message has the latest budget.
+    req.kind === "historyBudget"
   ) {
     return { ...base, kind: "declarative", covers: coversOf(req) };
   }
@@ -844,6 +871,7 @@ export class WorkerScene implements SceneLike {
   readonly #optimistic = new Set<MeshState>();
   readonly #listeners = new Set<(changes: MeshChange[]) => void>();
   readonly #statusListeners = new Set<() => void>();
+  readonly #permanentListeners = new Set<PermanentListener>();
   readonly #status = new Map<string, KeyStatus>();
   /** Called with each key whose status is set or forgotten, at once (see {@link watchStatusKeys}). */
   readonly #statusSinks = new Set<(key: string) => void>();
@@ -851,6 +879,7 @@ export class WorkerScene implements SceneLike {
   readonly #latest = new Map<string, number>();
   #statusScheduled = false;
   #history = { canUndo: false, canRedo: false };
+  #historyBytes = 0;
   /** See {@link presenceVersion}. */
   #presenceVersion = 0;
   /** The values mirror is on (a `values()` read asked for it). */
@@ -1533,6 +1562,8 @@ export class WorkerScene implements SceneLike {
     for (const c of r.changes) {
       this.#applyChange(c);
     }
+    // Their handles now: a mesh that is gone may be forgotten next.
+    const permanent = this.#permanentSteps(r);
     this.#applyPresence(r);
     // No colours: no colouring (its field removed, or the mesh).
     for (const st of this.#meshes.values()) {
@@ -1589,8 +1620,15 @@ export class WorkerScene implements SceneLike {
       this.#history = { ...r.history };
       this.#statusChanged();
     }
+    this.#historyBytes = r.historyBytes ?? 0;
     this.#applyStatus(r);
+    tellPermanent(this.#permanentListeners, permanent);
     this.#applyReplies(r);
+  }
+
+  #permanentSteps(r: Result): PermanentStep[] {
+    const handles = (ids: ClientId[]) => ids.flatMap((id) => this.#meshes.get(id)?.handle ?? []);
+    return (r.permanent ?? []).map((p) => ({ ...p, meshes: handles(p.meshes), gone: handles(p.gone) }));
   }
 
   #applyStatus(r: Result): void {
@@ -2037,7 +2075,9 @@ export class WorkerScene implements SceneLike {
    * With `undoable` the removal is an undo step (or part of the open one):
    * {@link WorkerScene.undo} brings the mesh back with the same handle, as
    * `Scene.removeMesh` does. A {@link WorkerScene.restart} clears the history,
-   * so it makes the removal permanent.
+   * so it makes the removal permanent, and so does one larger than the
+   * history budget: {@link WorkerScene.onPermanent} tells once the result is
+   * in, and {@link WorkerScene.removalBytes} before.
    */
   removeMesh(mesh: MeshHandle, options: RemoveMeshOptions = {}): void {
     const st = this.#live(mesh);
@@ -2070,6 +2110,15 @@ export class WorkerScene implements SceneLike {
     }
     const st = this.#state(mesh);
     return st.removed && st.parked;
+  }
+
+  /** About the bytes of history an undoable removal of `mesh` takes; see `Scene.removalBytes`. */
+  removalBytes(mesh: MeshHandle): Promise<number> {
+    return this.#query(
+      "removalBytes",
+      () => ({ mesh: this.#live(mesh).id }),
+      (v) => v,
+    );
   }
 
   /**
@@ -3685,6 +3734,44 @@ export class WorkerScene implements SceneLike {
     this.#scheduleFlush();
   }
 
+  /** The most bytes the history may hold, as last set here. */
+  get historyBudget(): number {
+    return this.#init.historyBudget ?? DEFAULT_HISTORY_BUDGET;
+  }
+
+  /**
+   * Changes the most bytes the history may hold, after the requests before
+   * it; see `Scene.setHistoryBudget`. A {@link WorkerScene.restart} keeps it.
+   *
+   * @throws `INVALID_ARGUMENT` for anything but a number, 0 or more.
+   */
+  setHistoryBudget(bytes: number): void {
+    this.#alive();
+    const budget = checkHistoryBudget(bytes);
+    // For later Workers; the current one gets the request.
+    this.#init = { ...this.#init, historyBudget: budget };
+    this.#push({ kind: "historyBudget", rev: ++this.#rev, bytes: budget });
+    this.#scheduleFlush();
+  }
+
+  /** The bytes the history holds, as of the latest result. */
+  get historyBytes(): number {
+    return this.#historyBytes;
+  }
+
+  /**
+   * Registers a listener called with each step the history could not keep
+   * (an action that is permanent, or one that cannot be redone), as its
+   * result is applied, before the promises it settles; see
+   * `Scene.onPermanent`. Returns the function that removes it.
+   */
+  onPermanent(listener: PermanentListener): () => void {
+    this.#permanentListeners.add(listener);
+    return () => {
+      this.#permanentListeners.delete(listener);
+    };
+  }
+
   /**
    * Opens a history step, or one more nesting level of the open one. Edits,
    * repairs, and placement changes until the matching {@link WorkerScene.endStep}
@@ -4501,6 +4588,7 @@ export class WorkerScene implements SceneLike {
     this.#failed.length = 0;
     this.#failedDropped = 0;
     this.#history = { canUndo: false, canRedo: false };
+    this.#historyBytes = 0;
     this.#statusChanged();
 
     // The replay, in dependency order: meshes, placements, fields,

@@ -286,7 +286,10 @@ export function repairActions(ctx: {
         });
         // The queue advances: the next secondary seeds itself.
         picks.setJoinSource("");
-        showReport(into, `${describeJoin(r)} — ${source.name} removed (undo brings it back)`, false);
+        const fate = store.isRestorable(source.mesh)
+          ? "undo brings it back"
+          : "for good: the join is too large for the undo memory";
+        showReport(into, `${describeJoin(r)} — ${source.name} removed (${fate})`, false);
       },
       (message) => `Join ${source.name} into ${targetName} failed: ${message}`,
     );

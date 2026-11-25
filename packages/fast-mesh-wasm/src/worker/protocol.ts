@@ -7,6 +7,7 @@ import type { Range } from "../changes.js";
 import type { DelaunayFlipOptions, DenoiseOptions } from "../denoise.js";
 import type { ExtrudeBaseOptions, ExtrudeFacesOptions } from "../extrude.js";
 import type { CheckedHeightfield, CheckedHeightfieldPlacement, HeightMap, HeightMapFrame } from "../height-map.js";
+import type { PermanentStep } from "../history.js";
 import type { EncodedPrimitive, PrimitiveMesh } from "../primitives.js";
 import type { LatticeOptions, LatticePlan, LatticePreview } from "../lattice.js";
 import type { WrapOptions, WrapPlan } from "../wrap.js";
@@ -78,6 +79,9 @@ export type PlaceMeshReportWire = Omit<PlaceMeshReport, "added"> & { added: Clie
 
 /** A mesh, field or section id allocated on the main side. Unique per kind. */
 export type ClientId = number;
+
+/** A {@link PermanentStep} naming its meshes by client id. */
+export type PermanentStepWire = Omit<PermanentStep, "meshes" | "gone"> & { meshes: ClientId[]; gone: ClientId[] };
 
 /** A {@link ColorRule} naming its field by client id. */
 export type ColorRuleWire = Omit<ColorRule, "field"> & { field: ClientId };
@@ -194,6 +198,8 @@ export type Request =
   | { kind: "undo" | "redo"; rev: number; key?: string }
   /** Drops every undo and redo step (the end of a `restart()` replay). */
   | { kind: "clearHistory"; rev: number; key?: string }
+  /** `Scene.setHistoryBudget`, with a checked budget. */
+  | { kind: "historyBudget"; rev: number; bytes: number; key?: string }
   /** Opens, closes, or cancels a history step matching `Scene.beginStep`/`endStep`/`cancelStep`. */
   | { kind: "step"; rev: number; phase: "begin" | "end" | "cancel" }
   | {
@@ -440,6 +446,7 @@ export interface QueryMap {
   };
   /** A relief, generated in the Worker (no scene state); its buffers are transferred. */
   generateHeightfield: { args: CheckedHeightfield; value: PrimitiveMesh };
+  removalBytes: { args: { mesh: ClientId }; value: number };
   latticePlan: { args: { mesh: ClientId; options: LatticeOptions }; value: LatticePlan };
   /** `Scene.latticePreview`; its buffers are transferred. */
   latticePreview: { args: { mesh: ClientId; options: LatticeOptions }; value: LatticePreview };
@@ -534,6 +541,13 @@ export interface Result {
    */
   sections: { section: ClientId; mesh: ClientId; result: SectionResultWire | null }[];
   history: { canUndo: boolean; canRedo: boolean };
+  /** The bytes the history holds. Omitted by poisoned results. */
+  historyBytes?: number;
+  /**
+   * The steps of this batch the history could not keep (`Scene.onPermanent`),
+   * in order. Omitted when there is none.
+   */
+  permanent?: PermanentStepWire[];
   /**
    * Where each mesh that an undoable add or removal, or its undo or redo,
    * moved in this batch now is: in the scene (`"live"`), out of it but kept
@@ -587,6 +601,8 @@ export interface InitMessage {
   crashChannel?: string;
   /** `WorkerSceneOptions.backgroundAddTriangles`, when set. */
   backgroundAddTriangles?: number;
+  /** The history budget, when it is not the default. */
+  historyBudget?: number;
 }
 
 /**
@@ -691,6 +707,7 @@ export function keyOf(req: Request): string | undefined {
     case "undo":
     case "redo":
     case "clearHistory":
+    case "historyBudget":
       return "history";
     case "field":
       return `field:${req.field}`;

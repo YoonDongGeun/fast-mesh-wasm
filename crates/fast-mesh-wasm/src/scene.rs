@@ -45,6 +45,7 @@ mod denoise;
 mod extrude;
 mod geodesic;
 mod height_map;
+mod history;
 mod hull;
 mod lattice;
 mod wrap;

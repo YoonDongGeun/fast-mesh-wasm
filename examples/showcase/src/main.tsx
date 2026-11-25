@@ -1,8 +1,9 @@
 // The fast-mesh-wasm showcase: load meshes (STL, OBJ, PLY), move them, undo.
 // The engine is a `WorkerScene` behind a `SceneStore` (threaded on this
 // cross-origin isolated page); `?local` runs the synchronous `Scene` on the
-// main thread instead. `?threads=N` asks for N engine threads. The app
-// boots onto the vessel tree; the demo meshes load from their button.
+// main thread instead. `?threads=N` asks for N engine threads, `?history=N`
+// for N MiB of undo memory. The app boots onto the vessel tree; the demo
+// meshes load from their button.
 // No top-level await here: the chunks that load on demand (#285), the engine of
 // `?local` among them, import from this one and would wait for it.
 import { createSceneStore, type SceneStore } from "fast-mesh-wasm/store";
@@ -15,11 +16,13 @@ import { Loader } from "./io/loader";
 import { loadSettings, saveSettings, settingsFromSnapshot } from "./shared/ux/settings";
 import { AppState } from "./app/state/app-state";
 import { preloadTab } from "./app/ux/feature-chunks";
+import { historyBudgetParam } from "./app/ux/history-notice";
 import "./styles.css";
 
 const params = new URLSearchParams(location.search);
 const local = params.has("local");
 const threadsParam = params.get("threads");
+const historyBudget = historyBudgetParam(params);
 
 async function createEngine(): Promise<{ store: SceneStore; engine: Engine }> {
   const isolated = globalThis.crossOriginIsolated === true;
@@ -27,12 +30,13 @@ async function createEngine(): Promise<{ store: SceneStore; engine: Engine }> {
     // Loaded only in this mode, so the Worker mode never fetches the wasm on the main thread.
     const { init, Scene } = await import("fast-mesh-wasm");
     await init();
-    const scene = new Scene();
+    const scene = new Scene({ historyBudget });
     return { store: createSceneStore(scene), engine: { mode: "local", scene, threads: () => 1, isolated } };
   }
-  const worker: WorkerScene = await createWorkerScene(
-    threadsParam === null ? {} : { threads: Math.max(1, Math.round(Number(threadsParam)) || 1) },
-  );
+  const worker: WorkerScene = await createWorkerScene({
+    ...(threadsParam === null ? {} : { threads: Math.max(1, Math.round(Number(threadsParam)) || 1) }),
+    historyBudget,
+  });
   return {
     store: createSceneStore(worker),
     engine: { mode: "worker", scene: worker, threads: () => worker.threads, isolated },

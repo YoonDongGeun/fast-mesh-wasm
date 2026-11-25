@@ -13,6 +13,36 @@ use crate::{MeshId, Placement, Result, SceneError};
 /// Bytes a placement entry counts against the budget: its old and new value.
 pub(crate) const PLACEMENT_BYTES: usize = 2 * size_of::<Placement>();
 
+/// What can no longer be done with a [`PermanentStep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorySide {
+    /// The step was just made (or redone), and cannot be undone.
+    Undo,
+    /// The step was just undone, and cannot be redone.
+    Redo,
+}
+
+/// A step the history let go of as it was made, undone or redone, since it is
+/// larger than the budget (see
+/// [`Scene::take_permanent`](crate::Scene::take_permanent)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermanentStep {
+    /// What can no longer be done with it.
+    pub lost: HistorySide,
+    /// The meshes it edited, moved, added or removed, each once, in recording
+    /// order. Those in `gone` no longer match.
+    pub meshes: Vec<MeshId>,
+    /// Of those, the meshes that are out of the scene with nothing left to
+    /// bring them back.
+    pub gone: Vec<MeshId>,
+    /// The bytes it counted, against
+    /// [`Scene::history_budget`](crate::Scene::history_budget).
+    pub bytes: u64,
+}
+
+/// The most [`PermanentStep`]s kept for `take_permanent`: the latest.
+const MAX_PERMANENT: usize = 256;
+
 /// One recorded change of a step.
 ///
 /// The patch is stored inline, not boxed: boxing it would allocate after the
@@ -52,14 +82,15 @@ impl Change {
     /// restored by holds it: its removal on the undo side, its add on the
     /// redo side. On the other side the mesh is live, or held by another
     /// entry.
-    fn bytes(&self, side: PatchSide) -> usize {
-        match self {
+    fn bytes(&self, side: PatchSide) -> u64 {
+        let bytes = match self {
             Change::Edit(_, p) => p.byte_size(),
             Change::Placement { .. } => PLACEMENT_BYTES,
             Change::Add { bytes, .. } if side == PatchSide::Redoable => *bytes,
             Change::Remove { bytes, .. } if side == PatchSide::Undoable => *bytes,
             Change::Add { .. } | Change::Remove { .. } => 0,
-        }
+        };
+        bytes as u64
     }
 }
 
@@ -101,7 +132,7 @@ fn release_in(change: &Change, entries: &mut SlotMap<Entry>, side: PatchSide) {
 pub(crate) struct Step {
     changes: Vec<Change>,
     /// What the changes hold on the stack the step is on.
-    bytes: usize,
+    bytes: u64,
 }
 
 impl Step {
@@ -116,6 +147,32 @@ impl Step {
             }
         }
         self.bytes = self.changes.iter().map(|c| c.bytes(side)).sum();
+    }
+
+    /// The report that the step cannot be undone, or redone, any more.
+    fn permanent(&self, lost: HistorySide) -> PermanentStep {
+        let mut meshes = Vec::new();
+        let mut gone = Vec::new();
+        for c in &self.changes {
+            let id = c.mesh();
+            if !meshes.contains(&id) {
+                meshes.push(id);
+            }
+            let out = match c {
+                Change::Remove { .. } => lost == HistorySide::Undo,
+                Change::Add { .. } => lost == HistorySide::Redo,
+                Change::Edit(..) | Change::Placement { .. } => false,
+            };
+            if out && !gone.contains(&id) {
+                gone.push(id);
+            }
+        }
+        PermanentStep {
+            lost,
+            meshes,
+            gone,
+            bytes: self.bytes,
+        }
     }
 }
 
@@ -139,7 +196,8 @@ pub(crate) enum Done {
 /// step larger than the whole budget is dropped as soon as it closes. An
 /// undo or a redo always happens, and then meets the budget, which it
 /// exceeds only when it undid a non-empty open step or parked meshes (see
-/// `trim_undone` and `trim_redone`).
+/// `trim_undone` and `trim_redone`). A step dropped as it closes, is undone
+/// or is redone is noted in `permanent`.
 pub(crate) struct History {
     undo: VecDeque<Step>,
     redo: Vec<Step>,
@@ -147,7 +205,9 @@ pub(crate) struct History {
     /// Nesting depth of `begin_step`; 0 when no step is open.
     depth: u32,
     budget: usize,
-    bytes: usize,
+    bytes: u64,
+    /// Steps dropped as they were made, undone or redone, not taken yet.
+    permanent: VecDeque<PermanentStep>,
 }
 
 impl History {
@@ -159,7 +219,55 @@ impl History {
             depth: 0,
             budget,
             bytes: 0,
+            permanent: VecDeque::new(),
         }
+    }
+
+    /// Most bytes the steps may hold.
+    pub(crate) fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// Changes the budget and meets it: the oldest undo steps go first, then
+    /// the furthest redo steps. An open step is kept, and meets it once
+    /// closed.
+    pub(crate) fn set_budget(&mut self, entries: &mut SlotMap<Entry>, budget: usize) {
+        self.budget = budget;
+        self.evict(entries);
+        self.evict_redo(entries, 0);
+    }
+
+    /// Bytes held by every step.
+    pub(crate) fn held(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Whether the steps hold more than the budget.
+    fn over(&self) -> bool {
+        self.bytes > self.budget as u64
+    }
+
+    /// Takes the steps noted as permanent since the last call.
+    pub(crate) fn take_permanent(&mut self) -> Vec<PermanentStep> {
+        std::mem::take(&mut self.permanent).into()
+    }
+
+    /// Whether `take_permanent` would return any.
+    pub(crate) fn has_permanent(&self) -> bool {
+        !self.permanent.is_empty()
+    }
+
+    /// Notes the step just made, undone or redone as permanent: `dropped`,
+    /// the last of those dropped to meet the budget, is it once `left` (what
+    /// is left of the stack it was on) is empty.
+    fn note_permanent(&mut self, dropped: Option<Step>, left: usize, lost: HistorySide) {
+        let Some(step) = dropped.filter(|_| left == 0) else {
+            return;
+        };
+        if self.permanent.len() == MAX_PERMANENT {
+            self.permanent.pop_front();
+        }
+        self.permanent.push_back(step.permanent(lost));
     }
 
     pub(crate) fn begin(&mut self) {
@@ -186,7 +294,8 @@ impl History {
         }
         // `reserve` made room for this push when the first change was recorded.
         self.undo.push_back(std::mem::take(&mut self.open));
-        self.evict(entries);
+        let dropped = self.evict(entries);
+        self.note_permanent(dropped, self.undo.len(), HistorySide::Undo);
     }
 
     /// Makes room for one more change, so that `record` (and the `close`
@@ -257,26 +366,34 @@ impl History {
         }
     }
 
-    fn evict(&mut self, entries: &mut SlotMap<Entry>) {
-        while self.bytes > self.budget && self.evict_one(entries) {}
+    /// Drops the oldest undo steps until the budget is met, or none are left.
+    /// Returns the last one dropped.
+    fn evict(&mut self, entries: &mut SlotMap<Entry>) -> Option<Step> {
+        let mut last = None;
+        while self.over() {
+            let Some(step) = self.evict_one(entries) else {
+                break;
+            };
+            last = Some(step);
+        }
+        last
     }
 
-    /// Drops the oldest undo step; false when there is none.
-    fn evict_one(&mut self, entries: &mut SlotMap<Entry>) -> bool {
-        let Some(step) = self.undo.pop_front() else {
-            return false;
-        };
+    /// Drops the oldest undo step and returns it, its changes released.
+    fn evict_one(&mut self, entries: &mut SlotMap<Entry>) -> Option<Step> {
+        let step = self.undo.pop_front()?;
         self.bytes -= step.bytes;
         for c in &step.changes {
             release_in(c, entries, PatchSide::Undoable);
         }
-        true
+        Some(step)
     }
 
     /// Closes the open step, then drops every step, releasing their slots.
     pub(crate) fn clear(&mut self, entries: &mut SlotMap<Entry>) {
-        self.close(entries);
-        for step in self.undo.drain(..) {
+        self.depth = 0;
+        let open = std::mem::take(&mut self.open);
+        for step in self.undo.drain(..).chain([open]) {
             for c in &step.changes {
                 release_in(c, entries, PatchSide::Undoable);
             }
@@ -285,17 +402,25 @@ impl History {
         self.bytes = 0;
     }
 
-    /// Drops the oldest redo steps until the budget is met, keeping the last
-    /// `keep`. Only needed after an undo or a redo (see `trim_undone` and
-    /// `trim_redone`).
-    fn evict_redo(&mut self, entries: &mut SlotMap<Entry>, keep: usize) {
-        while self.bytes > self.budget && self.redo.len() > keep {
-            let step = self.redo.remove(0);
-            self.bytes -= step.bytes;
+    /// Drops the furthest redo steps until the budget is met, keeping the
+    /// last `keep`. Returns the last one dropped. Only needed after an undo,
+    /// a redo (see `trim_undone` and `trim_redone`) or a smaller budget.
+    fn evict_redo(&mut self, entries: &mut SlotMap<Entry>, keep: usize) -> Option<Step> {
+        let mut bytes = self.bytes;
+        let mut n = 0;
+        while bytes > self.budget as u64 && self.redo.len() - n > keep {
+            bytes -= self.redo[n].bytes;
+            n += 1;
+        }
+        self.bytes = bytes;
+        let mut last = None;
+        for step in self.redo.drain(..n) {
             for c in &step.changes {
                 release_in(c, entries, PatchSide::Redoable);
             }
+            last = Some(step);
         }
+        last
     }
 
     /// True if an interactive step is currently open.
@@ -422,15 +547,17 @@ impl History {
     pub(crate) fn trim_undone(&mut self, entries: &mut SlotMap<Entry>) {
         self.evict_redo(entries, 1);
         let adds = |s: &Step| s.changes.iter().any(|c| matches!(c, Change::Add { .. }));
+        let mut dropped = None;
         if self
             .redo
             .last()
-            .is_some_and(|s| s.bytes > self.budget && adds(s))
+            .is_some_and(|s| s.bytes > self.budget as u64 && adds(s))
         {
-            self.evict_redo(entries, 0);
+            dropped = self.evict_redo(entries, 0);
         }
         self.evict(entries);
-        self.evict_redo(entries, 0);
+        let dropped = self.evict_redo(entries, 0).or(dropped);
+        self.note_permanent(dropped, self.redo.len(), HistorySide::Redo);
     }
 
     /// Meets the budget after `redo`, which exceeds it only when it parked
@@ -438,11 +565,12 @@ impl History {
     /// then, if that is not enough, the step itself (its removals are then
     /// permanent).
     pub(crate) fn trim_redone(&mut self, entries: &mut SlotMap<Entry>) {
-        while self.bytes > self.budget && self.undo.len() > 1 {
+        while self.over() && self.undo.len() > 1 {
             self.evict_one(entries);
         }
         self.evict_redo(entries, 0);
-        self.evict(entries);
+        let dropped = self.evict(entries);
+        self.note_permanent(dropped, self.undo.len(), HistorySide::Undo);
     }
 
     /// Reverts the open step's changes and takes the step out, for the caller
@@ -522,8 +650,8 @@ impl History {
         drop_from(&mut self.open, PatchSide::Undoable);
         self.undo.retain(|s| !s.changes.is_empty());
         self.redo.retain(|s| !s.changes.is_empty());
-        self.bytes = self.undo.iter().map(|s| s.bytes).sum::<usize>()
-            + self.redo.iter().map(|s| s.bytes).sum::<usize>()
+        self.bytes = self.undo.iter().map(|s| s.bytes).sum::<u64>()
+            + self.redo.iter().map(|s| s.bytes).sum::<u64>()
             + self.open.bytes;
     }
 
@@ -542,13 +670,13 @@ impl History {
     /// Bytes of each undo step, oldest first.
     #[cfg(test)]
     pub(crate) fn undo_step_bytes(&self) -> impl Iterator<Item = usize> + '_ {
-        self.undo.iter().map(|s| s.bytes)
+        self.undo.iter().map(|s| s.bytes as usize)
     }
 
     /// Bytes held by every step.
     #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
-        self.bytes
+        self.bytes as usize
     }
 }
 
