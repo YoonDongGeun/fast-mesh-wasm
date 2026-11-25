@@ -56,6 +56,8 @@ try {
   app.subscribe(() => {
     saveSettings(settingsFromSnapshot(app.getSnapshot()));
   });
+  // The list follows undone and redone adds and removals.
+  app.follow(store);
   const loader = new Loader(store, app);
   root.render(
     <StrictMode>

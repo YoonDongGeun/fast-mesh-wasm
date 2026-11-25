@@ -11,8 +11,8 @@ use crate::error::Error;
 impl WasmScene {
     /// Adds the convex hull of the meshes `meshes` (flat `[index,
     /// generation, ...]`) as a new closed, outward-wound mesh, built from
-    /// the vertices their live triangles use; the hull lands in it as one
-    /// undo step. With one shared placement the new mesh gets it, else it
+    /// the vertices their live triangles use, as one undo step (undo removes
+    /// it). With one shared placement the new mesh gets it, else it
     /// is built in the world at identity. `normals` turns its smooth vertex
     /// normals on. Returns `[index, generation, inputPoints, vertices,
     /// triangles]`.
@@ -76,11 +76,13 @@ mod tests {
         assert_eq!(s.triangle_slots(one[0], one[1]).unwrap(), 12);
         let both = s.convex_hull(&[a[0], a[1], b[0], b[1]], false).unwrap();
         assert_eq!(&both[2..], &[16, 8, 12]);
-        // One undo step empties the last hull.
+        // One undo step removes the last hull (#269).
         assert!(s.undo().unwrap());
-        let mesh = s.mesh(both[0], both[1]).unwrap();
-        assert_eq!(mesh.triangle_count(), 0);
+        assert!(s.mesh(both[0], both[1]).is_err());
+        assert!(s.is_restorable(both[0], both[1]));
         assert!(s.redo().unwrap());
+        let mesh = s.mesh(both[0], both[1]).unwrap();
+        assert_eq!(mesh.triangle_count(), 12);
 
         let pts = s.convex_hull_points(&CUBE, false).unwrap();
         assert_eq!(&pts[2..], &[8, 8, 12]);

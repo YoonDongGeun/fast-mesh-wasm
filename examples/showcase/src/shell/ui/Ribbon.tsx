@@ -8,6 +8,8 @@
 import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
 import type { AppState, WorkbenchTab } from "../../app/state/app-state";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
+import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
+import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
 import { DYNTOPO_MODE_OPTIONS } from "../../features/sculpt/ux/sculpt";
 import { DIAGNOSTIC_SHADING_OPTIONS } from "../../features/view/ui/shading";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
@@ -225,6 +227,14 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               >
                 Create Shape…
               </button>
+              <button
+                type="button"
+                data-action="create-text"
+                title="Create solid text, or emboss or engrave it on a surface"
+                onClick={() => textDialogOf(app).open()}
+              >
+                Create Text…
+              </button>
               <button type="button" onClick={onResetView}>
                 Reset View
               </button>
@@ -345,6 +355,19 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               >
                 Selective Heal
               </button>
+              {SURFACE_CLEANUP_COMMANDS.map((c) => (
+                <button
+                  key={c.op}
+                  type="button"
+                  disabled={!hasItems}
+                  onClick={() => triggerClick(`[data-repair-op="${c.op}"]`)}
+                >
+                  {c.short}
+                </button>
+              ))}
+              <button type="button" disabled={!hasItems} onClick={() => focusElement("[data-wrap-gap]")}>
+                Wrap
+              </button>
               <button
                 type="button"
                 aria-pressed={healerOverlays.selfIntersections}
@@ -402,6 +425,20 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               >
                 Isotropic Remesh
               </button>
+              <button
+                type="button"
+                data-ribbon-focus="extrude-faces"
+                onClick={() => focusElement("[data-extrude-faces-distance]")}
+              >
+                Extrude Faces
+              </button>
+              <button
+                type="button"
+                data-ribbon-focus="extrude-base"
+                onClick={() => focusElement("[data-extrude-base-run]")}
+              >
+                Extrude Base
+              </button>
               <button type="button" data-ribbon-focus="hull" onClick={() => focusElement("[data-modeling-hull-run]")}>
                 Convex Hull
               </button>
@@ -413,6 +450,14 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" data-ribbon-focus="place" onClick={() => focusElement("[data-modeling-place-section]")}>
                 Surface Stamp
+              </button>
+              <button
+                type="button"
+                data-action="text-tool"
+                title="Solid text, or text embossed or engraved on a surface"
+                onClick={() => textDialogOf(app).open()}
+              >
+                Text…
               </button>
               <button
                 type="button"
@@ -444,6 +489,20 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" onClick={() => focusElement("[data-align-pick]")}>
                 Landmark Align
+              </button>
+              <button
+                type="button"
+                data-ribbon-focus="coarse-icp"
+                onClick={() => focusElement('[data-align-action="multistage-run"]')}
+              >
+                Coarse + ICP
+              </button>
+              <button
+                type="button"
+                data-ribbon-focus="symmetry-plane"
+                onClick={() => focusElement('[data-align-action="symmetry-detect"]')}
+              >
+                Symmetry Plane
               </button>
               <button type="button" data-ribbon-focus="points" onClick={() => focusElement("[data-points-panel]")}>
                 Point Cloud
@@ -503,6 +562,9 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" data-ribbon-focus="maps" onClick={() => focusElement("[data-inspect-maps]")}>
                 Maps
+              </button>
+              <button type="button" data-ribbon-focus="geodesic" onClick={() => focusElement("[data-inspect-geodesic]")}>
+                Geodesic
               </button>
               <button
                 type="button"

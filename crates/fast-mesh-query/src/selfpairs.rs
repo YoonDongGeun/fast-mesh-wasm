@@ -40,6 +40,23 @@ pub fn self_intersecting_pairs(
     bvh: &Bvh,
     out: &mut Vec<(TriangleId, TriangleId)>,
 ) -> Result<()> {
+    self_intersecting_pairs_where(mesh, bvh, |_, _| true, out)
+}
+
+/// [`self_intersecting_pairs`], only the pairs that `keep` accepts, for
+/// callers interested in some triangles. `keep` is asked about candidate
+/// pairs before they are tested, in either order, possibly from several
+/// threads, so a pair it turns down costs next to nothing. It must give one
+/// answer for `(a, b)` and `(b, a)`.
+///
+/// # Errors
+/// As for [`self_intersecting_pairs`].
+pub fn self_intersecting_pairs_where(
+    mesh: &Mesh,
+    bvh: &Bvh,
+    keep: impl Fn(TriangleId, TriangleId) -> bool + Sync,
+    out: &mut Vec<(TriangleId, TriangleId)>,
+) -> Result<()> {
     check(mesh, bvh)?;
     let mut ap = Appender::new(out);
     let Some(root) = bvh.root() else {
@@ -52,7 +69,8 @@ pub fn self_intersecting_pairs(
             let mut pairs = Vec::new();
             let mut failed = None;
             part[0].search(bvh, &mut |a, b| {
-                if let Some(pair) = intersecting(mesh, a, b)
+                if keep(a, b)
+                    && let Some(pair) = intersecting(mesh, a, b)
                     && let Err(e) = try_push(&mut pairs, pair)
                 {
                     failed = Some(e);
@@ -68,7 +86,8 @@ pub fn self_intersecting_pairs(
     } else {
         let mut failed = None;
         Part::Within(root).search(bvh, &mut |a, b| {
-            if let Some(pair) = intersecting(mesh, a, b)
+            if keep(a, b)
+                && let Some(pair) = intersecting(mesh, a, b)
                 && let Err(e) = ap.push(pair)
             {
                 failed = Some(e);
@@ -488,6 +507,24 @@ mod tests {
         // the corner where vertex 8 coincides with vertex 0, sharing no id.
         assert_eq!(pairs(&mesh, &bvh), vec![(0, 4), (0, 5), (1, 4), (1, 5)]);
         assert_eq!(pairs(&mesh, &bvh), reference(&mesh));
+    }
+
+    #[test]
+    fn self_pairs_where_keeps_the_accepted_pairs() {
+        let mesh = crossed_boxes();
+        let bvh = build(&mesh, Quality::Sah);
+        let mut all = Vec::new();
+        self_intersecting_pairs(&mesh, &bvh, &mut all).unwrap();
+        let some = |a: TriangleId, b: TriangleId| a < 5 || b < 5;
+        let want: Vec<_> = all.iter().copied().filter(|&(a, b)| some(a, b)).collect();
+        assert!(!want.is_empty() && want.len() < all.len());
+        let mut got = vec![(7, 7)];
+        self_intersecting_pairs_where(&mesh, &bvh, some, &mut got).unwrap();
+        assert_eq!(got[0], (7, 7));
+        assert_eq!(got[1..], want);
+        let mut none = Vec::new();
+        self_intersecting_pairs_where(&mesh, &bvh, |_, _| false, &mut none).unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]

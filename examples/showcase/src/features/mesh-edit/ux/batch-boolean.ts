@@ -1,7 +1,7 @@
 // The multi-mesh boolean's pure parts (#254): the inputs read from the
 // multi-selection (primary first), the CSG tree for each operation, the
-// result's name, and the edit ops that move geometry between meshes so the
-// whole boolean lands as one undo step. No React, no engine calls.
+// result's name, and the edit ops that put the result into the primary.
+// No React, no engine calls.
 import type { BooleanMethod, BooleanOp, CsgNode, EditOp, MeshHandle } from "fast-mesh-wasm";
 import type { Item } from "../../../app/state/app-state";
 
@@ -200,6 +200,6 @@ export function describeBatchBoolean(r: {
   const label = batchOpLabel(r.op);
   const head = `${label[0].toUpperCase()}${label.slice(1)} of ${r.inputs} meshes → ${r.name}: ${r.triangles.toLocaleString("en")} triangles`;
   return r.keptInputs
-    ? `${head} (inputs kept; Ctrl+Z empties the result)`
-    : `${head} (the others emptied; Ctrl+Z restores every input)`;
+    ? `${head} (inputs kept; Ctrl+Z removes the result)`
+    : `${head} (the others removed; Ctrl+Z restores every input)`;
 }

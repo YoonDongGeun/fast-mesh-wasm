@@ -2,7 +2,8 @@
 // sizes, orientation, components, non-manifold and degenerate elements),
 // refreshed whenever its triangles change (a repair, its undo), the 3D
 // overlays drawing those issues on the mesh, and the library's repair ops,
-// each one undo step through `store.repair`. The analysis refresh, the op
+// each one undo step through `store.repair` (denoise and Delaunay flips
+// through the engine bridge). The analysis refresh, the op
 // parameters, the loop picks and the op sequences live in `ux/`.
 import type { AutoRepairPreset, FillContinuity, Scene, SelfIntersectionMode } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
@@ -21,10 +22,13 @@ import { useRepairAnalysis } from "../ux/use-repair-analysis";
 import { holeTargetsOf, useRepairLoopPicks } from "../ux/use-repair-loop-picks";
 import { useRepairOptions, wholeAtLeast, wholeNumber } from "../ux/use-repair-options";
 import { useRepairRunner } from "../ux/use-repair-runner";
+import { useSurfaceCleanup } from "../ux/use-surface-cleanup";
 import { formatLength, type LengthUnit } from "../../../shared/ux/units";
 import { LengthInput } from "../../../shared/ui/LengthInput";
 import { MeshHealerSection } from "./MeshHealerSection";
 import { REPAIR_OVERLAY_COLORS } from "./repair-overlays";
+import { SurfaceCleanupSection } from "./SurfaceCleanupSection";
+import { WrapSection } from "./WrapSection";
 
 /** The holes listed by size. */
 const HOLES_SHOWN = 6;
@@ -50,6 +54,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     onTriangleChange: runner.noteTriangleChange,
   });
   const picks = useRepairLoopPicks({ app, scene, mesh, items, analysis: live.analysis });
+  const cleanup = useSurfaceCleanup({ app, store, item, units, runner, live });
 
   const s = live.analysis?.mesh === mesh ? live.analysis.summary : null;
   const rawLoops = repairAnalysis?.mesh === mesh ? repairAnalysis.analysis.loops : [];
@@ -330,6 +335,8 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
         </div>
       </div>
 
+      <SurfaceCleanupSection cleanup={cleanup} disabled={disabled} />
+
       <div className="ops">
         <div className="op">
           <label className="field" title="Domain repair preset selecting pipeline stages and tolerances">
@@ -601,6 +608,10 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           </p>
         ) : null}
         <p className="muted small">Bridge stitches two holes of this mesh; Join merges another mesh into it (the source is removed).</p>
+      </div>
+
+      <div className="ops">
+        <WrapSection app={app} store={store} items={items} activeItem={item} units={units} disabled={disabled} />
       </div>
 
       {runner.busy !== null ? (

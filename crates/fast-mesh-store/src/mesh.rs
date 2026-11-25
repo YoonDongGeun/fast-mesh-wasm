@@ -309,6 +309,25 @@ impl Mesh {
         self.live_triangles
     }
 
+    /// Approximate heap memory held by the mesh: its slots, liveness,
+    /// channels (UVs included) and cached indices, by capacity.
+    pub fn byte_size(&self) -> usize {
+        let adjacency = self.adjacency.as_ref().map_or(0, Adjacency::byte_size);
+        let incidence = self.incidence.as_ref().map_or(0, Incidence::byte_size);
+        self.positions.capacity() * 12
+            + self.triangles.capacity() * 12
+            + (self.vertex_live.capacity() + self.triangle_live.capacity()) * 8
+            + self.vertex_refs.capacity() * 4
+            + self
+                .channels
+                .iter()
+                .map(|c| c.data.capacity() * 4 + c.desc.name.capacity())
+                .sum::<usize>()
+            + (self.vertex_free.capacity() + self.triangle_free.capacity()) * 4
+            + adjacency
+            + incidence
+    }
+
     pub fn is_vertex_alive(&self, v: VertexId) -> bool {
         bit(&self.vertex_live, v as usize)
     }

@@ -3,6 +3,7 @@
 // latest readouts and analysis, and how often they were refreshed.
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { AnalysisSummary } from "../../features/mesh-repair/ux/repair-summary";
+import type { InspectTool } from "./app-state";
 
 /** The collision readouts of the pair as last queried. */
 export interface Readouts {
@@ -102,7 +103,7 @@ export const inspect: {
   sceneVolume: { id: string | null; preset: string };
   /** The inspect tools (#110): the armed tool, the ruler, the query, the section and the clip box. */
   tools: {
-    tool: "ruler" | "query" | "section" | "clip" | null;
+    tool: InspectTool | null;
     /** The ruler's world endpoints and their distance (`null` until both clicked). */
     ruler: { a: [number, number, number]; b: [number, number, number] | null; distance: number | null };
     /** The query hit: mesh name, vertex slot, world point and coloring value. */

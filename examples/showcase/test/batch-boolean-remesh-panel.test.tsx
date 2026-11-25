@@ -63,6 +63,7 @@ function setup() {
   const scene = new Scene();
   const store = createSceneStore(scene);
   const app = new AppState();
+  app.follow(store);
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
@@ -126,7 +127,7 @@ describe("Modeling panel: multi-mesh boolean", () => {
     expect(run()?.disabled).toBe(false);
     expect(run()?.textContent).toBe("Run on 3 meshes");
 
-    // Primary minus the others, the inputs removed (cleared).
+    // Primary minus the others, the inputs removed.
     await click(container.querySelector('[data-batch-boolean-op="subtract"]'));
     expect(container.querySelector('[data-batch-boolean-op="subtract"]')?.getAttribute("aria-pressed")).toBe("true");
     await setChecked(container.querySelector<HTMLInputElement>("[data-batch-boolean-keep]"), false);
@@ -135,12 +136,11 @@ describe("Modeling panel: multi-mesh boolean", () => {
     const report = container.querySelector("[data-batch-boolean-report]");
     expect(report?.classList.contains("error")).toBe(false);
     expect(report?.textContent).toMatch(/^Multi-mesh boolean: Difference of 3 meshes → A: \d+ triangles/);
-    expect(app.getSnapshot().items.length).toBe(3);
-    expect(liveTriangles(scene, b.mesh)).toBe(0);
-    expect(liveTriangles(scene, c.mesh)).toBe(0);
+    expect(app.getSnapshot().items).toEqual([a]);
     expect(store.getSnapshot().selection).toBe(a.mesh);
 
     act(() => store.undo());
+    expect(app.getSnapshot().items).toEqual([a, b, c]);
     expect([a, b, c].map((i) => liveTriangles(scene, i.mesh))).toEqual([12, 12, 12]);
   });
 

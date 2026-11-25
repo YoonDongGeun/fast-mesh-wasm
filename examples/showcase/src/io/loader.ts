@@ -80,10 +80,10 @@ export class Loader {
   constructor(store: SceneStore, app: AppState) {
     this.#store = store;
     this.#app = app;
-    // Evict volumes whose mesh left (removed): both the page copy and the
-    // Worker's retained one (a CT stack is tens of megabytes).
+    // Evict volumes whose mesh left (removed, and beyond undo): both the page
+    // copy and the Worker's retained one (a CT stack is tens of megabytes).
     app.subscribe(() => {
-      const live = new Set<string>();
+      const live = new Set<string>(app.parkedVolumes());
       for (const item of app.getSnapshot().items) {
         if (item.volumeId !== null) {
           live.add(item.volumeId);
@@ -343,7 +343,7 @@ export class Loader {
         for (const item of items) {
           if (this.#app.getSnapshot().items.includes(item)) {
             try {
-              this.#app.removeMesh(this.#store, item);
+              this.#app.removeMesh(this.#store, item, { undoable: false });
             } catch {
               // Removed meanwhile: nothing to drop.
             }

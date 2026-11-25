@@ -380,6 +380,24 @@ input[type="range"] {
 .analysis.stale {
   opacity: 0.6;
 }
+.object-info-readouts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 10px;
+  margin: 8px 0;
+  font-size: 12px;
+}
+.object-info-readouts dt {
+  color: var(--muted);
+}
+.object-info-readouts dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.object-info-readouts dd.stale {
+  opacity: 0.6;
+}
 .holes {
   margin: 2px 0 0;
   padding-left: 14px;
@@ -499,6 +517,10 @@ input[type="range"] {
 }
 .modes button {
   flex: 1;
+}
+/* Five tools: the row wraps in a narrow column. */
+.modes[aria-label="Inspection tool"] {
+  flex-wrap: wrap;
 }
 .members {
   list-style: none;
@@ -1797,6 +1819,21 @@ input[type="range"] {
 }
 
 .modeling-panel h3,
+/* The geodesic and path sections (#252): every row on its own line, its controls apart. */
+.geodesic-panel > h3,
+.geodesic-panel > p,
+.geodesic-panel > .legend,
+.geodesic-panel > .readout,
+.geodesic-panel > .op-row {
+  flex: 1 0 100%;
+}
+.geodesic-panel > .op-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
 .surface-field-panel h3 {
   margin: 0 0 6px;
   font-size: 12px;
@@ -1809,6 +1846,29 @@ input[type="range"] {
   grid-template-columns: auto 1fr;
   gap: 4px 10px;
   margin: 0;
+  font-size: 12px;
+}
+
+.align-panel h3 {
+  flex-basis: 100%;
+  margin: 10px 0 2px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.align-panel .op > .report,
+.align-panel .op > .muted {
+  flex-basis: 100%;
+}
+
+.align-panel .report .error {
+  color: var(--error);
+}
+
+.align-panel .align-residuals {
+  margin: 4px 0 0;
+  padding-left: 20px;
   font-size: 12px;
 }
 

@@ -3,6 +3,26 @@
 // binding; every call into WebAssembly goes through `call` (error codes and
 // panic poisoning).
 import {
+  checkDelaunayFlipOptions,
+  checkDenoiseOptions,
+  decodeDelaunayFlipReport,
+  decodeDenoiseReport,
+  type DelaunayFlipOptions,
+  type DelaunayFlipReport,
+  type DenoiseOptions,
+  type DenoiseReport,
+} from "./denoise.js";
+import {
+  decodeExtrudeBase,
+  decodeExtrudeFaces,
+  type ExtrudeBaseOptions,
+  type ExtrudeBaseResult,
+  type ExtrudeFacesOptions,
+  type ExtrudeFacesResult,
+  extrudeBaseArgs,
+  extrudeFacesArgs,
+} from "./extrude.js";
+import {
   type ConvexHullOptions,
   type ConvexHullPoints,
   type ConvexHullResult,
@@ -12,6 +32,17 @@ import {
   hullPointsBuffer,
 } from "./hull.js";
 import { checkRegisterOptions } from "./register.js";
+import {
+  checkWrapOptions,
+  decodeWrapCounts,
+  decodeWrapPlan,
+  encodeWrapOptions,
+  type WrapGridOptions,
+  wrapMeshList,
+  type WrapOptions,
+  type WrapPlan,
+  type WrapResult,
+} from "./wrap.js";
 import {
   BOOLEAN_METHOD_CODES,
   BOOLEAN_OP_CODES,
@@ -278,10 +309,22 @@ const rawIds = new WeakMap<FieldHandle | SectionHandle, HandleId>();
  */
 export interface MeshChange {
   mesh: MeshHandle;
-  /** The mesh was added; every buffer is `"all"`. */
+  /**
+   * The mesh was added, or is back (an undone removal, a redone add); every
+   * buffer is `"all"`. A mesh that is back has the handle it had.
+   */
   added: boolean;
-  /** The mesh was removed; drop its GPU buffers. Nothing else is set. */
+  /**
+   * The mesh was removed (by a call, by the undo of its add or by the redo
+   * of its removal); drop its GPU buffers. Nothing else is set but
+   * {@link MeshChange.restorable}.
+   */
   removed: boolean;
+  /**
+   * Only on a removal: undo or redo can bring the mesh back, as `added` with
+   * the same handle (see {@link Scene.isRestorable}). Keep what shows it.
+   */
+  restorable?: true;
   /** Its placement changed: read {@link Scene.matrix4} again. */
   placementChanged: boolean;
   /**
@@ -381,6 +424,22 @@ export interface AddMeshOptions {
    * see `docs/uv-channel.md`. Weld keeps seams apart.
    */
   uvs?: Float32Array | readonly number[];
+  /**
+   * Record the add in the history, in the open step or as a step of its own:
+   * undo removes the mesh, redo brings it back with the same handle. Defaults
+   * to `false` (the add is permanent).
+   */
+  undoable?: boolean;
+}
+
+/** Options of {@link Scene.removeMesh}. */
+export interface RemoveMeshOptions {
+  /**
+   * Remove the mesh as an undo step, or as part of the open one: undo brings
+   * it back with the same handle. Defaults to `false` (removed for good, and
+   * its history entries with it).
+   */
+  undoable?: boolean;
 }
 
 /** Options of the {@link Scene} constructor. */
@@ -3208,8 +3267,10 @@ export function meshAdds(scene: Scene): MeshAdds {
 export class Scene implements SceneLike {
   #raw: WasmScene | undefined;
   readonly #guard: ViewGuard | undefined;
-  /** Live meshes' handles by `"index:generation"`. */
+  /** Handles by `"index:generation"`, of live meshes and of those undo or redo can bring back. */
   readonly #meshes = new Map<string, MeshHandle>();
+  /** A handle in `#meshes` may be of a mesh the history has dropped since. */
+  #prune = false;
   /** Handles of meshes removed since the last `takeChanges`, for their removal records. */
   readonly #removed = new Map<string, MeshHandle>();
   /** The rule each coloured mesh was last given by `setColoring`. */
@@ -3506,12 +3567,16 @@ export class Scene implements SceneLike {
     const p = toFloat64(positions);
     const i = toUint32(indices);
     const normals = options.normals ?? true;
-    if (options.uvs === undefined) {
-      const id = call(() => s.add_mesh(p, i, origin, mode, normals));
-      return this.#meshHandle(id[0], id[1]);
-    }
-    const uvs = options.uvs instanceof Float32Array ? options.uvs : Float32Array.from(options.uvs);
-    const id = call(() => s.add_mesh_with_uvs(p, i, uvs, origin, mode, normals));
+    const uvs =
+      options.uvs === undefined || options.uvs instanceof Float32Array ? options.uvs : Float32Array.from(options.uvs);
+    const id = call(() => {
+      if (options.undoable === true) {
+        return s.add_mesh_undoable(p, i, uvs, origin, mode, normals);
+      }
+      return uvs === undefined
+        ? s.add_mesh(p, i, origin, mode, normals)
+        : s.add_mesh_with_uvs(p, i, uvs, origin, mode, normals);
+    });
     return this.#meshHandle(id[0], id[1]);
   }
 
@@ -3519,17 +3584,49 @@ export class Scene implements SceneLike {
    * Removes a mesh. Its handle then gives `UNKNOWN_MESH`. An active drag of
    * the mesh is ended first, closing its step; the mesh's history entries
    * (the drag's included) are then dropped with it.
+   *
+   * With `undoable` the removal is an undo step (or part of the open one)
+   * and the history stays: {@link Scene.undo} brings the mesh back with the
+   * same handle, its data, placement, display (normals, colouring) and the
+   * fields on it. Nothing is copied, whatever the mesh's size. What belongs
+   * to other meshes is cut as by any removal and does not come back: fields
+   * on other meshes measured to it, its section entries and its collision
+   * rules. The kept mesh counts against the history's memory budget, and is
+   * freed once the history drops the step (see {@link Scene.isRestorable}).
    */
-  removeMesh(mesh: MeshHandle): void {
+  removeMesh(mesh: MeshHandle, options: RemoveMeshOptions = {}): void {
     const { index, generation } = this.#id(mesh);
     // A drag of this mesh ends first, recording its moves as one step.
     if (this.#drag?.mesh === mesh) {
       this.#drag.end();
     }
+    if (options.undoable === true) {
+      // Its handle stays known, for the way back.
+      call(() => this.#scene().remove_mesh_undoable(index, generation));
+      this.#prune = true;
+      return;
+    }
     call(() => this.#scene().remove_mesh(index, generation));
     const key = `${index}:${generation}`;
     this.#meshes.delete(key);
     this.#removed.set(key, mesh);
+  }
+
+  /** Whether the scene has `mesh`: `false` once it is removed, or its add is undone. */
+  has(mesh: MeshHandle): boolean {
+    const { index, generation } = this.#id(mesh);
+    return this.#peek().has_mesh(index, generation);
+  }
+
+  /**
+   * Whether undo or redo can still bring back `mesh`: it was removed with
+   * `undoable`, or its undoable add was undone, and the history has not
+   * dropped the step (its memory budget, {@link Scene.clearHistory}, or a
+   * new step after an undone add). `false` for a mesh in the scene.
+   */
+  isRestorable(mesh: MeshHandle): boolean {
+    const { index, generation } = this.#id(mesh);
+    return this.#peek().is_restorable(index, generation);
   }
 
   /**
@@ -3575,8 +3672,8 @@ export class Scene implements SceneLike {
    * boundary of an open mesh stays open. A mesh without UVs is read by vertex
    * index, so its split vertices are such a boundary: weld it first.
    *
-   * The cut undoes in one step; the added mesh stays, like the removed
-   * source of {@link Scene.join}.
+   * The cut and the added mesh are one undo step: undo restores the mesh
+   * and removes the added one, redo brings it back with the same handle.
    *
    * @deprecated Use `scene.boolean.cut()` instead.
    * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` when
@@ -3683,9 +3780,8 @@ export class Scene implements SceneLike {
    * with them; with one origin too, its vertices are exactly theirs.
    * Otherwise it is built in world space at the identity placement.
    *
-   * The new mesh is added empty and the hull lands in it as one undo step:
-   * {@link Scene.undo} empties the new mesh (it stays in the scene) and
-   * {@link Scene.redo} fills it again.
+   * The new mesh is added as one undo step: {@link Scene.undo} removes it and
+   * {@link Scene.redo} brings it back with the same handle.
    *
    * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty list or when the
    *   vertices have no volume (all on one point, line or plane; the message
@@ -3712,6 +3808,119 @@ export class Scene implements SceneLike {
     const normals = hullNormals(options);
     const r = call(() => this.#scene().convex_hull_points(buf, normals));
     return { mesh: this.#meshHandle(r[0], r[1]), ...decodeHullCounts(r) };
+  }
+
+  /**
+   * Smooths noise (from a scan, say) out of `mesh` while keeping its sharp
+   * features, as one undo step: the face normals are filtered over their
+   * neighbours, except across edges sharper than `featureAngle`, and the
+   * vertices move to fit them. Flat faces become flat again and the edges
+   * between them stay sharp. The triangles and UVs are kept.
+   *
+   * With `region` (a face selection), only those triangles are smoothed and
+   * no vertex that another triangle uses moves. The report has the
+   * surface's readouts before and after. Nothing is recorded when nothing
+   * moves.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an option out of range or
+   *   a dead or out-of-range triangle in `region`, `UNKNOWN_MESH` for a
+   *   removed mesh. Nothing changes then.
+   */
+  denoise(mesh: MeshHandle, options?: DenoiseOptions): DenoiseReport {
+    const { index, generation } = this.#id(mesh);
+    const o = checkDenoiseOptions(options);
+    const raw = call(() =>
+      this.#scene().denoise(
+        index,
+        generation,
+        o.iterations ?? Number.NaN,
+        o.strength ?? Number.NaN,
+        o.featureAngle ?? Number.NaN,
+        o.region,
+      ),
+    );
+    return decodeDenoiseReport(raw);
+  }
+
+  /**
+   * Improves `mesh`'s triangles without moving a vertex, as one undo step:
+   * flips edges towards a Delaunay triangulation wherever that takes the
+   * surface at most `dihedralLimit` degrees from what it was. Edges sharper
+   * than the limit never flip, and the smallest corner angle never drops.
+   * UVs are kept.
+   *
+   * With `region` (a face selection), only edges between two of its
+   * triangles flip. The report has the surface's readouts before and after.
+   * Nothing is recorded when nothing flips.
+   *
+   * @throws {FastMeshError} as {@link Scene.denoise}.
+   */
+  delaunayFlips(mesh: MeshHandle, options?: DelaunayFlipOptions): DelaunayFlipReport {
+    const { index, generation } = this.#id(mesh);
+    const o = checkDelaunayFlipOptions(options);
+    const raw = call(() =>
+      this.#scene().delaunay_flips(index, generation, o.dihedralLimit ?? Number.NaN, o.region),
+    );
+    return decodeDelaunayFlipReport(raw);
+  }
+
+  /**
+   * Plans the voxel grid of {@link Scene.wrap} for the same meshes and
+   * options without running it: its dimensions, voxel size, voxel count and
+   * estimated memory, and whether it is within `maxVoxels`. Cheap (one pass
+   * over the vertices), so it can follow a settings form.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty list, bad options,
+   *   meshes without triangles, or a voxel size that `f32` positions cannot
+   *   resolve; `UNKNOWN_MESH` for a removed mesh. A grid over the limit is not
+   *   an error here: it comes back with `fits: false`.
+   */
+  wrapPlan(meshes: MeshHandle | readonly MeshHandle[], options?: WrapGridOptions): WrapPlan {
+    const ids = this.#flatIds(wrapMeshList(meshes));
+    const values = encodeWrapOptions(checkWrapOptions(options));
+    return decodeWrapPlan(call(() => this.#scene().wrap_plan(ids, values)));
+  }
+
+  /**
+   * Wraps `meshes` (one mesh or several) in one closed envelope, added as a
+   * new mesh, and returns it with its counts. A robust last resort for broken
+   * scans and merged parts: the meshes may be open, holed, overlapping,
+   * self-intersecting or wound either way, and are not changed.
+   *
+   * The envelope is closed, manifold, wound outward and free of
+   * self-intersections. Gaps, slots and holes narrower than `gap` are closed,
+   * and interior cavities are filled. Every vertex is within about half the
+   * gap (and a voxel) of the meshes. It is built on a voxel grid: features
+   * thinner than a voxel may be lost, and sharp edges are cut by up to a voxel,
+   * less with `project`. A shell with a hole wider than the gap is open to the
+   * outside, so its inside is not filled and its walls, with no thickness,
+   * are lost: raise the gap over the hole. {@link Scene.wrapPlan} reports the
+   * grid and its memory beforehand, and a grid over `maxVoxels` is refused.
+   *
+   * When every mesh has the same placement and it has no scale, the wrap is
+   * built in their own space and the new mesh gets that placement; otherwise
+   * it is built in world space at the identity placement. Lengths are world
+   * units either way.
+   *
+   * The new mesh is added empty and the wrap lands in it as one undo step:
+   * {@link Scene.undo} empties the new mesh (it stays in the scene) and
+   * {@link Scene.redo} fills it again.
+   *
+   * At a million triangles this takes from about half a second to many
+   * seconds, by detail and threads: use `WorkerScene.wrap` to keep the page
+   * live.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty list, bad options,
+   *   a grid over `maxVoxels` (the message has its size and memory), or meshes
+   *   that enclose no volume at this gap and voxel size (a flat sheet, or a
+   *   shell with a hole wider than the gap); `UNKNOWN_MESH` for a removed mesh;
+   *   `OUT_OF_MEMORY`.
+   */
+  wrap(meshes: MeshHandle | readonly MeshHandle[], options?: WrapOptions): WrapResult {
+    const ids = this.#flatIds(wrapMeshList(meshes));
+    const checked = checkWrapOptions(options);
+    const r = call(() => this.#scene().wrap_meshes(ids, encodeWrapOptions(checked), checked.normals));
+    return { mesh: this.#meshHandle(r[0], r[1]), ...decodeWrapCounts(r) };
   }
 
   /**
@@ -4277,6 +4486,7 @@ export class Scene implements SceneLike {
         mesh: this.#meshHandle(c.index, c.generation),
         added: c.added,
         removed: c.removed,
+        ...(c.restorable ? { restorable: true as const } : {}),
         placementChanged: c.placementChanged,
         capacityChanged: c.capacityChanged,
         positions: c.positions,
@@ -4292,15 +4502,26 @@ export class Scene implements SceneLike {
         ),
       }),
     );
-    // A removed mesh's id never matches again: drop its handle, whatever
-    // removed it. Every removal is in this message (or was never reported,
-    // for a mesh added and removed in between), so removed handles can go.
+    // The id of a mesh removed for good never matches again: drop its
+    // handle, whatever removed it. Every removal is in this message (or was
+    // never reported, for a mesh added and removed in between), so removed
+    // handles can go. A restorable one is kept for the way back, until the
+    // history drops it.
     for (const c of raw) {
-      if (c.removed) {
+      if (c.removed && !c.restorable) {
         this.#meshes.delete(`${c.index}:${c.generation}`);
       }
     }
     this.#removed.clear();
+    if (this.#prune) {
+      this.#prune = false;
+      for (const [key, handle] of this.#meshes) {
+        const { index, generation } = meshIds.get(handle) as HandleId;
+        if (!s.has_mesh(index, generation) && !s.is_restorable(index, generation)) {
+          this.#meshes.delete(key);
+        }
+      }
+    }
     return out;
   }
 
@@ -4342,12 +4563,15 @@ export class Scene implements SceneLike {
   /**
    * Undoes the latest step; an active drag is ended first. Without an open
    * step around the drag, the drag is what gets undone; inside a caller's
-   * open step, that whole step (drag included) is closed and undone. Returns
-   * `false` when there is nothing to undo.
+   * open step, that whole step (drag included) is closed and undone. A mesh
+   * the step added undoably leaves the scene, and one it removed undoably
+   * comes back (see {@link MeshChange.added}). Returns `false` when there is
+   * nothing to undo.
    */
   undo(): boolean {
     const s = this.#scene();
     this.#drag?.end();
+    this.#prune = true;
     const done = call(() => s.undo());
     this.#stepDepth = 0;
     return done;
@@ -4357,6 +4581,7 @@ export class Scene implements SceneLike {
   redo(): boolean {
     const s = this.#scene();
     this.#drag?.end();
+    this.#prune = true;
     const done = call(() => s.redo());
     this.#stepDepth = 0;
     return done;
@@ -4378,14 +4603,15 @@ export class Scene implements SceneLike {
   clearHistory(): void {
     const s = this.#scene();
     this.#drag?.end();
+    this.#prune = true;
     call(() => s.clear_history());
     this.#stepDepth = 0;
   }
 
   /**
-   * Opens a history step, or one more nesting level of the open one. Edits
-   * and placement changes until the matching {@link Scene.endStep} are
-   * undone together.
+   * Opens a history step, or one more nesting level of the open one. Edits,
+   * placement changes and undoable adds and removals until the matching
+   * {@link Scene.endStep} are undone together.
    */
   beginStep(): void {
     const s = this.#scene();
@@ -4413,6 +4639,7 @@ export class Scene implements SceneLike {
   /** Reverts and discards the open step, however deeply nested. Throws `STEP_NOT_OPEN` when none is open. */
   cancelStep(): void {
     const s = this.#scene();
+    this.#prune = true;
     call(() => s.cancel_step());
     this.#stepDepth = 0;
     // The drag's step is gone with it: later moves must not record steps.
@@ -5622,6 +5849,69 @@ export class Scene implements SceneLike {
     const { index, generation } = this.#id(mesh);
     const raw = call(() => this.#scene().delete_selected_faces(index, generation, normalizeU32Selection(selectedTris)));
     return decodeFaceEditReport(raw);
+  }
+
+  /**
+   * Extrudes `triangles` of `mesh`: moves them by `options.distance` (world
+   * units) and builds side walls between where the selection's boundary was
+   * and where it went, as one undo step. A closed, consistently wound mesh
+   * stays closed and consistently wound.
+   *
+   * Each region of the selection moves along its average normal by default;
+   * see {@link ExtrudeFacesOptions.direction}. Selections with holes get walls
+   * around them, and regions that touch at a vertex separate there. Selected
+   * edges on the mesh's open boundary get walls too. The triangles keep their
+   * slots and are the moved faces, so the same selection extrudes them again.
+   *
+   * Self-intersections of the result are reported, not refused: pushing a
+   * face through the other side of a thin part, say, gives a closed mesh that
+   * crosses itself.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty selection, a slot
+   *   without a live triangle, a distance or direction that is zero or not
+   *   finite, a selected edge shared by three or more triangles, selected
+   *   triangles wound against each other, or a region whose normals cancel out
+   *   (give a direction then); `UNKNOWN_MESH` for a removed mesh. The mesh is
+   *   unchanged on error.
+   */
+  extrudeFaces(mesh: MeshHandle, triangles: Indices, options: ExtrudeFacesOptions): ExtrudeFacesResult {
+    const { index, generation } = this.#id(mesh);
+    const tris = normalizeU32Selection(triangles, "triangles");
+    const { distance, mode, direction, check } = extrudeFacesArgs(options);
+    return decodeExtrudeFaces(
+      call(() => this.#scene().extrude_faces(index, generation, tris, distance, mode, direction, check)),
+    );
+  }
+
+  /**
+   * Turns an open surface into a solid, as one undo step: runs boundary loops
+   * of `mesh` along a world direction (down by default) to a flat plane
+   * perpendicular to it, joins each with a wall and closes it with a flat cap.
+   * The plane is at `options.height`, or `options.offset` past the mesh's
+   * furthest vertex.
+   *
+   * By default only the longest loop is extruded, so fill smaller holes first
+   * (or pass `loops: "all"`, which makes them holes through the solid). A
+   * surface that faces the base is turned around, so that the solid faces
+   * outward ({@link ExtrudeBaseResult.flipped}).
+   *
+   * Self-intersections of the result are reported, not refused: a plane that
+   * cuts through the surface, say.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` when the mesh has no boundary
+   *   loop, a loop is open or not clean (orient or repair the mesh first), a
+   *   boundary vertex does not lie before the plane, or a loop's outline on
+   *   the plane crosses itself; `STALE_LOOPS` for a loop id that matches no
+   *   loop; `UNKNOWN_MESH` for a removed mesh. The mesh is unchanged on error.
+   */
+  extrudeBase(mesh: MeshHandle, options: ExtrudeBaseOptions): ExtrudeBaseResult {
+    const { index, generation } = this.#id(mesh);
+    const a = extrudeBaseArgs(options);
+    return decodeExtrudeBase(
+      call(() =>
+        this.#scene().extrude_base(index, generation, a.direction, a.plane, a.value, a.which, a.loops, a.refine, a.check),
+      ),
+    );
   }
 
   /** Extracts `selectedTris` into a new standalone mesh preserving exact world coordinates. */

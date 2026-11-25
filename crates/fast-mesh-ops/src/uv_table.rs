@@ -8,16 +8,19 @@ use fast_mesh_store::{Mesh, VertexId};
 
 use crate::bridge::BridgeOptions;
 use crate::deform::{Brush, Falloff, GrabOptions, InflateOptions, SmoothMethod, SmoothOptions};
+use crate::extrude::{
+    BaseLevel, ExtrudeBaseOptions, ExtrudeFacesOptions, extrude_base, extrude_faces,
+};
 use crate::remesh::{Region, RemeshOptions, SurfaceRemeshOptions, remesh_surface};
 use crate::simplify::{DecimateOptions, SimplifyOptions, simplify_with};
 use crate::subdivide::{SubdivideMethod, SubdivideOptions};
 use crate::test_util::{box_mesh, edit, grid, grid_without, hemisphere, mesh_of, uv_sphere};
 use crate::{
     AppendSource, AutoRepairOptions, BooleanOp, ComponentOptions, CutOptions, DegenerateOptions,
-    FillOptions, OffsetAlgorithm, OffsetOptions, ShellOptions, SkipReason, append_mesh,
-    append_mesh_with_uvs, apply_boolean, auto_repair, boolean_plan, boundary_loops, bridge_loops,
-    cut_by_plane, fill_holes, inflate, offset, orient, remove_degenerate, remove_small_components,
-    shell, weld,
+    DelaunayOptions, DenoiseOptions, FillOptions, OffsetAlgorithm, OffsetOptions, ShellOptions,
+    SkipReason, append_mesh, append_mesh_with_uvs, apply_boolean, auto_repair, boolean_plan,
+    boundary_loops, bridge_loops, cut_by_plane, delaunay_flips, denoise, fill_holes, inflate,
+    offset, orient, remove_degenerate, remove_small_components, shell, weld,
 };
 
 /// A planar UV of a position: linear, so anything interpolated stays on it.
@@ -540,6 +543,49 @@ fn shell_copies_uvs_to_the_inner_surface() {
 }
 
 #[test]
+fn extrude_faces_copies_uvs_to_the_caps() {
+    // Straight up, so a copy with its parent's UV stays on the planar mapping.
+    let mut m = with_planar(grid(4));
+    let before = copy(&m);
+    let sel: Vec<u32> = (10..22).collect();
+    let options = ExtrudeFacesOptions::default();
+    let (r, _) = edit(&mut m, |tx| extrude_faces(tx, &sel, &options));
+    assert!(r.added_vertices > 0);
+    assert_kept(&m, &before);
+    assert_planar(&m, 0.);
+}
+
+#[test]
+fn extrude_faces_walls_a_seam() {
+    // Two islands of two triangles: each has 4 border edges, the seam's among
+    // them, with 2 wall triangles on each.
+    let mut m = seam_with_bend(0.);
+    let sel: Vec<u32> = (0..4).collect();
+    let options = ExtrudeFacesOptions::default();
+    let (r, _) = edit(&mut m, |tx| extrude_faces(tx, &sel, &options));
+    assert_eq!(r.regions, 2);
+    assert_eq!(r.wall_triangles.len(), 2 * 8);
+    let on_seam = r
+        .wall_triangles
+        .iter()
+        .filter_map(|&t| m.triangle(t))
+        .filter(|t| t.iter().all(|&v| m.position(v).unwrap()[0] == 1.))
+        .count();
+    assert_eq!(on_seam, 4);
+}
+
+#[test]
+fn extrude_base_copies_rim_uvs_and_interpolates_the_cap() {
+    let mut m = with_planar(hemisphere(6, 16, 1.0));
+    let before = copy(&m);
+    let options = ExtrudeBaseOptions::along([0., 0., -1.], BaseLevel::At(0.5));
+    let (r, _) = edit(&mut m, |tx| extrude_base(tx, &options));
+    assert!(r.cap_vertices > 0);
+    assert_kept(&m, &before);
+    assert_planar(&m, 1e-6);
+}
+
+#[test]
 fn bridge_keeps_uvs() {
     // Two parallel quads, facing each other.
     let mut m = mesh_of(
@@ -570,6 +616,32 @@ fn brush() -> Brush {
         falloff: Falloff::Smooth,
         strength: 0.3,
     }
+}
+
+#[test]
+fn denoise_and_delaunay_flips_keep_uvs_on_their_vertices() {
+    // Sheared cells, so that there is something to flip.
+    let base = grid(6);
+    let mut positions: Vec<f32> = base.positions().iter().flatten().copied().collect();
+    for (i, p) in positions.chunks_mut(3).enumerate() {
+        p[0] += 0.8 * p[1];
+        p[2] = 0.02 * ((i * i) as f32).sin();
+    }
+    let triangles: Vec<[u32; 3]> = (0..base.triangle_slots() as u32)
+        .filter_map(|t| base.triangle(t))
+        .collect();
+    let start = with_planar(mesh_of(&positions, &triangles));
+    let mut m = copy(&start);
+    let (r, _) = edit(&mut m, |tx| denoise(tx, &DenoiseOptions::default(), None));
+    assert!(r.moved > 0);
+    assert_kept(&m, &start);
+    let mut m = copy(&start);
+    let (r, _) = edit(&mut m, |tx| {
+        delaunay_flips(tx, &DelaunayOptions::default(), None)
+    });
+    assert!(r.flips > 0);
+    assert_kept(&m, &start);
+    assert_planar(&m, 0.0);
 }
 
 #[test]

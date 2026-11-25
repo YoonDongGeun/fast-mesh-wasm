@@ -8,12 +8,9 @@
 // (`WorkerScene.generatePrimitive`, so the page loads no wasm of its own),
 // or on the main thread with `?local` (the module is initialised already).
 //
-// Adding: the engine's history records edits and placements, not added
-// meshes (a cut's added part stays on undo, too). So the mesh is added
-// empty, at the chosen centre, and its geometry goes in as one edit, with
-// the rotation baked into the positions: that edit is the one undo step.
-// Undo empties the mesh (its row stays, drawn empty, like any mesh whose
-// triangles are all gone) and redo brings the shape back.
+// Adding: the mesh is added at the chosen centre, with the rotation baked
+// into the positions, as one undo step: undo removes it (and its row) and
+// redo brings it back.
 import type { MeshHandle, PrimitiveMesh, PrimitiveShape, PrimitiveShapeKind, SceneLike } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { bounds, type Vec3 } from "../../../io/mesh-data";
@@ -362,12 +359,37 @@ export interface CreatePlacement {
 }
 
 /**
+ * Settles once the scene has `mesh` (a Worker scene adds it later): resolves
+ * also when it is gone again by then (undone), rejects when its add failed.
+ */
+function landed(store: SceneStore, mesh: MeshHandle): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let off: (() => void) | undefined;
+    const check = (): boolean => {
+      const state = store.getSnapshot().meshes.get(mesh);
+      if (state?.status === "computing") {
+        return false;
+      }
+      off?.();
+      if (state?.status === "error") {
+        reject(state.error ?? new Error("The mesh could not be added."));
+      } else {
+        resolve();
+      }
+      return true;
+    };
+    if (!check()) {
+      off = store.subscribe(check);
+    }
+  });
+}
+
+/**
  * Adds `mesh` to the scene and the list as one undo step (see the file
- * comment): an empty mesh with its origin at the centre, then one edit
- * adding every vertex (in world space, rotated) and triangle. A fresh mesh
- * numbers its vertices from 0, so the triangles keep their indices. The item
- * lists at once; `done` settles when the edit has landed, and on failure the
- * empty mesh is removed again.
+ * comment), with its origin at the centre. The item lists at once; `done`
+ * settles when the mesh has landed, and on failure it is removed again.
+ *
+ * @throws when the scene refuses the mesh at once (nothing is added).
  */
 export function addPrimitive(
   store: SceneStore,
@@ -376,24 +398,16 @@ export function addPrimitive(
   place: CreatePlacement,
 ): { item: Item; done: Promise<void> } {
   const world = placePositions(mesh.positions, place.centre, place.rotationDeg);
-  const handle: MeshHandle = store.addMesh(new Float64Array(0), new Uint32Array(0), { origin: place.centre });
+  const handle: MeshHandle = store.addMesh(world, mesh.indices, { origin: place.centre, undoable: true });
   const item = app.listMesh(handle, {
     name: place.name,
     triangles: mesh.indices.length / 3,
     center: [place.centre[0], place.centre[1], place.centre[2]],
     radius: bounds(world).radius,
   });
-  const done = store
-    .edit(handle, [
-      { op: "addVertices", positions: world },
-      { op: "addTriangles", triangles: mesh.indices },
-    ])
-    .then(
-      () => undefined,
-      (e: unknown) => {
-        app.removeMesh(store, item);
-        throw e;
-      },
-    );
+  const done = landed(store, handle).catch((e: unknown) => {
+    app.removeMesh(store, item, { undoable: false });
+    throw e;
+  });
   return { item, done };
 }

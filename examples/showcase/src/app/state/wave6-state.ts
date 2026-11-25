@@ -16,6 +16,7 @@ import type {
   PlaceUpAxis,
   SoftDeformSolver,
 } from "fast-mesh-wasm";
+import { DEFAULT_TEXT_PARAMS, type TextParams } from "../../features/mesh-edit/ux/text-mesh";
 
 export interface Wave6SelectState {
   activeTool: null | "lasso" | "box" | "brush" | "crease" | "shell";
@@ -89,8 +90,10 @@ export interface Wave6PrintPrepState {
     generatePlug: boolean;
   };
   placeParams: {
-    stampSource: "peg" | "hexBoss" | "dome" | "cube" | "sceneMesh";
+    stampSource: "peg" | "hexBoss" | "dome" | "cube" | "sceneMesh" | "text";
     stampMeshId: number | null;
+    /** The text a `"text"` stamp spells, and its letter height, depth and spacing (#260). */
+    text: TextParams;
     mode: "embedUnion" | "engraveSubtract" | "keepSeparate";
     upAxis: PlaceUpAxis;
     embedDepth: number;
@@ -180,6 +183,7 @@ export function createDefaultWave6State(): Wave6State {
       placeParams: {
         stampSource: "peg",
         stampMeshId: null,
+        text: { ...DEFAULT_TEXT_PARAMS },
         mode: "embedUnion",
         upAxis: "posZ",
         embedDepth: 0.5,

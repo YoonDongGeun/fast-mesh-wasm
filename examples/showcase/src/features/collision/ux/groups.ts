@@ -49,6 +49,11 @@ export function liveMembers<M>(members: readonly M[], items: readonly { mesh: M 
   return members.filter((m) => items.some((i) => i.mesh === m));
 }
 
+/** Puts `m` back into the groups `ids` (an undone removal); groups removed since stay away. */
+export function restoreMember<M>(groups: readonly NamedGroup<M>[], ids: readonly number[], m: M): NamedGroup<M>[] {
+  return groups.map((g) => (ids.includes(g.id) && !g.members.includes(m) ? { ...g, members: [...g.members, m] } : g));
+}
+
 /** Drops `m` from every group (a removal); groups stay, even emptied. */
 export function dropMember<M>(groups: readonly NamedGroup<M>[], m: M): NamedGroup<M>[] {
   return groups.map((g) => (g.members.includes(m) ? { ...g, members: g.members.filter((x) => x !== m) } : g));

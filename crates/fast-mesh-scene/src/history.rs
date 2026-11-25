@@ -1,5 +1,5 @@
-//! The shared undo history: steps of edits and placement changes across
-//! meshes, limited by a memory budget.
+//! The shared undo history: steps of edits, placement changes and undoable
+//! adds and removals across meshes, limited by a memory budget.
 
 use std::collections::VecDeque;
 use std::mem::size_of;
@@ -29,37 +29,70 @@ pub(crate) enum Change {
         old: Placement,
         new: Placement,
     },
+    /// An undoable add: undo parks the mesh, redo restores it. `bytes` is
+    /// what the mesh held when it was last parked by its undo (see
+    /// `Entry::byte_size`).
+    Add { id: MeshId, bytes: usize },
+    /// An undoable removal: the mesh is parked, undo restores it and redo
+    /// parks it again. `bytes` is what the mesh held when it was last parked.
+    Remove { id: MeshId, bytes: usize },
 }
 
 impl Change {
     fn mesh(&self) -> MeshId {
         match self {
-            Change::Edit(id, _) | Change::Placement { id, .. } => *id,
+            Change::Edit(id, _)
+            | Change::Placement { id, .. }
+            | Change::Add { id, .. }
+            | Change::Remove { id, .. } => *id,
         }
     }
 
-    fn bytes(&self) -> usize {
+    /// The bytes the change holds on `side`. Only the entry a parked mesh is
+    /// restored by holds it: its removal on the undo side, its add on the
+    /// redo side. On the other side the mesh is live, or held by another
+    /// entry.
+    fn bytes(&self, side: PatchSide) -> usize {
         match self {
             Change::Edit(_, p) => p.byte_size(),
             Change::Placement { .. } => PLACEMENT_BYTES,
-        }
-    }
-
-    /// Releases the slots the change reserves on `mesh` (its own mesh). Call
-    /// once, when the change is discarded.
-    fn release(&self, mesh: &mut Mesh, side: PatchSide) {
-        if let Change::Edit(_, p) = self {
-            p.release(mesh, side);
+            Change::Add { bytes, .. } if side == PatchSide::Redoable => *bytes,
+            Change::Remove { bytes, .. } if side == PatchSide::Undoable => *bytes,
+            Change::Add { .. } | Change::Remove { .. } => 0,
         }
     }
 }
 
-/// Releases the slots `change` reserves, looking its mesh up in `entries`.
-/// Every change in the history belongs to a live mesh: `remove_mesh` drops a
-/// mesh's changes before the mesh goes.
+/// Releases what `change` holds once the history drops it from `side`: the
+/// slots its patch reserves (on its mesh, live or parked), or the parked mesh
+/// it was the last way back to. Call once, when the change is discarded.
+///
+/// An add dropped from the redo side, or a removal dropped from the undo
+/// side, frees its parked mesh: the id never matches again. An add dropped
+/// from the undo side, or a removal from the redo side, leaves its live mesh
+/// alone: it just stays.
+///
+/// Every change in the history belongs to a live or a parked mesh, or to one
+/// another change of the same batch just freed: `remove_mesh` drops a live
+/// mesh's changes before the mesh goes, and a parked mesh is freed only here.
 fn release_in(change: &Change, entries: &mut SlotMap<Entry>, side: PatchSide) {
-    if let Some(e) = entries.get_mut(change.mesh()) {
-        change.release(&mut e.mesh, side);
+    match change {
+        Change::Edit(id, p) => {
+            if let Some(e) = entries.get_any_mut(*id) {
+                p.release(&mut e.mesh, side);
+            }
+        }
+        Change::Placement { .. } => {}
+        Change::Add { id, .. } => {
+            if side == PatchSide::Redoable {
+                drop(entries.release_parked(*id));
+            }
+        }
+        Change::Remove { id, .. } => {
+            if side == PatchSide::Undoable {
+                drop(entries.release_parked(*id));
+            }
+        }
     }
 }
 
@@ -67,12 +100,35 @@ fn release_in(change: &Change, entries: &mut SlotMap<Entry>, side: PatchSide) {
 #[derive(Default)]
 pub(crate) struct Step {
     changes: Vec<Change>,
+    /// What the changes hold on the stack the step is on.
     bytes: usize,
 }
 
-/// What one change did when a step was undone or redone: the mesh, and its
-/// changes (`None` for a placement change).
-pub(crate) type Done = (MeshId, Option<ChangeSet>);
+impl Step {
+    /// Counts what the step holds now that it is on `side`'s stack: the
+    /// meshes it just parked are measured.
+    fn recount(&mut self, entries: &SlotMap<Entry>, side: PatchSide) {
+        for c in &mut self.changes {
+            if let Change::Add { id, bytes } | Change::Remove { id, bytes } = c
+                && let Some(e) = entries.get_parked(*id)
+            {
+                *bytes = e.byte_size();
+            }
+        }
+        self.bytes = self.changes.iter().map(|c| c.bytes(side)).sum();
+    }
+}
+
+/// What one change did when a step was undone or redone.
+pub(crate) enum Done {
+    /// An edit was applied or reverted: the mesh and its changes.
+    Edit(MeshId, ChangeSet),
+    /// A placement entry was applied or reverted.
+    Placement(MeshId),
+    /// The mesh was parked or restored: its slot says which. The scene has
+    /// yet to bring its registries in line (`Scene::settle_presence`).
+    Presence(MeshId),
+}
 
 /// Undo and redo stacks of steps, plus the step being recorded.
 ///
@@ -80,9 +136,10 @@ pub(crate) type Done = (MeshId, Option<ChangeSet>);
 /// drops the oldest undo steps; it runs whenever a change is recorded, at
 /// which point the redo stack is already empty. The open step is never
 /// evicted while open; once closed, it is evicted like any other step, so a
-/// step larger than the whole budget is dropped as soon as it closes. The
-/// one exception is `undo` on a non-empty open step: the step is undone
-/// first and then meets the budget on the redo stack (see `undo`).
+/// step larger than the whole budget is dropped as soon as it closes. An
+/// undo or a redo always happens, and then meets the budget, which it
+/// exceeds only when it undid a non-empty open step or parked meshes (see
+/// `trim_undone` and `trim_redone`).
 pub(crate) struct History {
     undo: VecDeque<Step>,
     redo: Vec<Step>,
@@ -148,7 +205,7 @@ impl History {
     /// since the last `record`.
     pub(crate) fn record(&mut self, entries: &mut SlotMap<Entry>, change: Change) {
         self.drop_redo(entries);
-        let bytes = change.bytes();
+        let bytes = change.bytes(PatchSide::Undoable);
         self.open.changes.push(change);
         self.open.bytes += bytes;
         self.bytes += bytes;
@@ -201,15 +258,19 @@ impl History {
     }
 
     fn evict(&mut self, entries: &mut SlotMap<Entry>) {
-        while self.bytes > self.budget {
-            let Some(step) = self.undo.pop_front() else {
-                break;
-            };
-            self.bytes -= step.bytes;
-            for c in &step.changes {
-                release_in(c, entries, PatchSide::Undoable);
-            }
+        while self.bytes > self.budget && self.evict_one(entries) {}
+    }
+
+    /// Drops the oldest undo step; false when there is none.
+    fn evict_one(&mut self, entries: &mut SlotMap<Entry>) -> bool {
+        let Some(step) = self.undo.pop_front() else {
+            return false;
+        };
+        self.bytes -= step.bytes;
+        for c in &step.changes {
+            release_in(c, entries, PatchSide::Undoable);
         }
+        true
     }
 
     /// Closes the open step, then drops every step, releasing their slots.
@@ -224,11 +285,11 @@ impl History {
         self.bytes = 0;
     }
 
-    /// Drops the oldest redo steps until the budget is met. Only needed after
-    /// an open step was undone straight onto the redo stack, since an open
-    /// step is not evicted while open and may exceed the budget.
-    fn evict_redo(&mut self, entries: &mut SlotMap<Entry>) {
-        while self.bytes > self.budget && !self.redo.is_empty() {
+    /// Drops the oldest redo steps until the budget is met, keeping the last
+    /// `keep`. Only needed after an undo or a redo (see `trim_undone` and
+    /// `trim_redone`).
+    fn evict_redo(&mut self, entries: &mut SlotMap<Entry>, keep: usize) {
+        while self.bytes > self.budget && self.redo.len() > keep {
             let step = self.redo.remove(0);
             self.bytes -= step.bytes;
             for c in &step.changes {
@@ -259,9 +320,10 @@ impl History {
     ///
     /// A non-empty open step is undone directly, before any eviction, so
     /// that it is undone even when it exceeds the budget (§15.3: Ctrl+Z
-    /// mid-drag undoes the drag). It then goes to the redo stack, and the
-    /// budget is met by evicting the oldest undo steps, then, if that is not
-    /// enough, by dropping it from the redo stack again.
+    /// mid-drag undoes the drag). It then goes to the redo stack.
+    ///
+    /// The caller meets the budget with `trim_undone` once it has settled the
+    /// parked and restored meshes, some of which that may free.
     pub(crate) fn undo(&mut self, entries: &mut SlotMap<Entry>) -> Result<Option<Vec<Done>>> {
         let has_open = !self.open.changes.is_empty();
         if !has_open && self.undo.is_empty() {
@@ -285,15 +347,20 @@ impl History {
                 }
             };
             self.depth = 0;
-            self.redo.push(std::mem::take(&mut self.open));
-            self.evict(entries);
-            self.evict_redo(entries);
+            let mut step = std::mem::take(&mut self.open);
+            self.bytes -= step.bytes;
+            step.recount(entries, PatchSide::Redoable);
+            self.bytes += step.bytes;
+            self.redo.push(step);
             return Ok(Some(done));
         }
-        let step = self.undo.pop_back().ok_or(SceneError::Corrupted)?;
+        let mut step = self.undo.pop_back().ok_or(SceneError::Corrupted)?;
         match run_step(&step, entries, false) {
             Ok(done) => {
                 self.depth = 0;
+                self.bytes -= step.bytes;
+                step.recount(entries, PatchSide::Redoable);
+                self.bytes += step.bytes;
                 self.redo.push(step);
                 Ok(Some(done))
             }
@@ -309,7 +376,8 @@ impl History {
     }
 
     /// Closes the open step and redoes the latest undone step. `None` when
-    /// there is nothing to redo. Errors as for `undo`.
+    /// there is nothing to redo. Errors as for `undo`. The caller meets the
+    /// budget with `trim_redone`, as for `undo`.
     pub(crate) fn redo(&mut self, entries: &mut SlotMap<Entry>) -> Result<Option<Vec<Done>>> {
         if self.redo.is_empty() {
             // Closing may evict the closed step, as `end_step` would; there
@@ -326,10 +394,13 @@ impl History {
         self.undo
             .try_reserve(1)
             .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
-        let step = self.redo.pop().ok_or(SceneError::Corrupted)?;
+        let mut step = self.redo.pop().ok_or(SceneError::Corrupted)?;
         match run_step(&step, entries, true) {
             Ok(done) => {
                 self.depth = 0;
+                self.bytes -= step.bytes;
+                step.recount(entries, PatchSide::Undoable);
+                self.bytes += step.bytes;
                 self.undo.push_back(step);
                 Ok(Some(done))
             }
@@ -344,10 +415,41 @@ impl History {
         }
     }
 
-    /// Reverts the open step's changes and discards the step, releasing the
-    /// slots its patches created. On error the step stays open, unchanged,
-    /// except that [`SceneError::Corrupted`] discards it.
-    pub(crate) fn cancel(&mut self, entries: &mut SlotMap<Entry>) -> Result<Vec<Done>> {
+    /// Meets the budget after `undo`. What was undone before goes first (it
+    /// is the furthest to redo), then the oldest undo steps, then, if that
+    /// is not enough, the step itself. A step larger than the whole budget
+    /// that parked meshes goes at once, sparing the undo steps.
+    pub(crate) fn trim_undone(&mut self, entries: &mut SlotMap<Entry>) {
+        self.evict_redo(entries, 1);
+        let adds = |s: &Step| s.changes.iter().any(|c| matches!(c, Change::Add { .. }));
+        if self
+            .redo
+            .last()
+            .is_some_and(|s| s.bytes > self.budget && adds(s))
+        {
+            self.evict_redo(entries, 0);
+        }
+        self.evict(entries);
+        self.evict_redo(entries, 0);
+    }
+
+    /// Meets the budget after `redo`, which exceeds it only when it parked
+    /// meshes: the oldest undo steps go first, then the furthest redo steps,
+    /// then, if that is not enough, the step itself (its removals are then
+    /// permanent).
+    pub(crate) fn trim_redone(&mut self, entries: &mut SlotMap<Entry>) {
+        while self.bytes > self.budget && self.undo.len() > 1 {
+            self.evict_one(entries);
+        }
+        self.evict_redo(entries, 0);
+        self.evict(entries);
+    }
+
+    /// Reverts the open step's changes and takes the step out, for the caller
+    /// to `discard` once it has settled the parked and restored meshes. On
+    /// error the step stays open, unchanged, except that
+    /// [`SceneError::Corrupted`] discards it.
+    pub(crate) fn cancel(&mut self, entries: &mut SlotMap<Entry>) -> Result<(Vec<Done>, Step)> {
         if self.depth == 0 {
             return Err(SceneError::StepNotOpen);
         }
@@ -363,10 +465,15 @@ impl History {
         let step = std::mem::take(&mut self.open);
         self.depth = 0;
         self.bytes -= step.bytes;
+        Ok((done, step))
+    }
+
+    /// Releases what a step reverted by `cancel` holds: the slots its patches
+    /// created, and the meshes it added.
+    pub(crate) fn discard(step: &Step, entries: &mut SlotMap<Entry>) {
         for c in &step.changes {
             release_in(c, entries, PatchSide::Redoable);
         }
-        Ok(done)
     }
 
     /// Discards the open step after [`SceneError::Corrupted`]: its patches'
@@ -380,11 +487,13 @@ impl History {
     /// Drops changes of mesh `id`; steps left empty are dropped too (the open
     /// step stays open).
     ///
-    /// - With `mesh` (removal): every change of the mesh goes, and the slots
-    ///   its patches reserve on `mesh` are released.
+    /// - With `mesh` (removal for good): every change of the mesh goes, and
+    ///   the slots its patches reserve on `mesh` are released. Its add and
+    ///   removal entries hold nothing: the mesh is live, so its add is on the
+    ///   undo side and a removal on the redo side.
     /// - Without (compaction): only its edit changes go, releasing nothing,
-    ///   since their slots no longer exist; placement changes stay valid and
-    ///   are kept.
+    ///   since their slots no longer exist; placement, add and removal
+    ///   changes stay valid and are kept.
     pub(crate) fn forget(&mut self, id: MeshId, mut mesh: Option<&mut Mesh>) {
         let mut drop_from = |step: &mut Step, side: PatchSide| {
             step.changes.retain(|c| {
@@ -393,14 +502,16 @@ impl History {
                 }
                 match mesh.as_deref_mut() {
                     Some(m) => {
-                        c.release(m, side);
+                        if let Change::Edit(_, p) = c {
+                            p.release(m, side);
+                        }
                         false
                     }
                     // Compaction: only patches go stale with the epoch.
-                    None => matches!(c, Change::Placement { .. }),
+                    None => !matches!(c, Change::Edit(..)),
                 }
             });
-            step.bytes = step.changes.iter().map(Change::bytes).sum();
+            step.bytes = step.changes.iter().map(|c| c.bytes(side)).sum();
         };
         for step in &mut self.undo {
             drop_from(step, PatchSide::Undoable);
@@ -420,6 +531,12 @@ impl History {
     #[cfg(test)]
     pub(crate) fn undo_len(&self) -> usize {
         self.undo.len()
+    }
+
+    /// Number of steps that can be redone.
+    #[cfg(test)]
+    pub(crate) fn redo_len(&self) -> usize {
+        self.redo.len()
     }
 
     /// Bytes of each undo step, oldest first.
@@ -448,6 +565,11 @@ impl History {
 /// The caller drops the failed step, so the patches whose end state this run
 /// determines are released for it here; a patch a failed change touched is
 /// left reserved, since its state is unknown.
+///
+/// Adds and removals only flip their mesh between live and parked here, which
+/// cannot fail, so they always recover. The scene's registries follow once
+/// the whole step has run (`Scene::settle_presence`), and a step that fails
+/// never touches them.
 fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<Vec<Done>> {
     let mut done: Vec<Done> = Vec::new();
     done.try_reserve_exact(step.changes.len())
@@ -461,10 +583,15 @@ fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<
     };
     for i in 0..step.changes.len() {
         match run_change(&step.changes[order(i)], entries, forward) {
-            Ok(changes) => done.push((step.changes[order(i)].mesh(), changes)),
+            Ok(d) => done.push(d),
             Err(e) => {
                 for j in (0..i).rev() {
                     if run_change(&step.changes[order(j)], entries, !forward).is_err() {
+                        // The adds and removals still to recover: no mesh may
+                        // stay where the scene's registries do not expect it.
+                        for k in (0..j).rev() {
+                            run_presence(&step.changes[order(k)], entries, !forward);
+                        }
                         mark_corrupted(step, entries);
                         release_partial(step, entries, forward, i, j);
                         return Err(SceneError::Corrupted);
@@ -487,8 +614,8 @@ fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<
 /// for the state each is known to be in. Change `i` is the one whose run
 /// failed and `j` the one whose recovery failed; both are left reserved.
 /// Changes run and recovered, or never run, are at the step's far state
-/// (after it for undo, before it for redo); changes run and never recovered
-/// are at the run's end state.
+/// (after it for undo, before it for redo), and so is every add and removal;
+/// edits run and never recovered are at the run's end state.
 fn release_partial(step: &Step, entries: &mut SlotMap<Entry>, forward: bool, i: usize, j: usize) {
     let order = |k: usize| {
         if forward {
@@ -514,7 +641,9 @@ fn release_partial(step: &Step, entries: &mut SlotMap<Entry>, forward: bool, i: 
         release_in(&step.changes[order(k)], entries, far);
     }
     for k in 0..j {
-        release_in(&step.changes[order(k)], entries, end);
+        let c = &step.changes[order(k)];
+        let presence = matches!(c, Change::Add { .. } | Change::Remove { .. });
+        release_in(c, entries, if presence { far } else { end });
     }
 }
 
@@ -547,6 +676,7 @@ fn mark_corrupted(step: &Step, entries: &mut SlotMap<Entry>) {
         match c {
             Change::Edit(..) => e.flag_unknown(),
             Change::Placement { .. } => e.report_placement(),
+            Change::Add { .. } | Change::Remove { .. } => {}
         }
     }
     for c in &step.changes {
@@ -558,18 +688,11 @@ fn mark_corrupted(step: &Step, entries: &mut SlotMap<Entry>) {
     }
 }
 
-/// Applies (`forward`) or reverts one change. Returns the mesh's changes, or
-/// `None` for a placement change. On error the mesh is unchanged.
-fn run_change(
-    change: &Change,
-    entries: &mut SlotMap<Entry>,
-    forward: bool,
-) -> Result<Option<ChangeSet>> {
-    let entry = entries
-        .get_mut(change.mesh())
-        .ok_or(SceneError::Corrupted)?;
+/// Applies (`forward`) or reverts one change. On error the mesh is unchanged.
+fn run_change(change: &Change, entries: &mut SlotMap<Entry>, forward: bool) -> Result<Done> {
     match change {
-        Change::Edit(_, patch) => {
+        Change::Edit(id, patch) => {
+            let entry = entries.get_mut(*id).ok_or(SceneError::Corrupted)?;
             #[cfg(test)]
             crate::scene::fault::before_patch()?;
             let changes = if forward {
@@ -577,11 +700,33 @@ fn run_change(
             } else {
                 patch.revert(&mut entry.mesh)?
             };
-            Ok(Some(changes))
+            Ok(Done::Edit(*id, changes))
         }
-        Change::Placement { old, new, .. } => {
+        Change::Placement { id, old, new } => {
+            let entry = entries.get_mut(*id).ok_or(SceneError::Corrupted)?;
             entry.placement = if forward { *new } else { *old };
-            Ok(None)
+            Ok(Done::Placement(*id))
         }
+        Change::Add { id, .. } | Change::Remove { id, .. } => {
+            if run_presence(change, entries, forward) {
+                Ok(Done::Presence(*id))
+            } else {
+                // Defensive: the mesh is not where the change expects it.
+                Err(SceneError::Corrupted)
+            }
+        }
+    }
+}
+
+/// Parks or restores the mesh of an add or a removal: redoing an add, or
+/// undoing a removal, restores it. False when the mesh is not where the
+/// change expects it, and for other changes, which are left alone.
+fn run_presence(change: &Change, entries: &mut SlotMap<Entry>, forward: bool) -> bool {
+    match change {
+        Change::Add { id, .. } if forward => entries.unpark(*id),
+        Change::Add { id, .. } => entries.park(*id),
+        Change::Remove { id, .. } if forward => entries.park(*id),
+        Change::Remove { id, .. } => entries.unpark(*id),
+        Change::Edit(..) | Change::Placement { .. } => false,
     }
 }

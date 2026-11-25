@@ -510,10 +510,13 @@ describe("Scene", () => {
     const keptBounds = s.bounds(mesh)!;
     const keptOriginX = s.matrix4(mesh)[12];
     expect(keptBounds.min[0] + keptOriginX).toBeGreaterThanOrEqual(0.5 - 1e-6);
-    // One undo step restores the cut mesh; the added part stays.
+    // One undo step restores the cut mesh and removes the added part (#269).
     expect(s.undo()).toBe(true);
     expect(s.triangleCount(mesh)).toBe(12);
+    expect([s.has(r.removed), s.isRestorable(r.removed)]).toEqual([false, true]);
+    expect(s.redo()).toBe(true);
     expect(s.triangleCount(r.removed)).toBe(r.removedTriangles);
+    expect(s.undo()).toBe(true);
     // A plane past the cube misses it.
     expect(codeOf(() => s.cutByPlane(mesh, { origin: [5, 0, 0], normal: [1, 0, 0] }))).toBe(
       "INVALID_ARGUMENT",

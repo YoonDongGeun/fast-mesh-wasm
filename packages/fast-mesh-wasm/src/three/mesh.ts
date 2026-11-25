@@ -204,7 +204,8 @@ const SETTLE_BOUNDS_MS = 250;
  *
  * When the scene mesh is removed, the binding detaches: it stops following
  * the scene and leaves the object as it was (remove it from your THREE.Scene
- * and call {@link BoundMesh.dispose}).
+ * and call {@link BoundMesh.dispose}). A mesh that undo or redo brings back
+ * needs a new binding.
  *
  * The object must sit under an untransformed parent (its `matrix` is a world
  * matrix); a transformed ancestor is detected and warned about once.

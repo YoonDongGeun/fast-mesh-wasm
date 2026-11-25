@@ -7,6 +7,7 @@ import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { type RefObject, useCallback, useEffect, useRef } from "react";
 import type { AppState, InspectTool } from "../../app/state/app-state";
+import { nextAnglePoints } from "../../features/inspect/ux/angle-measure";
 import { pickVertex } from "../../features/inspect/ux/pick-vertex";
 import { selectMesh } from "../../features/select/ux/selection";
 import type { SculptBrush } from "../../features/sculpt/ux/sculpt";
@@ -143,8 +144,9 @@ export function useMeshClick(params: {
       }
       // The inspect tools own the click while armed, and never select: the
       // ruler appends a world point (a third click restarts it), the query
-      // records the snapped vertex. A hit on another mesh still lands.
-      if (tool === "ruler" || tool === "query") {
+      // records the snapped vertex, the angle appends a point (a fourth click
+      // restarts it, #257). A hit on another mesh still lands.
+      if (tool === "ruler" || tool === "query" || tool === "angle") {
         const { origin, direction } = e.ray;
         const at = app.getSnapshot();
         void Promise.resolve()
@@ -162,6 +164,8 @@ export function useMeshClick(params: {
               } else {
                 app.setRuler({ a: ruler.a, b: picked.point });
               }
+            } else if (tool === "angle") {
+              app.setObjectInfo({ angle: nextAnglePoints(app.getSnapshot().objectInfo.angle, picked.point) });
             } else {
               app.setInspectQuery({ mesh: picked.mesh, slot: picked.slot, point: picked.point });
             }

@@ -18,7 +18,11 @@ import { view } from "../../viewport/ux/view";
 import { hasRepairOverlays } from "../../features/mesh-repair/ui/repair-overlays";
 import { hasWireOverlay } from "../../features/view/ui/wire";
 import { inspectMapProbe } from "../../features/inspect/ux/use-inspect-maps";
+import { objectInfoProbe, qualityReportFile, readQualityReport } from "../../features/inspect/ux/use-object-info";
+import { geodesicMapProbe } from "../../features/inspect/ux/use-geodesic-map";
+import { pathLength } from "../../features/inspect/ux/surface-paths";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
+import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
 
 export function installTestHook(
   store: SceneStore,
@@ -56,6 +60,11 @@ export function installTestHook(
     createDialog: () => {
       const d = createDialogOf(app).getSnapshot();
       return { open: d.open, kind: d.kind, previewTriangles: (d.preview?.mesh.indices.length ?? 0) / 3 };
+    },
+    /** The Text dialog: whether it is open, and the preview's triangles (0 with none). */
+    textDialog: () => {
+      const d = textDialogOf(app).getSnapshot();
+      return { open: d.open, previewTriangles: (d.preview?.mesh.indices.length ?? 0) / 3 };
     },
     /** What the mesh's list picture cost, and how many were started and finished. */
     meshPreview: (name: string) => meshPreviewStats(find(name).mesh),
@@ -143,6 +152,17 @@ export function installTestHook(
     placementPick: () => {
       const pick = app.getSnapshot().placementTool.pick;
       return pick === null ? null : { kind: pick.kind, points: pick.points.length };
+    },
+    /** The align panel's landmark points per mesh and whether it is picking, and the symmetry plane's mesh (#253). */
+    alignTool: () => {
+      const { landmarks, symmetry } = app.getSnapshot().alignTool;
+      return {
+        landmarks:
+          landmarks === null
+            ? null
+            : { moving: landmarks.movingPoints.length, fixed: landmarks.fixedPoints.length, picking: landmarks.picking },
+        symmetry: symmetry === null ? null : { mesh: nameOf(symmetry.mesh), errorRms: symmetry.errorRms, score: symmetry.score },
+      };
     },
     dragging: () => view.dragging,
     /**
@@ -277,6 +297,44 @@ export function installTestHook(
           s === null
             ? null
             : { ...s, readout: { ...s.readout }, range: [...s.range], band: s.band === null ? null : [...s.band] },
+      };
+    },
+    /** The object info box, its overlays and the angle measure (#257): the numbers shown, the box drawn, normal lines, the angle. */
+    objectInfo: () => ({
+      ...objectInfoProbe,
+      info: objectInfoProbe.info === null ? null : { ...objectInfoProbe.info },
+      angle: { points: objectInfoProbe.angle.points.map((p) => [...p]), degrees: objectInfoProbe.angle.degrees },
+    }),
+    /** The selected mesh's quality report as HTML or CSV text (#257), `null` without a selection. */
+    qualityReport: async (format: "html" | "csv"): Promise<string | null> => {
+      const mesh = store.getSnapshot().selection;
+      if (mesh === null) {
+        return null;
+      }
+      return qualityReportFile(await readQualityReport(app, engine.scene, mesh), format, app.getSnapshot().units).text;
+    },
+    /**
+     * The geodesic map and surface path (#252): the picked mesh, the armed pick, the method, the source
+     * slots, the path (points, legs, closed, world length), legs tracing, the latest error, the iso-line
+     * segments drawn, and the map shown with how many map queries landed.
+     */
+    surfacePath: () => {
+      const s = app.getSnapshot().surfacePath;
+      const m = geodesicMapProbe.shown;
+      return {
+        mesh: nameOf(s.mesh),
+        armed: s.armed,
+        method: s.method,
+        sources: s.sources.map((p) => p.slot),
+        path:
+          s.path === null
+            ? null
+            : { points: s.path.points.length, legs: s.path.legs.length, closed: s.path.closed, length: pathLength(s.path) },
+        tracing: s.tracing,
+        error: s.error,
+        isoSegments: (s.isoLines?.length ?? 0) / 6,
+        map: m === null ? null : { ...m, sources: [...m.sources] },
+        mapRuns: geodesicMapProbe.runs,
       };
     },
     /** The volume view: the series shown, its preset, MIP, and whether it rendered. */

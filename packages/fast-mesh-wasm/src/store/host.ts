@@ -14,6 +14,7 @@ import type {
   AutoRepairReport,
   AutoRepairRequest,
   RepairOp,
+  RemoveMeshOptions,
   RepairReport,
   Scene,
   SculptOp,
@@ -24,17 +25,35 @@ import type {
 } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
 import type { Indices, PlacementInput, Positions64, Vec3 } from "../api.js";
-import { addFieldKeyed, type KeyStatus, watchStatusKeys, type WorkerScene } from "../worker/client.js";
+import {
+  addFieldKeyed,
+  fieldTargets,
+  type KeyStatus,
+  presenceVersion,
+  sectionMeshes,
+  watchStatusKeys,
+  type WorkerScene,
+} from "../worker/client.js";
 
 /** Options of `SceneStore.addMesh`: those both scenes take (a store mesh is always eager). */
-export type StoreAddMeshOptions = Pick<AddMeshOptions, "origin" | "normals" | "uvs">;
+export type StoreAddMeshOptions = Pick<AddMeshOptions, "origin" | "normals" | "uvs" | "undoable">;
 
 /** What the store needs of a scene, the same on both hosts. */
 export interface Host {
   readonly mode: "local" | "worker";
   readonly scene: SceneLike;
   addMesh(positions: Positions64, indices: Indices, options?: StoreAddMeshOptions): MeshHandle;
-  removeMesh(mesh: MeshHandle): void;
+  removeMesh(mesh: MeshHandle, options?: RemoveMeshOptions): void;
+  /**
+   * Where the scene has a mesh: in it, out of it but within reach of undo or
+   * redo, or out of it for good.
+   */
+  presence(mesh: MeshHandle): "live" | "restorable" | "gone";
+  /**
+   * Goes up when a result says that undoable adds and removals moved meshes.
+   * Always 0 on the local host, where the store follows each step itself.
+   */
+  presenceVersion(): number;
   setPlacement(mesh: MeshHandle, placement: PlacementInput): void;
   edit(mesh: MeshHandle, ops: readonly EditOp[]): Promise<EditResult>;
   repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): Promise<RepairReport | RepairReport[]>;
@@ -69,6 +88,12 @@ export interface Host {
    */
   addField(desc: DistanceFieldDesc, key?: string): FieldHandle;
   removeField(field: FieldHandle): void;
+  /**
+   * The targets a distance field is left with, `null` for one the scene no
+   * longer has, or `undefined` when they are as the store knows them (the
+   * local host: the store follows each step as it is undone or redone).
+   */
+  fieldTargets(field: FieldHandle): readonly MeshHandle[] | null | undefined;
   /** A copy of a field's values as of its last update, one per vertex slot. */
   fieldValues(field: FieldHandle): Promise<Float32Array>;
   setColoring(mesh: MeshHandle, rule: ColorRule | null): void;
@@ -76,6 +101,8 @@ export interface Host {
   setSectionPlane(section: SectionHandle, plane: SectionPlane): void;
   setSectionMeshes(section: SectionHandle, meshes: readonly MeshHandle[]): void;
   setSectionFill(section: SectionHandle, fill: boolean): void;
+  /** The meshes a section cuts; `undefined` as for {@link Host.fieldTargets}. */
+  sectionMeshes(section: SectionHandle): readonly MeshHandle[] | undefined;
   removeSection(section: SectionHandle): void;
   restart(): Promise<void>;
   /**
@@ -132,6 +159,17 @@ function tracker(changed: Set<string>) {
 }
 
 /**
+ * {@link Host.presence} from either scene. A stand-in scene without `has`
+ * (tests make them) has every mesh it was given.
+ */
+function presenceIn(scene: Scene | WorkerScene, mesh: MeshHandle): "live" | "restorable" | "gone" {
+  if (typeof scene.has !== "function") {
+    return "live";
+  }
+  return scene.has(mesh) ? "live" : scene.isRestorable(mesh) ? "restorable" : "gone";
+}
+
+/**
  * The synchronous scene. Calls apply at once, so every key is `"ready"`,
  * except one whose latest call made through `track` threw: that key is
  * `"error"` until a call under it succeeds. Nothing is ever pending, so
@@ -148,7 +186,9 @@ export function localHost(scene: Scene): Host {
     mode: "local",
     scene,
     addMesh: (positions, indices, options) => scene.addMesh(positions, indices, options),
-    removeMesh: (mesh) => scene.removeMesh(mesh),
+    removeMesh: (mesh, options) => scene.removeMesh(mesh, options),
+    presence: (mesh) => presenceIn(scene, mesh),
+    presenceVersion: () => 0,
     setPlacement: (mesh, placement) => scene.setPlacement(mesh, placement),
     edit: (mesh, ops) => promised(() => scene.edit(mesh, ops)),
     // One op, a list or auto: the cast only picks an overload (all take any of them).
@@ -188,6 +228,14 @@ export function localHost(scene: Scene): Host {
     forgetErrors,
     addField: (desc) => scene.addDistanceField(desc),
     removeField: (field) => scene.removeField(field),
+    fieldTargets: (field) => {
+      try {
+        scene.fieldStatus(field);
+        return undefined;
+      } catch {
+        return null;
+      }
+    },
     // A copy: the zero-copy view is only valid until the next allocation.
     fieldValues: (field) => promised(() => scene.fieldValues(field).slice()),
     setColoring: (mesh, rule) => scene.setColoring(mesh, rule),
@@ -195,6 +243,7 @@ export function localHost(scene: Scene): Host {
     setSectionPlane: (section, plane) => scene.setSectionPlane(section, plane),
     setSectionMeshes: (section, meshes) => scene.setSectionMeshes(section, meshes),
     setSectionFill: (section, fill) => scene.setSectionFill(section, fill),
+    sectionMeshes: () => undefined,
     removeSection: (section) => scene.removeSection(section),
     restart: () => Promise.reject(new FastMeshError("INVALID_ARGUMENT", "restart needs a Worker scene")),
   };
@@ -213,7 +262,9 @@ export function workerHost(scene: WorkerScene): Host {
     mode: "worker",
     scene,
     addMesh: (positions, indices, options) => scene.addMesh(positions, indices, options),
-    removeMesh: (mesh) => scene.removeMesh(mesh),
+    removeMesh: (mesh, options) => scene.removeMesh(mesh, options),
+    presence: (mesh) => presenceIn(scene, mesh),
+    presenceVersion: () => presenceVersion(scene),
     setPlacement: (mesh, placement) => scene.setPlacement(mesh, placement),
     edit: (mesh, ops) => scene.edit(mesh, ops),
     // One op, a list or auto: the cast only picks an overload (all take any of them).
@@ -238,12 +289,14 @@ export function workerHost(scene: WorkerScene): Host {
     idOf: (handle) => scene.idOf(handle),
     addField: (desc, key) => (key === undefined ? scene.addDistanceField(desc) : addFieldKeyed(scene, desc, key)),
     removeField: (field) => scene.removeField(field),
+    fieldTargets: (field) => fieldTargets(scene, field),
     fieldValues: (field) => scene.fetchFieldValues(field),
     setColoring: (mesh, rule) => scene.setColoring(mesh, rule),
     addSection: (desc) => scene.addSection(desc),
     setSectionPlane: (section, plane) => scene.setSectionPlane(section, plane),
     setSectionMeshes: (section, meshes) => scene.setSectionMeshes(section, meshes),
     setSectionFill: (section, fill) => scene.setSectionFill(section, fill),
+    sectionMeshes: (section) => sectionMeshes(scene, section),
     removeSection: (section) => scene.removeSection(section),
     restart: () => {
       // Once the replay is applied, statuses are the replay's (9a): the

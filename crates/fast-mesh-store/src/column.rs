@@ -270,7 +270,6 @@ impl<T: Copy + Default> Column<T> {
         Ok(self.seal(prepared))
     }
 
-    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.data.capacity()
     }

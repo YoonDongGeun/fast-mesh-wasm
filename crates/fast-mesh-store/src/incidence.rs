@@ -46,6 +46,13 @@ fn distinct(tri: [VertexId; 3]) -> impl Iterator<Item = VertexId> {
 }
 
 impl Incidence {
+    /// Approximate heap memory held.
+    pub(crate) fn byte_size(&self) -> usize {
+        (self.offsets.capacity() + self.triangles.capacity()) * 4
+            + self.overlay.len() * 32
+            + self.overlay_len * 4
+    }
+
     pub(crate) fn build(mesh: &Mesh) -> Result<Self> {
         let mut build = IncidenceBuild::new(mesh);
         build.step(mesh, usize::MAX)?;

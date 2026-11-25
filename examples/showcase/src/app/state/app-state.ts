@@ -18,6 +18,7 @@ import {
   dropMember,
   type NamedGroup,
   removeGroup,
+  restoreMember,
   setColored,
   toggleCheck,
 } from "../../features/collision/ux/groups";
@@ -35,13 +36,19 @@ import {
 import { type ImportScale, type LengthUnit, NO_IMPORT_SCALE } from "../../shared/ux/units";
 import { createDefaultWave6State, type Wave6State } from "./wave6-state";
 import { DEFAULT_PLACEMENT_TOOL, type PlacementToolState } from "../../features/transform/ux/placement-picks";
+import { type AlignToolState, DEFAULT_ALIGN_TOOL } from "../../features/transform/ux/align-tools";
+import { DEFAULT_OBJECT_INFO, type ObjectInfoState } from "../../features/inspect/ux/object-info-state";
+import { DEFAULT_SURFACE_PATH_TOOL, type SurfacePathToolState } from "../../features/inspect/ux/surface-paths";
 
 export interface Item {
   /** A React key. */
   id: number;
   mesh: MeshHandle;
   name: string;
-  /** Owned by the app (one per mesh, as `bindMesh` requires); disposed on removal. */
+  /**
+   * Owned by the app (one per mesh, as `bindMesh` requires); disposed on
+   * removal (an undone removal shows it again: the renderer sets it up afresh).
+   */
   material: THREE.MeshStandardMaterial;
   /** The mesh's colour (`0xrrggbb`), for its swatch: the material turns white while a colouring shows. */
   color: number;
@@ -61,6 +68,22 @@ export interface Item {
   locked: boolean;
   /** Per-mesh diagnostic shading override, or `null` to follow scene shading (#235). */
   shadingOverride: DiagnosticShadingMode | null;
+}
+
+/** A listed mesh that undo or redo can bring back, with the places it had. */
+interface ParkedItem {
+  item: Item;
+  /** Its index in the list. */
+  at: number;
+  /** It was the primary selection. */
+  primary: boolean;
+  /** The sides of the collision pair it was picked for. */
+  sides: readonly (keyof CollisionPair)[];
+  /** It was a member of the contact group, with the listed pairs naming it. */
+  grouped: boolean;
+  pairs: readonly (readonly [MeshHandle, MeshHandle])[];
+  /** The named groups it was in. */
+  folders: readonly number[];
 }
 
 export type JobPhase = "reading" | "parsing" | "decimating" | "adding" | "done" | "error";
@@ -140,8 +163,8 @@ export interface RepairAnalysis {
   analysis: Analysis;
 }
 
-/** One inspection tool of the inspect panel: ruler, click-to-query, section plane or clip box. */
-export type InspectTool = "ruler" | "query" | "section" | "clip";
+/** One inspection tool of the inspect panel: ruler, click-to-query, section plane, clip box or angle (#257). */
+export type InspectTool = "ruler" | "query" | "section" | "clip" | "angle";
 
 /** The inspect section plane: the store's handle and its plane, for the panel and the gizmo. */
 export interface InspectSection {
@@ -375,6 +398,12 @@ export interface AppSnapshot {
   wave6: Wave6State;
   /** The placement helpers' armed surface pick and latest report (#256). */
   placementTool: PlacementToolState;
+  /** The align panel's landmark pairs and the symmetry plane on show (#253). */
+  alignTool: AlignToolState;
+  /** The object info box, its overlays and the angle measure (#257). */
+  objectInfo: ObjectInfoState;
+  /** The geodesic map's sources, the surface path and their armed pick (#252). */
+  surfacePath: SurfacePathToolState;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -461,6 +490,9 @@ export class AppState {
     commandPaletteOpen: false,
     wave6: createDefaultWave6State(),
     placementTool: DEFAULT_PLACEMENT_TOOL,
+    alignTool: DEFAULT_ALIGN_TOOL,
+    objectInfo: DEFAULT_OBJECT_INFO,
+    surfacePath: DEFAULT_SURFACE_PATH_TOOL,
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -501,6 +533,8 @@ export class AppState {
   /** The group defaults to the first three meshes added (the demo set), until it is ticked by hand. */
   #autoGroup = true;
   readonly #listeners = new Set<() => void>();
+  /** Meshes out of the list that undo or redo can bring back (see {@link AppState.follow}). */
+  readonly #parked = new Map<MeshHandle, ParkedItem>();
   #nextItem = 0;
   #nextColor = 0;
   #nextGroup = 1;
@@ -519,10 +553,63 @@ export class AppState {
     }
   }
 
-  /** Adds a loaded mesh to the store (its arrays are transferred to a Worker scene) and lists it. */
-  addMesh(store: SceneStore, loaded: LoadedMesh): Item {
+  /**
+   * Keeps the list in step with the store as undoable adds and removals are
+   * undone and redone: a mesh that left the scene leaves the list, and one
+   * that is back is listed again as the item it was (name, colour, material,
+   * place, groups, and the selection when nothing else is selected). Returns
+   * the function that stops it.
+   */
+  follow(store: SceneStore): () => void {
+    this.syncMeshes(store);
+    return store.subscribe(() => this.syncMeshes(store));
+  }
+
+  /** {@link AppState.follow}, once. */
+  syncMeshes(store: SceneStore): void {
+    const { meshes } = store.getSnapshot();
+    for (const item of this.#snap.items) {
+      if (meshes.has(item.mesh) || !this.#snap.items.includes(item)) {
+        continue;
+      }
+      // Releasing a colouring notifies the store's listeners, so this call
+      // comes back here: the item may have left by then.
+      const primary = this.#snap.multi[0] === item.mesh;
+      const detached = this.#detach(store, item);
+      if (this.#snap.items.includes(item)) {
+        this.#leave(store, item, detached, primary);
+      }
+    }
+    // The last to leave first, so that each finds its place.
+    let select: MeshHandle | undefined;
+    for (const [mesh, parked] of [...this.#parked].reverse()) {
+      if (meshes.has(mesh)) {
+        this.#relist(parked);
+        select = parked.primary ? mesh : select;
+      } else if (!store.isRestorable(mesh)) {
+        this.#parked.delete(mesh);
+      }
+    }
+    if (select !== undefined && store.getSnapshot().selection === null) {
+      this.#set({ multi: [select] });
+      store.select(select);
+    }
+  }
+
+  /** The volumes of the meshes undo or redo can bring back. */
+  parkedVolumes(): string[] {
+    return [...this.#parked.values()].flatMap(({ item }) => item.volumeId ?? []);
+  }
+
+  /**
+   * Adds a loaded mesh to the store (its arrays are transferred to a Worker
+   * scene) and lists it. With `undoable` the add is an undo step, or part of
+   * the open one.
+   */
+  addMesh(store: SceneStore, loaded: LoadedMesh, options: { undoable?: boolean } = {}): Item {
     const triangles = loaded.indices.length / 3;
     const mesh = store.addMesh(loaded.positions, loaded.indices, {
+      ...(options.undoable === true ? { undoable: true } : {}),
       origin: loaded.center,
       ...(loaded.colors ? { colors: loaded.colors } : {}),
       ...(loaded.uvs ? { uvs: loaded.uvs } : {}),
@@ -583,10 +670,9 @@ export class AppState {
   }
 
   /**
-   * Lists a mesh its caller added to the store and fills itself (the Create
-   * dialog adds an empty mesh and its geometry as one undoable edit), with
-   * the size it will have: the triangle count, centre (its origin) and half
-   * diagonal.
+   * Lists a mesh its caller added to the store (or adds empty and fills
+   * itself), with the size it has or will have: the triangle count, centre
+   * (its origin) and half diagonal.
    */
   listMesh(mesh: MeshHandle, meta: Pick<Item, "name" | "triangles" | "center" | "radius">): Item {
     return this.#registerItem(mesh, { ...meta, volumeId: null, preset: null, importScale: NO_IMPORT_SCALE });
@@ -633,7 +719,9 @@ export class AppState {
   }
 
   /**
-   * Removes a mesh from the store and the list, and disposes its material.
+   * Removes a mesh from the store and the list, as an undo step or part of
+   * the open one (for good with `undoable: false`), and disposes its
+   * material.
    * When it is one of the collision pair, its picker resets; in pair mode
    * the other mesh's colouring (measured to it) stops first, in the same
    * tick: the store would otherwise report the colouring's lost target as
@@ -641,11 +729,62 @@ export class AppState {
    * takes a removed mesh out of its groups itself, and the other members
    * keep their remaining partners.
    */
-  removeMesh(store: SceneStore, item: Item): void {
+  removeMesh(store: SceneStore, item: Item, options: { undoable?: boolean } = {}): void {
+    const primary = store.getSnapshot().selection === item.mesh;
     const detached = this.#detach(store, item);
-    store.removeMesh(item.mesh);
+    store.removeMesh(item.mesh, { undoable: options.undoable ?? true });
+    // A followed store has had it leave the list already.
+    if (this.#snap.items.includes(item)) {
+      this.#leave(store, item, detached, primary);
+    }
+  }
+
+  /**
+   * A mesh that left the scene leaves the list (`primary`: it was the primary
+   * selection); kept aside while undo or redo can bring it back.
+   */
+  #leave(
+    store: SceneStore,
+    item: Item,
+    detached: { collision: CollisionPair; group: GroupSetup },
+    primary: boolean,
+  ): void {
+    if (store.isRestorable?.(item.mesh) === true) {
+      const { items, collision, group, meshGroups } = this.#snap;
+      this.#parked.set(item.mesh, {
+        item,
+        at: items.indexOf(item),
+        primary,
+        sides: (["a", "b"] as const).filter((side) => collision[side] === item.mesh),
+        grouped: group.members.includes(item.mesh),
+        pairs: group.pairs === "all" ? [] : group.pairs.filter(([a, b]) => a === item.mesh || b === item.mesh),
+        folders: meshGroups.filter((g) => g.members.includes(item.mesh)).map((g) => g.id),
+      });
+    }
     item.material.dispose();
     this.#dropLists(item, detached);
+  }
+
+  /** Lists a mesh that is back in the scene again, where it was. */
+  #relist(parked: ParkedItem): void {
+    const { item } = parked;
+    this.#parked.delete(item.mesh);
+    const items = [...this.#snap.items];
+    items.splice(Math.min(parked.at, items.length), 0, item);
+    let collision = this.#snap.collision;
+    for (const side of parked.sides) {
+      if (collision[side] === null) {
+        collision = { ...collision, [side]: item.mesh };
+      }
+    }
+    let group = this.#snap.group;
+    if (parked.grouped && !group.members.includes(item.mesh)) {
+      const members = [...group.members, item.mesh];
+      const back = parked.pairs.filter(([a, b]) => members.includes(a) && members.includes(b));
+      group = { members, pairs: group.pairs === "all" ? "all" : [...group.pairs, ...back] };
+    }
+    const meshGroups = restoreMember(this.#snap.meshGroups, parked.folders, item.mesh);
+    this.#set({ items, collision, group, meshGroups });
   }
 
   /**
@@ -667,7 +806,8 @@ export class AppState {
     let collision = this.#snap.collision;
     if (collision.a === item.mesh || collision.b === item.mesh) {
       const other = collision.a === item.mesh ? collision.b : collision.a;
-      if (this.#snap.collisionMode === "pair" && other !== null && other !== item.mesh) {
+      const shown = other !== null && other !== item.mesh && store.getSnapshot().meshes.has(other);
+      if (this.#snap.collisionMode === "pair" && shown) {
         store.setDisplay(other, { coloring: null });
       }
       collision = { a: collision.a === item.mesh ? null : collision.a, b: collision.b === item.mesh ? null : collision.b };
@@ -968,6 +1108,21 @@ export class AppState {
   /** Arms or clears (`pick: null`) a placement helper's surface pick, or sets its report (#256). */
   setPlacementTool(patch: Partial<PlacementToolState>): void {
     this.#set({ placementTool: { ...this.#snap.placementTool, ...patch } });
+  }
+
+  /** Sets the align panel's landmark pairs (`landmarks: null` clears them) or symmetry plane (#253). */
+  setAlignTool(patch: Partial<AlignToolState>): void {
+    this.#set({ alignTool: { ...this.#snap.alignTool, ...patch } });
+  }
+
+  /** Updates the object info box, its overlays or the angle measure's points (#257; display state, not undoable). */
+  setObjectInfo(patch: Partial<ObjectInfoState>): void {
+    this.#set({ objectInfo: { ...this.#snap.objectInfo, ...patch } });
+  }
+
+  /** Changes the geodesic map and surface path state: picks, the armed pick, the method (#252). */
+  setSurfacePath(patch: Partial<SurfacePathToolState>): void {
+    this.#set({ surfacePath: { ...this.#snap.surfacePath, ...patch } });
   }
 
   /** Locks or unlocks a mesh against move/rotate/scale and sculpt/mask edits (#235). */

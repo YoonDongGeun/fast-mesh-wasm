@@ -6,9 +6,12 @@
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { AppState, CameraPreset, DiagnosticShadingMode, Item, WorkbenchTab } from "../../app/state/app-state";
 import { createPrimitiveCommands } from "../../features/home/ux/create-commands";
+import { textCommands } from "../../features/mesh-edit/ux/text-commands";
+import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
 import { sculptBrush, type SculptTool } from "../../features/sculpt/ux/sculpt";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
-import { triggerClick } from "./panel-triggers";
+import { ALIGN_COMMANDS } from "../../features/transform/ux/align-tools";
+import { focusElement, triggerClick } from "./panel-triggers";
 import type { GizmoMode } from "../../viewport/ui/Viewport";
 
 export interface CommandPaletteItem {
@@ -144,6 +147,7 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
   }
 
   cmds.push(...createPrimitiveCommands(app));
+  cmds.push(...textCommands(app));
 
   cmds.push(
     {
@@ -262,6 +266,24 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       },
     },
     {
+      id: "tool:extrude-faces",
+      title: "Mesh Edit: Extrude Faces",
+      category: "Tool",
+      keywords: "extrude faces selection push pull pocket boss wall normal direction distance",
+      run: () => {
+        app.setActiveTab("edit");
+      },
+    },
+    {
+      id: "tool:extrude-base",
+      title: "Mesh Edit: Extrude Base",
+      category: "Tool",
+      keywords: "extrude base boundary loop open surface solid flat plane cap pedestal floor",
+      run: () => {
+        app.setActiveTab("edit");
+      },
+    },
+    {
       id: "tool:deform-ffd",
       title: "Deform: FFD Lattice",
       category: "Tool",
@@ -348,6 +370,15 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       },
     },
     {
+      id: "tool:repair-wrap",
+      title: "Repair: Wrap in a Closed Envelope",
+      category: "Tool",
+      keywords: "repair wrap envelope watertight closed manifold gap hole voxel remesh broken scan merge parts",
+      run: () => {
+        app.setActiveTab("repair");
+      },
+    },
+    {
       id: "tool:points-panel",
       title: "Points: Point Cloud & Surface Reconstruction",
       category: "Tool",
@@ -393,6 +424,16 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       },
     },
     {
+      id: "tool:inspect-geodesic",
+      title: "Inspect: Geodesic Distance, Surface Path & Trim",
+      category: "Tool",
+      keywords: "geodesic surface distance source iso line contour path shortest length loop trim split cut curve",
+      run: () => {
+        app.setActiveTab("inspect");
+        focusElement("[data-inspect-geodesic]");
+      },
+    },
+    {
       id: "tool:inspect-ruler",
       title: "Inspect: Measure Ruler",
       category: "Tool",
@@ -400,6 +441,36 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       run: () => {
         app.setActiveTab("inspect");
         app.setInspectTool("ruler");
+      },
+    },
+    {
+      id: "tool:inspect-angle",
+      title: "Inspect: Measure Angle",
+      category: "Tool",
+      keywords: "inspect angle measure three points vertex degrees",
+      run: () => {
+        app.setActiveTab("inspect");
+        app.setInspectTool("angle");
+      },
+    },
+    {
+      id: "action:object-info-box",
+      title: "Object Info: Toggle Bounding Box Overlay",
+      category: "Action",
+      keywords: "object info bounding box overlay dimensions size aabb",
+      run: () => {
+        const oi = app.getSnapshot().objectInfo;
+        app.setObjectInfo({ open: true, showBox: !oi.showBox });
+      },
+    },
+    {
+      id: "action:object-info-normals",
+      title: "Object Info: Toggle Normals Overlay",
+      category: "Action",
+      keywords: "object info normals overlay face vertex lines direction",
+      run: () => {
+        const oi = app.getSnapshot().objectInfo;
+        app.setObjectInfo({ open: true, normals: oi.normals === "off" ? "face" : "off" });
       },
     },
     {
@@ -474,6 +545,36 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       run: () => {
         app.setActiveTab("select");
         triggerClick(`[data-placement-action="${c.action}"]`);
+      },
+    });
+  }
+
+  // The align tools press the align panel's buttons (#253).
+  for (const c of ALIGN_COMMANDS) {
+    cmds.push({
+      id: `align:${c.action}`,
+      title: c.label,
+      category: "Tool",
+      keywords: c.keywords,
+      disabled: items.length < c.meshes,
+      run: () => {
+        app.setActiveTab("align");
+        triggerClick(`[data-align-action="${c.action}"]`);
+      },
+    });
+  }
+
+  // Denoise and Delaunay flips press the repair panel's buttons (#264).
+  for (const c of SURFACE_CLEANUP_COMMANDS) {
+    cmds.push({
+      id: `repair:${c.op}`,
+      title: c.label,
+      category: "Action",
+      keywords: c.keywords,
+      disabled: selection === null,
+      run: () => {
+        app.setActiveTab("repair");
+        triggerClick(`[data-repair-op="${c.op}"]`);
       },
     });
   }

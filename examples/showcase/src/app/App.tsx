@@ -11,6 +11,7 @@ import type { Loader } from "../io/loader";
 import { CollisionPanel } from "../features/collision/ui/CollisionPanel";
 import { CommandPalette } from "../shell/ui/CommandPalette";
 import { CreatePrimitiveDialog } from "../features/home/ui/CreatePrimitiveDialog";
+import { TextDialog } from "../features/mesh-edit/ui/TextDialog";
 import { DeformPanel } from "../features/sculpt/ui/DeformPanel";
 import { ExportPanel } from "../features/home/ui/ExportPanel";
 import { GroupsBar } from "../features/collision/ui/GroupsBar";
@@ -19,6 +20,7 @@ import { HoverTip } from "../features/collision/ui/HoverTip";
 import { AlignPanel } from "../features/transform/ui/AlignPanel";
 import { InspectPanel } from "../features/inspect/ui/InspectPanel";
 import { MeshList } from "../features/home/ui/MeshList";
+import { ObjectInfoBox } from "../features/inspect/ui/ObjectInfoBox";
 import { ModelingPanel } from "../features/mesh-edit/ui/ModelingPanel";
 import { PointsPanel } from "../features/points/ui/PointsPanel";
 import { ProjectPanel } from "../features/home/ui/ProjectPanel";
@@ -104,6 +106,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const wave6DeformTool = useApp(app, (s) => s.wave6.deform.activeTool);
   const wave6PrintTool = useApp(app, (s) => s.wave6.printPrep.activeTool);
   const placementPick = useApp(app, (s) => s.placementTool.pick);
+  const landmarkPick = useApp(app, (s) => s.alignTool.landmarks?.picking === true);
+  const surfacePick = useApp(app, (s) => s.surfacePath.armed);
   const onPickPoint = useCallback(
     (mesh: MeshHandle, point: readonly [number, number, number]) =>
       app.setBrushPick({ mesh, point: [point[0], point[1], point[2]] }),
@@ -172,6 +176,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         />
         <GroupsBar app={app} />
         <ProjectPanel app={app} />
+        <ObjectInfoBox app={app} scene={engine.scene} />
       </aside>
       <main className="viewport">
         <Viewport
@@ -197,6 +202,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <VolumeOverlay app={app} />
         <ViewportNavigationHud app={app} />
         <CreatePrimitiveDialog app={app} />
+        <TextDialog app={app} />
         <p className="hint">
           {viewportHint({
             sculpting: sculpt !== null,
@@ -206,6 +212,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
             printTool: wave6PrintTool,
             picking: picking !== null,
             placementPick: placementPick !== null,
+            landmarkPick,
+            surfacePick,
             selected: selection !== null,
             coarse: coarsePointer,
           })}

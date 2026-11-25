@@ -196,7 +196,11 @@ function createWorkerHarness(): {
     select: (m: MeshHandle | null) => realStore.select(m),
     addMesh: (pos: Float64Array, idx: Uint32Array, opts?: Parameters<SceneStore["addMesh"]>[2]) =>
       realStore.addMesh(pos, idx, opts),
-    removeMesh: (mesh: MeshHandle) => realStore.removeMesh(mesh),
+    removeMesh: (mesh: MeshHandle, opts?: Parameters<SceneStore["removeMesh"]>[1]) => realStore.removeMesh(mesh, opts),
+    isRestorable: (mesh: MeshHandle) => realStore.isRestorable(mesh),
+    beginStep: () => realStore.beginStep(),
+    endStep: () => realStore.endStep(),
+    cancelStep: () => realStore.cancelStep(),
     repair: (mesh: MeshHandle, op: RepairOp) => realStore.repair(mesh, op),
     edit: (mesh: MeshHandle, ops: EditOp[]) => realStore.edit(mesh, ops),
     setPlacement: (mesh: MeshHandle, p: PlacementInput) => realStore.setPlacement(mesh, p),

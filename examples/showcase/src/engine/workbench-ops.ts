@@ -4,30 +4,46 @@
 // working seamlessly with both synchronous `Scene` and `WorkerScene`.
 import type {
   BooleanOp,
+  CoarseAlignMethod,
   ConvexHullPoints,
   ConvexHullResult,
   CutReport,
+  DelaunayFlipOptions,
+  DelaunayFlipReport,
+  DenoiseOptions,
+  DenoiseReport,
   EditOp,
+  ExtrudeBaseOptions,
+  ExtrudeBaseResult,
+  ExtrudeFacesOptions,
+  ExtrudeFacesResult,
   FieldHandle,
+  IcpObjective,
+  LandmarkAlignment,
+  LandmarkPair,
   MeshHandle,
   OffsetAlgorithm,
   OffsetReport,
   Placement,
   RegisterResult,
+  RegistrationReport,
   Scene,
   SceneLike,
   SectionPlane,
   ShellReport,
   SimplifyReport,
   SubdivideReport,
+  SymmetryPlaneReport,
 } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { bounds, type Vec3 } from "../io/mesh-data";
+import type { LoadedMesh } from "../io/protocol";
 import type { AppState, Item, OverlayBand, SurfaceColormap, SurfaceFieldState } from "../app/state/app-state";
 import { selectMesh } from "../features/select/ux/selection";
 import { liveVertexIds } from "../features/transform/ux/transform-math";
 import type { BooleanMethod, BooleanOptions, CsgNode, IsotropicRemeshOptions, SurfaceRemeshReport } from "fast-mesh-wasm";
+import type { WrapOptions, WrapPlan, WrapResult } from "fast-mesh-wasm";
 import {
   batchBooleanTree,
   batchResultName,
@@ -196,10 +212,13 @@ function applyPlacementToStore(store: SceneStore, mesh: MeshHandle, placement: P
   });
 }
 
-/** Clones an existing mesh's live geometry, attributes, and placement as `"<name> copy"`. */
+/**
+ * Clones an existing mesh's live geometry, attributes, and placement as
+ * `"<name> copy"`, in one undo step (undo removes the copy).
+ */
 export function duplicateMesh(store: SceneStore, app: AppState, item: Item): Item {
   const snap = extractLiveMeshData(store.scene, item.mesh);
-  const copy = app.addMesh(store, {
+  const loaded: LoadedMesh = {
     name: `${item.name} copy`,
     positions: snap.positions,
     indices: snap.indices,
@@ -209,8 +228,18 @@ export function duplicateMesh(store: SceneStore, app: AppState, item: Item): Ite
     radius: snap.radius,
     volumeId: item.volumeId,
     preset: item.preset,
-  });
-  applyPlacementToStore(store, copy.mesh, snap.placement);
+  };
+  store.beginStep();
+  let copy: Item;
+  try {
+    copy = app.addMesh(store, loaded, { undoable: true });
+    applyPlacementToStore(store, copy.mesh, snap.placement);
+  } catch (err) {
+    store.cancelStep();
+    app.syncMeshes(store);
+    throw err;
+  }
+  store.endStep();
   const srcColoring = store.getSnapshot().meshes.get(item.mesh)?.display.coloring ?? null;
   if (srcColoring !== null) {
     store.setDisplay(copy.mesh, { coloring: { ...srcColoring } });
@@ -219,12 +248,20 @@ export function duplicateMesh(store: SceneStore, app: AppState, item: Item): Ite
   return copy;
 }
 
+/** A world plane to mirror across: a point on it and its unit normal (#253). */
+export interface MirrorPlane {
+  point: Vec3;
+  normal: Vec3;
+}
+
 /**
- * Mirrors a mesh across the chosen local X/Y/Z axis and reverses every live triangle
- * winding `(a, b, c) -> (a, c, b)` so outward normals are preserved, in a single undo step.
+ * Mirrors a mesh across the chosen local X/Y/Z axis, or across a world plane, and
+ * reverses every live triangle winding `(a, b, c) -> (a, c, b)` so outward normals
+ * are preserved, in a single undo step.
  */
-export async function mirrorMesh(store: SceneStore, mesh: MeshHandle, axis: MirrorAxis): Promise<void> {
-  const axisIdx = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+export async function mirrorMesh(store: SceneStore, mesh: MeshHandle, across: MirrorAxis | MirrorPlane): Promise<void> {
+  const plane = typeof across === "string" ? null : across;
+  const axisIdx = plane !== null ? -1 : across === "x" ? 0 : across === "y" ? 1 : 2;
   const views = store.scene.views(mesh);
   const srcPos = views.positions();
   const srcIdx = views.indices();
@@ -250,6 +287,9 @@ export async function mirrorMesh(store: SceneStore, mesh: MeshHandle, axis: Mirr
   const e13 = matrix[13];
   const e14 = matrix[14];
 
+  const [nx, ny, nz] = plane?.normal ?? [0, 0, 0];
+  const [px, py, pz] = plane?.point ?? [0, 0, 0];
+
   const worldPos = new Float64Array(vertices.length * 3);
   for (let i = 0; i < vertices.length; i++) {
     const slot = vertices[i];
@@ -258,11 +298,20 @@ export async function mirrorMesh(store: SceneStore, mesh: MeshHandle, axis: Mirr
     let lz = srcPos[3 * slot + 2];
     if (axisIdx === 0) lx = lx === 0 ? 0 : -lx;
     else if (axisIdx === 1) ly = ly === 0 ? 0 : -ly;
-    else lz = lz === 0 ? 0 : -lz;
+    else if (axisIdx === 2) lz = lz === 0 ? 0 : -lz;
 
-    worldPos[3 * i] = e0 * lx + e4 * ly + e8 * lz + e12;
-    worldPos[3 * i + 1] = e1 * lx + e5 * ly + e9 * lz + e13;
-    worldPos[3 * i + 2] = e2 * lx + e6 * ly + e10 * lz + e14;
+    let wx = e0 * lx + e4 * ly + e8 * lz + e12;
+    let wy = e1 * lx + e5 * ly + e9 * lz + e13;
+    let wz = e2 * lx + e6 * ly + e10 * lz + e14;
+    if (plane !== null) {
+      const twice = 2 * ((wx - px) * nx + (wy - py) * ny + (wz - pz) * nz);
+      wx -= twice * nx;
+      wy -= twice * ny;
+      wz -= twice * nz;
+    }
+    worldPos[3 * i] = wx;
+    worldPos[3 * i + 1] = wy;
+    worldPos[3 * i + 2] = wz;
   }
 
   const liveTris: number[] = [];
@@ -352,7 +401,11 @@ export interface BooleanRunResult {
   triangles: number;
 }
 
-/** Runs Boolean CSG (`union` | `intersect` | `subtract`) on both sync `Scene` and `WorkerScene`. */
+/**
+ * Runs Boolean CSG (`union` | `intersect` | `subtract`) on both sync `Scene`
+ * and `WorkerScene`, as one undo step: undo removes the result mesh
+ * (`keepOriginals`), or restores the target and brings the source back.
+ */
 export async function runBooleanCsg(params: {
   store: SceneStore;
   app: AppState;
@@ -368,28 +421,37 @@ export async function runBooleanCsg(params: {
     const syncScene = asSyncScene(store.scene);
     if (keepOriginals) {
       const snap = extractLiveMeshData(syncScene, target.mesh);
-      const copy = app.addMesh(store, {
-        name: `${target.name} ${label} ${source.name}`,
-        positions: snap.positions,
-        indices: snap.indices,
-        ...(snap.colors ? { colors: snap.colors } : {}),
-        ...(snap.uvs ? { uvs: snap.uvs } : {}),
-        center: [0, 0, 0],
-        radius: snap.radius,
-        volumeId: null,
-        preset: null,
+      const { copy, resultMesh } = await inOneStep(store, app, async () => {
+        const made = app.addMesh(
+          store,
+          {
+            name: `${target.name} ${label} ${source.name}`,
+            positions: snap.positions,
+            indices: snap.indices,
+            ...(snap.colors ? { colors: snap.colors } : {}),
+            ...(snap.uvs ? { uvs: snap.uvs } : {}),
+            center: [0, 0, 0],
+            radius: snap.radius,
+            volumeId: null,
+            preset: null,
+          },
+          { undoable: true },
+        );
+        applyPlacementToStore(store, made.mesh, snap.placement);
+        return { copy: made, resultMesh: syncScene.boolean(made.mesh, source.mesh, op) };
       });
-      applyPlacementToStore(store, copy.mesh, snap.placement);
-      const resultMesh = syncScene.boolean(copy.mesh, source.mesh, op);
       const liveCount = extractLiveMeshData(syncScene, resultMesh).indices.length / 3;
       selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, resultMesh, false);
       return { mesh: resultMesh, name: copy.name, triangles: liveCount };
     }
 
-    const resultMesh = syncScene.boolean(target.mesh, source.mesh, op);
-    if (source.mesh !== target.mesh) {
-      app.removeMesh(store, source);
-    }
+    const resultMesh = await inOneStep(store, app, async () => {
+      const result = syncScene.boolean(target.mesh, source.mesh, op);
+      if (source.mesh !== target.mesh) {
+        app.removeMesh(store, source);
+      }
+      return result;
+    });
     const liveCount = extractLiveMeshData(syncScene, resultMesh).indices.length / 3;
     selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, resultMesh, false);
     return { mesh: resultMesh, name: target.name, triangles: liveCount };
@@ -420,25 +482,34 @@ export async function runBooleanCsg(params: {
     const outSnap = extractLiveMeshData(tmp, outHandle);
 
     if (keepOriginals) {
-      const added = app.addMesh(store, {
-        name: `${target.name} ${label} ${source.name}`,
-        positions: outSnap.positions,
-        indices: outSnap.indices,
-        center: [0, 0, 0],
-        radius: outSnap.radius,
-        volumeId: null,
-        preset: null,
+      const added = await inOneStep(store, app, async () => {
+        const made = app.addMesh(
+          store,
+          {
+            name: `${target.name} ${label} ${source.name}`,
+            positions: outSnap.positions,
+            indices: outSnap.indices,
+            center: [0, 0, 0],
+            radius: outSnap.radius,
+            volumeId: null,
+            preset: null,
+          },
+          { undoable: true },
+        );
+        applyPlacementToStore(store, made.mesh, outSnap.placement);
+        return made;
       });
-      applyPlacementToStore(store, added.mesh, outSnap.placement);
       selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, added.mesh, false);
       return { mesh: added.mesh, name: added.name, triangles: outSnap.indices.length / 3 };
     }
 
-    await replaceMeshGeometryLocal(store, target.mesh, outSnap.positions, outSnap.indices);
-    applyPlacementToStore(store, target.mesh, outSnap.placement);
-    if (source.mesh !== target.mesh) {
-      app.removeMesh(store, source);
-    }
+    await inOneStep(store, app, async () => {
+      await replaceMeshGeometryLocal(store, target.mesh, outSnap.positions, outSnap.indices);
+      applyPlacementToStore(store, target.mesh, outSnap.placement);
+      if (source.mesh !== target.mesh) {
+        app.removeMesh(store, source);
+      }
+    });
     selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, target.mesh, false);
     return { mesh: target.mesh, name: target.name, triangles: outSnap.indices.length / 3 };
   } finally {
@@ -453,8 +524,12 @@ export interface BatchBooleanRunResult {
   triangles: number;
 }
 
-/** Runs `work` inside one history step: committed when it settles, reverted when it throws. */
-async function inOneStep<T>(store: SceneStore, work: () => Promise<T>): Promise<T> {
+/**
+ * Runs `work` inside one history step: committed when it settles, reverted
+ * when it throws (the meshes it added or removed leave or rejoin the list;
+ * `app` is null for work that adds and removes none).
+ */
+async function inOneStep<T>(store: SceneStore, app: AppState | null, work: () => Promise<T>): Promise<T> {
   store.beginStep();
   try {
     const value = await work();
@@ -462,6 +537,7 @@ async function inOneStep<T>(store: SceneStore, work: () => Promise<T>): Promise<
     return value;
   } catch (err) {
     store.cancelStep();
+    app?.syncMeshes(store);
     throw err;
   }
 }
@@ -494,14 +570,13 @@ async function writeWorldGeometry(
  * the result to a scratch mesh, read and removed here; then, as one undo
  * step:
  *
- * - `keepInputs`: the result fills a new mesh, added empty first. Undo
- *   empties it; the inputs never change.
+ * - `keepInputs`: the result is added as a new mesh. Undo removes it; the
+ *   inputs never change.
  * - otherwise the primary takes the result in place (keeping its name and
- *   placement) and the other inputs are cleared. Undo restores every input.
+ *   placement) and the other inputs are removed. Undo restores every input.
  *
- * Adding and removing meshes are not undo steps, so no input is removed: a
- * cleared input stays listed, empty, until undo refills it. An empty result
- * (inputs that do not overlap, say) throws before anything changes.
+ * An empty result (inputs that do not overlap, say) throws before anything
+ * changes.
  */
 export async function runBatchBoolean(params: {
   store: SceneStore;
@@ -546,27 +621,18 @@ export async function runBatchBoolean(params: {
   const triangles = corners.length / 3;
 
   if (keepInputs) {
-    const mesh = store.addMesh(new Float64Array(0), new Uint32Array(0), { origin: [0, 0, 0] });
-    try {
-      await inOneStep(store, () => writeWorldGeometry(store, mesh, positions, corners));
-    } catch (err) {
-      store.removeMesh(mesh);
-      throw err;
-    }
-    const item = app.adoptSceneMesh(store, mesh, batchResultName(op, inputs));
+    const { center, radius } = bounds(positions);
+    const mesh = store.addMesh(positions, corners, { origin: center, undoable: true });
+    const item = app.listMesh(mesh, { name: batchResultName(op, inputs), triangles, center, radius });
     selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, mesh, false);
     return { mesh, name: item.name, triangles };
   }
 
   const [primary, ...others] = inputs;
-  await inOneStep(store, async () => {
+  await inOneStep(store, app, async () => {
     await writeWorldGeometry(store, primary.mesh, positions, corners);
     for (const other of others) {
-      const views = scene.views(other.mesh);
-      const clear = clearMeshOps(Math.floor(views.positions().length / 3), views.indices());
-      if (clear.length > 0) {
-        await store.edit(other.mesh, clear);
-      }
+      app.removeMesh(store, other);
     }
   });
   selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, primary.mesh, false);
@@ -726,6 +792,64 @@ export async function runIsotropicRemesh(params: {
   return params.store.repair(params.mesh, { op: "remeshSurface", ...params.options, mode: "isotropic" });
 }
 
+/** Extrudes a face selection (#262): one undo step, on the Worker when the scene runs there. */
+export async function runExtrudeFaces(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  triangles: Uint32Array;
+  options: ExtrudeFacesOptions;
+}): Promise<ExtrudeFacesResult> {
+  const { store, mesh, triangles, options } = params;
+  const scene = store.scene;
+  const r = await (isWorkerScene(scene) ? scene : asSyncScene(scene)).extrudeFaces(mesh, triangles, options);
+  store.commitFrame();
+  return r;
+}
+
+/** Extrudes a mesh's open boundary to a flat, capped base (#262): one undo step. */
+export async function runExtrudeBase(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: ExtrudeBaseOptions;
+}): Promise<ExtrudeBaseResult> {
+  const { store, mesh, options } = params;
+  const scene = store.scene;
+  const r = await (isWorkerScene(scene) ? scene : asSyncScene(scene)).extrudeBase(mesh, options);
+  store.commitFrame();
+  return r;
+}
+
+/**
+ * Feature-preserving denoise (#264) of the mesh, or of `options.region`: one
+ * undo step, run by the Worker when the scene is there.
+ */
+export async function runDenoise(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: DenoiseOptions;
+}): Promise<DenoiseReport> {
+  const scene = params.store.scene;
+  const run = (s: Scene | WorkerScene): DenoiseReport | Promise<DenoiseReport> =>
+    s.denoise(params.mesh, params.options);
+  const r = await run(isWorkerScene(scene) ? scene : asSyncScene(scene));
+  params.store.commitFrame();
+  return r;
+}
+
+/** Delaunay edge flips (#264) on the mesh, or on `options.region`, as {@link runDenoise}. */
+export async function runDelaunayFlips(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: DelaunayFlipOptions;
+}): Promise<DelaunayFlipReport> {
+  const scene = params.store.scene;
+  const run = (s: Scene | WorkerScene): DelaunayFlipReport | Promise<DelaunayFlipReport> =>
+    s.delaunayFlips(params.mesh, params.options);
+  const r = await run(isWorkerScene(scene) ? scene : asSyncScene(scene));
+  params.store.commitFrame();
+  return r;
+}
+
 /**
  * Rigid ICP registration (`scene.align.register`) applied through `store.setPlacement`
  * so alignment commits as a single undoable placement step.
@@ -755,6 +879,68 @@ export async function runIcpAlign(params: {
   return { ...result, applied: true, notApplied: null };
 }
 
+/** The scene's alignment domain, or a throw when the engine has none. */
+function alignDomain(store: SceneStore): NonNullable<SceneLike["align"]> {
+  if (!store.scene.align) {
+    throw new Error("Alignment is unavailable");
+  }
+  return store.scene.align;
+}
+
+/**
+ * Landmark alignment (`scene.align.alignByLandmarks`, #253): moves `moving` so
+ * its world `pairs[i].source` points best meet the `target` ones (rigid, or with
+ * a uniform scale), as one undo step.
+ */
+export async function runLandmarkAlign(params: {
+  store: SceneStore;
+  moving: MeshHandle;
+  fixed: MeshHandle;
+  pairs: readonly LandmarkPair[];
+  allowScaling: boolean;
+}): Promise<LandmarkAlignment> {
+  const { store, moving, fixed, pairs, allowScaling } = params;
+  const align = alignDomain(store);
+  return inOneStep(store, null, async () => await align.alignByLandmarks(moving, fixed, pairs, allowScaling));
+}
+
+/** Both stages of a coarse + ICP run (#253). */
+export interface MultistageAlignResult {
+  coarse: RegistrationReport;
+  fine: RegistrationReport;
+}
+
+/**
+ * Coarse pre-alignment, then ICP (`scene.align.registerMultistage` twice, #253):
+ * the coarse stage alone (no ICP iterations) and then ICP from its pose with
+ * no coarse stage, so each stage reports its own RMSE. Both placements land in
+ * one history step, so one undo puts the mesh back.
+ */
+export async function runMultistageAlign(params: {
+  store: SceneStore;
+  moving: MeshHandle;
+  fixed: MeshHandle;
+  coarseMethod: CoarseAlignMethod;
+  objective: IcpObjective;
+  maxIterations: number;
+  overlap: number;
+  maxDistance?: number;
+}): Promise<MultistageAlignResult> {
+  const { store, moving, fixed, coarseMethod, objective, maxIterations, overlap, maxDistance } = params;
+  const align = alignDomain(store);
+  const shared = { objective, overlap, ...(maxDistance !== undefined && maxDistance > 0 ? { maxDistance } : {}) };
+  return inOneStep(store, null, async () => {
+    const coarse = await align.registerMultistage(moving, fixed, { ...shared, coarseMethod, maxIterations: 0 });
+    const fine = await align.registerMultistage(moving, fixed, { ...shared, coarseMethod: "none", maxIterations });
+    return { coarse, fine };
+  });
+}
+
+/** The mesh's dominant reflection symmetry plane in world space (`scene.align.detectSymmetryPlane`, #253). */
+export async function runDetectSymmetryPlane(store: SceneStore, mesh: MeshHandle): Promise<SymmetryPlaneReport> {
+  return await alignDomain(store).detectSymmetryPlane(mesh);
+}
+
 /** What a convex hull action added: its list item and the hull's counts. */
 export interface ConvexHullRunResult {
   item: Item;
@@ -766,8 +952,8 @@ export interface ConvexHullRunResult {
 /**
  * Adds the convex hull of `sources` (their world shapes) or of world `points`
  * as a new mesh named `name`, lists it and selects it. The sources stay as
- * they are. The engine fills the new mesh as one undo step (undo empties it),
- * on the Worker when the scene runs there.
+ * they are. The engine adds the mesh as one undo step (undo removes it), on
+ * the Worker when the scene runs there.
  */
 export async function runConvexHull(params: {
   store: SceneStore;
@@ -785,6 +971,45 @@ export async function runConvexHull(params: {
   selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, item.mesh, false);
   store.commitFrame();
   return { item, inputPoints: r.inputPoints, vertices: r.vertices, triangles: r.triangles };
+}
+
+/** The voxel grid a wrap of `sources` with `options` takes, without running it. */
+export async function planWrap(params: {
+  store: SceneStore;
+  sources: readonly Item[];
+  options: WrapOptions;
+}): Promise<WrapPlan> {
+  const { scene } = params.store;
+  const meshes = params.sources.map((i) => i.mesh);
+  return isWorkerScene(scene) ? scene.wrapPlan(meshes, params.options) : asSyncScene(scene).wrapPlan(meshes, params.options);
+}
+
+/** What a wrap action added: its list item, and the wrap's counts and grid. */
+export type WrapRunResult = { item: Item } & Omit<WrapResult, "mesh">;
+
+/**
+ * Adds the closed envelope of `sources` (their world shapes) as a new mesh
+ * named `name`, lists it and selects it. The sources stay as they are. The
+ * engine fills the new mesh as one undo step (undo empties it), on the Worker
+ * when the scene runs there, so the page stays live meanwhile.
+ */
+export async function runWrap(params: {
+  store: SceneStore;
+  app: AppState;
+  name: string;
+  sources: readonly Item[];
+  options: WrapOptions;
+}): Promise<WrapRunResult> {
+  const { store, app, name, options } = params;
+  const scene = store.scene;
+  const meshes = params.sources.map((i) => i.mesh);
+  const { mesh, ...counts } = isWorkerScene(scene)
+    ? await scene.wrap(meshes, options)
+    : asSyncScene(scene).wrap(meshes, options);
+  const item = app.adoptSceneMesh(store, mesh, name);
+  selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, item.mesh, false);
+  store.commitFrame();
+  return { item, ...counts };
 }
 
 /**

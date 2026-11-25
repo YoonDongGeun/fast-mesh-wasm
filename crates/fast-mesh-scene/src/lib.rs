@@ -7,7 +7,11 @@
 //! removed, its id is rejected with [`SceneError::UnknownMesh`] for good.
 //!
 //! - Registry: [`Scene::add_mesh`], [`Scene::remove_mesh`], [`Scene::mesh`]
-//!   and [`Scene::ids`] (in index order).
+//!   and [`Scene::ids`] (in index order). Adds with
+//!   [`MeshOptions::undoable`] and [`Scene::remove_mesh_undoable`] are undo
+//!   steps: undo removes an added mesh again and brings a removed one back
+//!   under the same id, with its data and display state
+//!   ([`Scene::is_restorable`]).
 //! - Placements: [`Scene::placement`] and [`Scene::set_placement`]. A
 //!   placement is validated (a proper rotation, a finite positive scale)
 //!   and stored exactly as given. World queries, fields and sections all
@@ -27,9 +31,19 @@
 //! - Booleans: [`Scene::boolean`] unions, subtracts or intersects mesh B
 //!   into mesh A in the world; the result replaces A with A's placement,
 //!   as one undo step.
+//! - Extrusion: [`Scene::extrude_faces`] moves a triangle selection out and
+//!   walls its boundary, and [`Scene::extrude_base`] runs boundary loops to a
+//!   flat, capped base; each is one undo step, measured in the world.
 //! - Convex hulls: [`Scene::convex_hull`] and [`Scene::convex_hull_points`]
-//!   add the exact convex hull of meshes or points as a new mesh, filled as
-//!   one undo step.
+//!   add the exact convex hull of meshes or points as a new mesh, as one
+//!   undo step.
+//! - Denoising and Delaunay flips: [`Scene::denoise`] smooths scan noise and
+//!   keeps sharp features, and [`Scene::delaunay_flips`] improves triangles
+//!   without moving a vertex; on a whole mesh or a face region, each one undo
+//!   step.
+//! - Wraps: [`Scene::wrap`] adds a closed, manifold envelope around meshes,
+//!   gaps and holes below a size closed, as a new mesh filled as one undo
+//!   step; [`Scene::wrap_plan`] reports its voxel grid first.
 //! - Registration: [`Scene::register`] rigidly aligns one mesh to another by
 //!   trimmed point-to-plane ICP from their current placements, and sets the
 //!   moving mesh's placement as one undo step when the result is good.
@@ -96,8 +110,10 @@ mod baked;
 mod boolean;
 mod contacts;
 mod cut;
+mod denoise;
 mod domains;
 mod error;
+mod extrude;
 mod fields;
 mod history;
 mod hull;
@@ -105,6 +121,9 @@ mod id;
 mod join;
 mod normals;
 mod placement;
+mod presence;
+#[cfg(test)]
+mod presence_tests;
 mod query;
 mod register;
 mod report;
@@ -114,6 +133,7 @@ mod sections;
 #[cfg(test)]
 mod uv_tests;
 mod wave6_ops;
+mod wrap;
 
 pub use boolean::{BooleanMethod, BooleanOp, BooleanOptions, BooleanReport, CsgNode};
 pub use contacts::{
@@ -127,6 +147,7 @@ pub use domains::{
     SceneRepairOps, SceneSculptOps,
 };
 pub use error::{Result, SceneError};
+pub use extrude::{BasePlane, ExtrudeBaseOptions, ExtrudeBaseReport, ExtrudeFacesOptions};
 pub use fast_mesh_fields::{
     ColorRule, Colormap, FieldsError, OutOfRange, SignMode, SignStatus, color_of,
 };
@@ -156,3 +177,4 @@ pub use scene::{MeshBuild, MeshOptions, Scene, SceneOptions, UpdateMode};
 pub use sculpt::{Dab, DabReport};
 pub use sections::{Gap, SectionContour, SectionDesc, SectionResult, SectionStatus};
 pub use wave6_ops::Vec3;
+pub use wrap::SceneWrapReport;

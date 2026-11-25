@@ -14,6 +14,7 @@ const COLORS_ALL = 64;
 const INDICES_ALL = 128;
 const UVS = 256;
 const UVS_ALL = 512;
+const RESTORABLE = 1024;
 
 /** One mesh's record, with raw ids; the scene turns them into handles. */
 export interface RawChange {
@@ -21,6 +22,8 @@ export interface RawChange {
   generation: number;
   added: boolean;
   removed: boolean;
+  /** A removed mesh that undo or redo can bring back. */
+  restorable: boolean;
   placementChanged: boolean;
   capacityChanged: boolean;
   positions: Range[] | "all";
@@ -72,6 +75,7 @@ export function decodeChanges(msg: Uint32Array): RawChange[] {
       generation,
       added: (flags & ADDED) !== 0,
       removed: (flags & REMOVED) !== 0,
+      restorable: (flags & RESTORABLE) !== 0,
       placementChanged: (flags & PLACEMENT) !== 0,
       capacityChanged: (flags & CAPACITY) !== 0,
       positions: ranges((flags & POSITIONS_ALL) !== 0),

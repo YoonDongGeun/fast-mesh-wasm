@@ -73,6 +73,12 @@
 //! that the two cross along the terrain's zero lines, and on a clean
 //! 1M-triangle UV sphere that crosses nothing. Setup prints how many
 //! triangles each lists.
+//!
+//! **Undoable add and remove** of `terrain(708)` (1M triangles, normals on),
+//! beside a second mesh: a removal and its undo, the undo and redo of a
+//! removal and of an add, each with `take_changes`. For comparison, emptying
+//! the mesh with one edit and undoing it (what tools did before adds and
+//! removals were undoable).
 
 use std::hint::black_box;
 
@@ -1182,7 +1188,73 @@ fn bench_self_intersections(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_presence(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scene undoable add and remove");
+    group.sample_size(20);
+    let big = || {
+        let mut scene = Scene::new(SceneOptions::default());
+        scene.add_mesh(terrain(16), MeshOptions::default()).unwrap();
+        let options = MeshOptions {
+            undoable: true,
+            ..MeshOptions::default()
+        };
+        let id = scene.add_mesh(terrain(708), options).unwrap();
+        scene.set_normals(id, true).unwrap();
+        scene.take_changes();
+        (scene, id)
+    };
+    let pair = |scene: &mut Scene, undo_first: bool| {
+        for step in 0..2 {
+            let done = if (step == 0) == undo_first {
+                scene.undo()
+            } else {
+                scene.redo()
+            };
+            assert!(done.unwrap());
+            black_box(scene.take_changes().len());
+        }
+    };
+    group.bench_function("remove, then undo 1M", |bn| {
+        let (mut scene, id) = big();
+        bn.iter(|| {
+            scene.remove_mesh_undoable(id).unwrap();
+            black_box(scene.take_changes().len());
+            assert!(scene.undo().unwrap());
+            black_box(scene.take_changes().len());
+        });
+    });
+    group.bench_function("undo, then redo a removal 1M", |bn| {
+        let (mut scene, id) = big();
+        scene.remove_mesh_undoable(id).unwrap();
+        bn.iter(|| pair(&mut scene, true));
+    });
+    group.bench_function("undo, then redo an add 1M", |bn| {
+        let (mut scene, _) = big();
+        bn.iter(|| pair(&mut scene, true));
+    });
+    group.sample_size(10);
+    group.bench_function("empty by an edit, then undo 1M (the old pattern)", |bn| {
+        let (mut scene, id) = big();
+        let mesh = scene.mesh(id).unwrap();
+        let triangles: Vec<u32> = (0..mesh.triangle_slots() as u32).collect();
+        let vertices: Vec<u32> = (0..mesh.vertex_slots() as u32).collect();
+        bn.iter(|| {
+            scene
+                .edit(id, |tx| {
+                    tx.remove_triangles(&triangles)?;
+                    tx.remove_vertices(&vertices)
+                })
+                .unwrap();
+            black_box(scene.take_changes().len());
+            assert!(scene.undo().unwrap());
+            black_box(scene.take_changes().len());
+        });
+    });
+    group.finish();
+}
+
 fn benches(c: &mut Criterion) {
+    bench_presence(c);
     bench_self_intersections(c);
     bench_sections(c);
     bench_overhead(c, "1M", 708);

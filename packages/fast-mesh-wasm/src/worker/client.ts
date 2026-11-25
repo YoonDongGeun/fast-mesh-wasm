@@ -8,6 +8,22 @@
 // too, so everything the adapters read stays synchronous. Drags are
 // optimistic: a move shows at once and holds until the Worker has the drag.
 import {
+  checkDelaunayFlipOptions,
+  checkDenoiseOptions,
+  type DelaunayFlipOptions,
+  type DelaunayFlipReport,
+  type DenoiseOptions,
+  type DenoiseReport,
+} from "../denoise.js";
+import {
+  type ExtrudeBaseOptions,
+  type ExtrudeBaseResult,
+  type ExtrudeFacesOptions,
+  type ExtrudeFacesResult,
+  extrudeBaseArgs,
+  extrudeFacesArgs,
+} from "../extrude.js";
+import {
   type ConvexHullOptions,
   type ConvexHullPoints,
   type ConvexHullResult,
@@ -16,6 +32,14 @@ import {
   hullPointsBuffer,
 } from "../hull.js";
 import { checkRegisterOptions } from "../register.js";
+import {
+  checkWrapOptions,
+  type WrapGridOptions,
+  wrapMeshList,
+  type WrapOptions,
+  type WrapPlan,
+  type WrapResult,
+} from "../wrap.js";
 import {
   checkSurfacePathOptions,
   checkU32Int,
@@ -116,6 +140,7 @@ import type {
   RepairReportOf,
   SculptBrushOp,
   SculptOp,
+  RemoveMeshOptions,
   SculptReport,
   SculptReportOf,
   SectionDesc,
@@ -538,8 +563,15 @@ interface MeshState {
    */
   requested: Pose | undefined;
   requestedUntil: number;
-  /** `removeMesh` was called: calls on it give `UNKNOWN_MESH`. */
+  /**
+   * `removeMesh` was called, or the engine removed it (the undo of its add,
+   * the redo of its removal): calls on it give `UNKNOWN_MESH`.
+   */
   removed: boolean;
+  /** The revision of the `removeMesh` request (0: none): an older result says nothing about it. */
+  removedRev: number;
+  /** Removed undoably: undo or redo can bring it back, so its state is kept. */
+  parked: boolean;
   /** Its removal was delivered: the mirrors are gone too. */
   gone: boolean;
   /** The colouring last requested (kept for a restart). */
@@ -549,6 +581,8 @@ interface MeshState {
    * applied it is in (`coloring(mesh)` returns it).
    */
   shown: ColorRule | null;
+  /** What `shown` was when the mesh was parked: shown again when it is back. */
+  parkedRule: ColorRule | null;
   /** Colouring requests not applied yet, by revision. */
   pendingRules: Map<number, ColorRule | null>;
   /** The engine has the mesh, as of the latest result (its mirrors are its data). */
@@ -687,6 +721,12 @@ let debugDumpOf: (scene: WorkerScene, mesh: MeshHandle) => Promise<QueryMap["deb
 let addFieldKeyedOf: (scene: WorkerScene, desc: DistanceFieldDesc, key: string) => FieldHandle;
 /** Set by `WorkerScene`'s static block: the internal {@link watchStatusKeys}. */
 let watchStatusKeysOf: (scene: WorkerScene, sink: (key: string) => void) => () => void;
+/** Set by `WorkerScene`'s static block: the internal {@link fieldTargets}. */
+let fieldTargetsOf: (scene: WorkerScene, field: FieldHandle) => readonly MeshHandle[] | null;
+/** Set by `WorkerScene`'s static block: the internal {@link sectionMeshes}. */
+let sectionMeshesOf: (scene: WorkerScene, section: SectionHandle) => readonly MeshHandle[];
+/** Set by `WorkerScene`'s static block: the internal {@link presenceVersion}. */
+let presenceVersionOf: (scene: WorkerScene) => number;
 
 /**
  * A scene whose engine runs in a Worker, from {@link createWorkerScene}. It
@@ -785,6 +825,8 @@ export class WorkerScene implements SceneLike {
   readonly #latest = new Map<string, number>();
   #statusScheduled = false;
   #history = { canUndo: false, canRedo: false };
+  /** See {@link presenceVersion}. */
+  #presenceVersion = 0;
   /** The values mirror is on (a `values()` read asked for it). */
   #values = false;
   #drag: DragState | undefined;
@@ -1422,6 +1464,7 @@ export class WorkerScene implements SceneLike {
     for (const c of r.changes) {
       this.#applyChange(c);
     }
+    this.#applyPresence(r);
     // No colours: no colouring (its field removed, or the mesh).
     for (const st of this.#meshes.values()) {
       if (st.colors === null) {
@@ -1521,11 +1564,16 @@ export class WorkerScene implements SceneLike {
     }
     if (c.removed) {
       st.live = false;
+      if (c.restorable === true) {
+        st.parkedRule = st.shown;
+      }
       this.#clearMirrors(st);
     } else {
       if (c.added) {
         st.live = true;
         st.add = undefined;
+        st.shown ??= st.parkedRule;
+        st.parkedRule = null;
         if (c.origin !== undefined) {
           st.origin = [...c.origin] as Vec3;
           st.pose = poseOf(st.pose.rotation, st.pose.translation, st.origin, st.pose.scale);
@@ -1542,6 +1590,7 @@ export class WorkerScene implements SceneLike {
       mesh: st.handle,
       added: c.added,
       removed: c.removed,
+      ...(c.restorable === true ? { restorable: true as const } : {}),
       placementChanged: c.placementChanged,
       capacityChanged: c.capacityChanged,
       positions: c.positions,
@@ -1554,6 +1603,87 @@ export class WorkerScene implements SceneLike {
     };
     const prev = this.#changes.get(st);
     this.#changes.set(st, prev === undefined ? record : merge(prev, record));
+  }
+
+  /**
+   * Follows the meshes that undoable adds and removals, and their undo and
+   * redo, moved out of the engine's scene or back into it. A removal
+   * requested after the result's batch decides instead.
+   */
+  #applyPresence(r: Result): void {
+    if (r.presence === undefined && r.fieldTargets === undefined && r.sectionMeshes === undefined) {
+      return;
+    }
+    this.#presenceVersion++;
+    this.#statusChanged();
+    const moved = (r.presence ?? []).flatMap(({ id, state }) => {
+      const st = this.#meshes.get(id);
+      return st === undefined || r.rev < st.removedRev ? [] : [{ st, state }];
+    });
+    const left: MeshState[] = [];
+    for (const { st, state } of moved) {
+      if (state === "live") {
+        st.removed = false;
+        st.parked = false;
+        st.gone = false;
+        st.removedRev = 0;
+        continue;
+      }
+      if (!st.removed) {
+        left.push(st);
+      }
+      st.removed = true;
+      st.parked = state === "parked";
+      st.live = false;
+      st.add = undefined;
+      st.local = undefined;
+      st.localUntil = 0;
+      st.requested = undefined;
+      st.requestedUntil = 0;
+      if (!st.gone && this.#changes.get(st)?.removed !== true) {
+        // Added and undone before any record of it was packed.
+        this.#clearMirrors(st);
+        this.#removedHere(st);
+      }
+    }
+    for (const st of left) {
+      this.#dropLinks(st);
+    }
+    // What went with them depends on the order of the steps, which only the
+    // engine knows (a mesh may have left and come back).
+    for (const { section, meshes } of r.sectionMeshes ?? []) {
+      const s = this.#sections.get(section);
+      if (s !== undefined && !s.removed && (this.#latest.get(`section:${section}:meshes`) ?? 0) <= r.rev) {
+        s.meshes = meshes.flatMap((id) => this.#meshes.get(id) ?? []);
+      }
+    }
+    for (const { field, to } of r.fieldTargets ?? []) {
+      const f = this.#fields.get(field);
+      if (f === undefined || f.removed) {
+        continue;
+      }
+      if (to === null) {
+        this.#fieldRemoved(f, r.rev);
+      } else {
+        // A new object: sent requests keep theirs.
+        f.desc = { ...f.desc, to };
+      }
+    }
+    for (const { st, state } of moved) {
+      if (state === "gone" && st.gone) {
+        this.#forgetMesh(st);
+      }
+    }
+  }
+
+  /** Keeps only a tombstone of a mesh removed for good, once its removal is delivered. */
+  #forgetMesh(st: MeshState): void {
+    this.#meshes.delete(st.id);
+    this.#byMesh.delete(st.handle);
+    this.#tombstones.add(st.handle);
+    const id = st.id;
+    this.#forgetKeys([`mesh:${id}`, `placement:${id}`, `edit:${id}`, `display:${id}`], []);
+    this.#statusChanged();
   }
 
   #clearMirrors(st: MeshState): void {
@@ -1739,12 +1869,13 @@ export class WorkerScene implements SceneLike {
    * it that do not need it run meanwhile, so a reply to one of them can
    * arrive before the mesh. Until it lands, `status("mesh:<id>")` reads
    * `"computing"` and its views are empty; its buffers arrive with that
-   * status turning `"ready"`.
+   * status turning `"ready"`. An `undoable` add is never in the background:
+   * it lands in the step it was made in, and undo removes the mesh again.
    */
   addMesh(
     positions: Positions64,
     indices: Indices,
-    options: Pick<AddMeshOptions, "origin" | "normals" | "uvs"> = {},
+    options: Pick<AddMeshOptions, "origin" | "normals" | "uvs" | "undoable"> = {},
   ): MeshHandle {
     this.#alive();
     // Copies: the buffers are transferred.
@@ -1759,6 +1890,7 @@ export class WorkerScene implements SceneLike {
     const origin: Vec3 | undefined =
       options.origin === undefined ? boxCentre(p) : [options.origin[0], options.origin[1], options.origin[2]];
     const st = this.#allocMeshState(origin ?? [0, 0, 0], options.normals ?? true);
+    const undoable = options.undoable === true;
     st.add = {
       kind: "addMesh",
       rev: ++this.#rev,
@@ -1767,7 +1899,7 @@ export class WorkerScene implements SceneLike {
       f64: !(p instanceof Float32Array),
       indices: i.buffer as ArrayBuffer,
       ...(uvs === undefined ? {} : { uvs: uvs.buffer as ArrayBuffer }),
-      options: { origin, normals: st.normalsOn },
+      options: { origin, normals: st.normalsOn, ...(undoable ? { undoable } : {}) },
     };
     this.#push(st.add);
     return st.handle;
@@ -1795,7 +1927,10 @@ export class WorkerScene implements SceneLike {
       requested: undefined,
       requestedUntil: 0,
       removed: false,
+      removedRev: 0,
+      parked: false,
       gone: false,
+      parkedRule: null,
       coloring: null,
       live: false,
       normalsOn,
@@ -1826,15 +1961,43 @@ export class WorkerScene implements SceneLike {
    * Removes a mesh, ending an active drag of it first. Later calls on it give
    * `UNKNOWN_MESH`; its mirrors stay readable until the removal is delivered
    * by `commitFrame()`.
+   *
+   * With `undoable` the removal is an undo step (or part of the open one):
+   * {@link WorkerScene.undo} brings the mesh back with the same handle, as
+   * `Scene.removeMesh` does. A {@link WorkerScene.restart} clears the history,
+   * so it makes the removal permanent.
    */
-  removeMesh(mesh: MeshHandle): void {
+  removeMesh(mesh: MeshHandle, options: RemoveMeshOptions = {}): void {
     const st = this.#live(mesh);
     if (this.#drag?.mesh === st) {
       this.#drag.end();
     }
+    const undoable = options.undoable === true;
     const rev = ++this.#rev;
+    st.parked = undoable;
     this.#noteRemoved(st, rev);
-    this.#push({ kind: "removeMesh", rev, id: st.id });
+    this.#push({ kind: "removeMesh", rev, id: st.id, ...(undoable ? { undoable } : {}) });
+  }
+
+  /**
+   * Whether the scene has `mesh`: `false` once its removal is requested, or
+   * a result says that the undo of its add (or the redo of its removal) took
+   * it out.
+   */
+  has(mesh: MeshHandle): boolean {
+    return !(mesh instanceof MeshHandle && this.#tombstones.has(mesh)) && !this.#state(mesh).removed;
+  }
+
+  /**
+   * Whether undo or redo can still bring back a removed `mesh`, as of the
+   * latest result (see `Scene.isRestorable`).
+   */
+  isRestorable(mesh: MeshHandle): boolean {
+    if (mesh instanceof MeshHandle && this.#tombstones.has(mesh)) {
+      return false;
+    }
+    const st = this.#state(mesh);
+    return st.removed && st.parked;
   }
 
   /**
@@ -1868,11 +2031,23 @@ export class WorkerScene implements SceneLike {
 
   /**
    * Notes a mesh as removed at `rev`: later calls on it give `UNKNOWN_MESH`,
-   * fields on it (or only to it) are dropped and its section entries go. The
-   * engine does the same when the removal lands.
+   * and its links go ({@link WorkerScene.#dropLinks}).
    */
   #noteRemoved(st: MeshState, rev: number): void {
     st.removed = true;
+    st.removedRev = rev;
+    if (!st.parked) {
+      this.#dropFieldsOf(st, rev);
+    }
+    this.#dropLinks(st);
+  }
+
+  /**
+   * Drops the fields on a mesh removed for good (or only to it). The engine
+   * does the same when the removal lands; for a parked mesh it says what is
+   * left of the fields ({@link WorkerScene.#applyPresence}).
+   */
+  #dropFieldsOf(st: MeshState, rev: number): void {
     for (const f of this.#fields.values()) {
       if (f.removed) {
         continue;
@@ -1885,6 +2060,10 @@ export class WorkerScene implements SceneLike {
         f.desc = { ...f.desc, to: f.desc.to.filter((m) => m !== st.id) };
       }
     }
+  }
+
+  /** A removed mesh's section entries and collision rules go, as they do in the engine. */
+  #dropLinks(st: MeshState): void {
     for (const s of this.#sections.values()) {
       if (!s.removed) {
         s.meshes = s.meshes.filter((m) => m !== st);
@@ -2731,6 +2910,35 @@ export class WorkerScene implements SceneLike {
     );
   }
 
+  /** Extrudes a face selection in the Worker, one undo step (see `Scene.extrudeFaces`). */
+  extrudeFaces(mesh: MeshHandle, triangles: Indices, options: ExtrudeFacesOptions): Promise<ExtrudeFacesResult> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const tris = normalizeU32Selection(triangles, "triangles");
+        extrudeFacesArgs(options);
+        const cloned = copyInput(options, "options");
+        this.#endDragOn(st);
+        return { kind: "extrudeFaces", rev, id: st.id, triangles: tris, options: cloned, qid };
+      },
+      (v) => v as ExtrudeFacesResult,
+    );
+  }
+
+  /** Extrudes a mesh's boundary to a flat base in the Worker, one undo step (see `Scene.extrudeBase`). */
+  extrudeBase(mesh: MeshHandle, options: ExtrudeBaseOptions): Promise<ExtrudeBaseResult> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        extrudeBaseArgs(options);
+        const cloned = copyInput(options, "options");
+        this.#endDragOn(st);
+        return { kind: "extrudeBase", rev, id: st.id, options: cloned, qid };
+      },
+      (v) => v as ExtrudeBaseResult,
+    );
+  }
+
   extractSelectedFaces(
     mesh: MeshHandle,
     selectedTris: Indices,
@@ -3053,6 +3261,68 @@ export class WorkerScene implements SceneLike {
         return { kind: "convexHullPoints", rev, addedId: added.id, points: buf, normals, qid };
       },
       (v) => ({ mesh: (added as MeshState).handle, ...(v as Omit<ConvexHullResult, "mesh">) }),
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
+  /** Smooths noise out of `mesh` in the Worker, one undo step (see `Scene.denoise`). */
+  denoise(mesh: MeshHandle, options?: DenoiseOptions): Promise<DenoiseReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const checked = checkDenoiseOptions(options);
+        this.#endDragOn(st);
+        return { kind: "denoise", rev, id: st.id, options: checked, qid };
+      },
+      (v) => v as DenoiseReport,
+    );
+  }
+
+  /** Flips `mesh`'s edges towards Delaunay in the Worker, one undo step (see `Scene.delaunayFlips`). */
+  delaunayFlips(mesh: MeshHandle, options?: DelaunayFlipOptions): Promise<DelaunayFlipReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const checked = checkDelaunayFlipOptions(options);
+        this.#endDragOn(st);
+        return { kind: "delaunayFlips", rev, id: st.id, options: checked, qid };
+      },
+      (v) => v as DelaunayFlipReport,
+    );
+  }
+
+  /**
+   * Plans the voxel grid of {@link WorkerScene.wrap} for the same meshes and
+   * options without running it (see `Scene.wrapPlan`).
+   */
+  wrapPlan(meshes: MeshHandle | readonly MeshHandle[], options?: WrapGridOptions): Promise<WrapPlan> {
+    return this.#query(
+      "wrapPlan",
+      () => ({
+        meshes: wrapMeshList(meshes).map((m) => this.#live(m).id),
+        options: checkWrapOptions(options),
+      }),
+      (v) => v,
+    );
+  }
+
+  /**
+   * Wraps `meshes` (one mesh or several) in one closed, manifold envelope in
+   * the Worker, added as a new mesh, one undo step (see `Scene.wrap`). The
+   * page stays live while it runs.
+   */
+  wrap(meshes: MeshHandle | readonly MeshHandle[], options?: WrapOptions): Promise<WrapResult> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        const states = wrapMeshList(meshes).map((m) => this.#live(m));
+        const checked = checkWrapOptions(options);
+        added = this.#allocMeshState([0, 0, 0], checked.normals);
+        return { kind: "wrap", rev, addedId: added.id, meshes: states.map((st) => st.id), options: checked, qid };
+      },
+      (v) => ({ mesh: (added as MeshState).handle, ...(v as Omit<WrapResult, "mesh">) }),
     ).catch((e) => {
       this.#discardPlaceholder(added);
       throw e;
@@ -3734,15 +4004,9 @@ export class WorkerScene implements SceneLike {
           continue;
         }
         st.gone = true;
-        if (st.removed) {
-          // Removed for good (unlike a removal by the engine, which a redo
-          // may revert): keep only a tombstone.
-          this.#meshes.delete(st.id);
-          this.#byMesh.delete(st.handle);
-          this.#tombstones.add(st.handle);
-          const id = st.id;
-          this.#forgetKeys([`mesh:${id}`, `placement:${id}`, `edit:${id}`, `display:${id}`], []);
-          this.#statusChanged();
+        if (st.removed && !st.parked) {
+          // Removed for good: nothing brings it back.
+          this.#forgetMesh(st);
         }
       }
     }
@@ -3818,7 +4082,8 @@ export class WorkerScene implements SceneLike {
    * - fields, colourings and sections as last requested (removed ones are
    *   not re-created).
    *
-   * History is cleared (`canUndo`/`canRedo` are false). The replay is sent
+   * History is cleared (`canUndo`/`canRedo` are false), and the meshes it
+   * could have brought back are gone for good. The replay is sent
    * at once, not with the next frame. Every replayed key is `"computing"`
    * until the replay's results arrive, and so is the key of every pending
    * declarative request (placement, drag, colouring, field, section), also
@@ -4035,6 +4300,14 @@ export class WorkerScene implements SceneLike {
       this.#push({ kind: "values", rev: ++this.#rev });
     }
     const replayed = new Set<ClientId>();
+    // The history goes, and with it the way back of every parked mesh.
+    for (const st of [...this.#meshes.values()].filter((m) => m.parked)) {
+      st.parked = false;
+      this.#dropFieldsOf(st, this.#rev);
+      if (st.gone) {
+        this.#forgetMesh(st);
+      }
+    }
     for (const st of this.#meshes.values()) {
       if (st.removed) {
         if (!st.gone) {
@@ -4185,6 +4458,7 @@ export class WorkerScene implements SceneLike {
       mesh: st.handle,
       added: false,
       removed: true,
+      ...(st.parked ? { restorable: true as const } : {}),
       placementChanged: false,
       capacityChanged: false,
       positions: [],
@@ -4256,6 +4530,15 @@ export class WorkerScene implements SceneLike {
         scene.#statusSinks.delete(sink);
       };
     };
+    fieldTargetsOf = (scene, field) => {
+      const st = scene.#byField.get(field);
+      if (st === undefined || st.removed) {
+        return null;
+      }
+      return st.desc.to.flatMap((id) => scene.#meshes.get(id)?.handle ?? []);
+    };
+    sectionMeshesOf = (scene, section) => scene.#bySection.get(section)?.meshes.map((m) => m.handle) ?? [];
+    presenceVersionOf = (scene) => scene.#presenceVersion;
     debugDumpOf = (scene, mesh) =>
       scene.#query(
         "debugDump",
@@ -4293,6 +4576,28 @@ export function addFieldKeyed(scene: WorkerScene, desc: DistanceFieldDesc, key: 
  */
 export function watchStatusKeys(scene: WorkerScene, sink: (key: string) => void): () => void {
   return watchStatusKeysOf(scene, sink);
+}
+
+/**
+ * Internal, not exported from `fast-mesh-wasm/worker`: the targets a field is
+ * left with as of the latest result, or `null` for one that is gone.
+ */
+export function fieldTargets(scene: WorkerScene, field: FieldHandle): readonly MeshHandle[] | null {
+  return fieldTargetsOf(scene, field);
+}
+
+/** Internal, not exported from `fast-mesh-wasm/worker`: the meshes a section cuts, as of the latest result. */
+export function sectionMeshes(scene: WorkerScene, section: SectionHandle): readonly MeshHandle[] {
+  return sectionMeshesOf(scene, section);
+}
+
+/**
+ * Internal, not exported from `fast-mesh-wasm/worker`: goes up with every
+ * result that says where undoable adds and removals moved meshes. `onStatus`
+ * listeners are called for it.
+ */
+export function presenceVersion(scene: WorkerScene): number {
+  return presenceVersionOf(scene);
 }
 
 /** Test-only, not exported from `fast-mesh-wasm/worker`: the sizes of the scene's internal maps. */
@@ -4401,7 +4706,13 @@ function merge(a: MeshChange, b: MeshChange): MeshChange {
     return { ...b, added: false };
   }
   if (b.added) {
-    return { ...b, fieldsChanged: union(a.fieldsChanged, b.fieldsChanged), sectionsChanged: union(a.sectionsChanged, b.sectionsChanged) };
+    return {
+      ...b,
+      // Out and back within the frame: whoever still shows it starts over.
+      ...(a.removed ? { placementChanged: true, capacityChanged: true } : {}),
+      fieldsChanged: union(a.fieldsChanged, b.fieldsChanged),
+      sectionsChanged: union(a.sectionsChanged, b.sectionsChanged),
+    };
   }
   if (a.removed) {
     return b;

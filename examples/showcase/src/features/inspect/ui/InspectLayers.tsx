@@ -16,6 +16,7 @@ import { boxFaces, rulerDistance } from "../ux/inspect-tools";
 import { useSectionDrag } from "../ux/use-section-drag";
 import { setBoxClip, setSectionClip } from "../../../viewport/ux/clip-planes";
 import { view } from "../../../viewport/ux/view";
+import { ObjectInfoLayers } from "./ObjectInfoLayers";
 
 export function InspectLayers(props: { app: AppState; scene: Scene | WorkerScene; items: readonly Item[] }) {
   const { app, scene, items } = props;
@@ -25,6 +26,7 @@ export function InspectLayers(props: { app: AppState; scene: Scene | WorkerScene
       <QueryMarker app={app} items={items} />
       <SectionLayer app={app} scene={scene} items={items} />
       <ClipBoxLayer app={app} items={items} />
+      <ObjectInfoLayers app={app} scene={scene} items={items} />
     </>
   );
 }

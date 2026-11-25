@@ -4,7 +4,10 @@
 // the main side allocates synchronously; the engine maps them to its handles.
 import type { Bounds, Placement, PlacementInput, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
+import type { DelaunayFlipOptions, DenoiseOptions } from "../denoise.js";
+import type { ExtrudeBaseOptions, ExtrudeFacesOptions } from "../extrude.js";
 import type { EncodedPrimitive, PrimitiveMesh } from "../primitives.js";
+import type { WrapOptions, WrapPlan } from "../wrap.js";
 import type {
   NormalizedBooleanOptions,
   NormalizedDyntopoOptions,
@@ -117,12 +120,21 @@ export type Request =
       /**
        * Add in place, in the batch's own result (a restart's replay), never
        * in the background: by default a large mesh is built in the
-       * background and lands with a later result or `update` message.
+       * background and lands with a later result or `update` message. An
+       * `undoable` add is always in place, so that it lands in its step.
        */
       inline?: boolean;
       key?: string;
     }
-  | { kind: "removeMesh" | "compact"; rev: number; id: ClientId; key?: string }
+  | {
+      kind: "removeMesh";
+      rev: number;
+      id: ClientId;
+      /** Remove it as an undo step (see `RemoveMeshOptions`). */
+      undoable?: boolean;
+      key?: string;
+    }
+  | { kind: "compact"; rev: number; id: ClientId; key?: string }
   | {
       kind: "setPlacement";
       rev: number;
@@ -311,6 +323,10 @@ export type Request =
   /** `Scene.setFieldInteraction`. */
   | { kind: "fieldInteraction"; rev: number; points: number | null }
   | { kind: "deleteSelectedFaces"; rev: number; id: ClientId; selectedTris: Uint32Array; qid: number }
+  /** `Scene.extrudeFaces`; replies with its result. */
+  | { kind: "extrudeFaces"; rev: number; id: ClientId; triangles: Uint32Array; options: ExtrudeFacesOptions; qid: number }
+  /** `Scene.extrudeBase`; replies with its result. */
+  | { kind: "extrudeBase"; rev: number; id: ClientId; options: ExtrudeBaseOptions; qid: number }
   | { kind: "extractSelectedFaces"; rev: number; id: ClientId; addedId: ClientId; selectedTris: Uint32Array; normals: boolean; qid: number }
   | { kind: "splitSelectedFaces"; rev: number; id: ClientId; addedId: ClientId; selectedTris: Uint32Array; normals: boolean; qid: number }
   | { kind: "applyFfd"; rev: number; id: ClientId; options: FfdOptions; qid: number }
@@ -328,7 +344,13 @@ export type Request =
   | { kind: "convexHull"; rev: number; addedId: ClientId; meshes: ClientId[]; normals: boolean; qid: number }
   /** `Scene.convexHullOfPoints` on flat world positions; replies with the hull's counts. */
   | { kind: "convexHullPoints"; rev: number; addedId: ClientId; points: Float64Array; normals: boolean; qid: number }
+  /** `Scene.wrap`; replies with the wrap's counts and grid. */
+  | { kind: "wrap"; rev: number; addedId: ClientId; meshes: ClientId[]; options: WrapOptions; qid: number }
   | { kind: "hollowMesh"; rev: number; id: ClientId; options: HollowOptions; qid: number }
+  /** `Scene.denoise`; replies with its report. */
+  | { kind: "denoise"; rev: number; id: ClientId; options: DenoiseOptions; qid: number }
+  /** `Scene.delaunayFlips`; replies with its report. */
+  | { kind: "delaunayFlips"; rev: number; id: ClientId; options: DelaunayFlipOptions; qid: number }
   | { kind: "punchDrainHole"; rev: number; id: ClientId; plugId?: ClientId; options: DrainHoleOptions; qid: number }
   | { kind: "placeMesh"; rev: number; target: ClientId; stamp: ClientId; addedId?: ClientId; options: PlaceMeshOptions; qid: number }
   | { kind: "query"; rev: number; qid: number; name: string; args: unknown }
@@ -395,6 +417,7 @@ export interface QueryMap {
   fitPrimitive: { args: { mesh: ClientId; options: FitPrimitiveOptions }; value: FittedPrimitiveReport };
   sliceContours: { args: { mesh: ClientId; origin: Vec3; normal: Vec3 }; value: ContourSlice };
   sliceContourStack: { args: { mesh: ClientId; origin: Vec3; normal: Vec3; spacing: number; count: number }; value: ContourSlice[] };
+  wrapPlan: { args: { meshes: ClientId[]; options: WrapOptions }; value: WrapPlan };
   /** A primitive shape, generated in the Worker (no scene state); its buffers are transferred. */
   generatePrimitive: { args: EncodedPrimitive; value: PrimitiveMesh };
   /** Test-only (an engine run with `debug`): copies of a mesh's buffers. */
@@ -434,6 +457,8 @@ export interface MeshChangeWire {
   id: ClientId;
   added: boolean;
   removed: boolean;
+  /** Only on a removal: undo or redo can bring the mesh back (see `MeshChange`). */
+  restorable?: true;
   placementChanged: boolean;
   capacityChanged: boolean;
   positions: Range[] | "all";
@@ -484,6 +509,21 @@ export interface Result {
    */
   sections: { section: ClientId; mesh: ClientId; result: SectionResultWire | null }[];
   history: { canUndo: boolean; canRedo: boolean };
+  /**
+   * Where each mesh that an undoable add or removal, or its undo or redo,
+   * moved in this batch now is: in the scene (`"live"`), out of it but kept
+   * by the history (`"parked"`), or out of it for good (`"gone"`: the history
+   * dropped a parked mesh). Omitted when there is none.
+   */
+  presence?: { id: ClientId; state: "live" | "parked" | "gone" }[];
+  /**
+   * The fields that lost targets to such a move, with the targets left, or
+   * `null` for a field that went (it was measured to nothing else, or on a
+   * mesh now gone for good). Omitted when there is none.
+   */
+  fieldTargets?: { field: ClientId; to: ClientId[] | null }[];
+  /** The sections that lost meshes to such a move, with the meshes left. Omitted when there is none. */
+  sectionMeshes?: { section: ClientId; meshes: ClientId[] }[];
   /**
    * The outcome of every keyed request run in this batch, in order (a
    * request dropped as superseded, or an abandoned field build, has none).
@@ -590,12 +630,16 @@ export function keyOf(req: Request): string | undefined {
     case "applyDyntopo":
     case "dyntopoDab":
     case "deleteSelectedFaces":
+    case "extrudeFaces":
+    case "extrudeBase":
     case "splitSelectedFaces":
     case "applyFfd":
     case "applyArap":
     case "applyKelvinlet":
     case "applyXpbd":
     case "hollowMesh":
+    case "denoise":
+    case "delaunayFlips":
     case "punchDrainHole":
       return `edit:${req.id}`;
     case "join":
@@ -606,6 +650,7 @@ export function keyOf(req: Request): string | undefined {
     case "reconstructPointCloud":
     case "convexHull":
     case "convexHullPoints":
+    case "wrap":
       return `mesh:${req.addedId}`;
     case "placeMesh":
       return req.addedId !== undefined ? `mesh:${req.addedId}` : `edit:${req.target}`;

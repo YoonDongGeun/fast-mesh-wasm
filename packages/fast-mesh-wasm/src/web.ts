@@ -36,7 +36,29 @@ export {
   type Vec3,
 } from "./api.js";
 export { FastMeshError, type FastMeshErrorCode } from "./core.js";
+export type {
+  DelaunayFlipOptions,
+  DelaunayFlipReport,
+  DenoiseOptions,
+  DenoiseReport,
+  SurfaceStats,
+} from "./denoise.js";
+export type {
+  ExtrudeBaseOptions,
+  ExtrudeBaseResult,
+  ExtrudeDirection,
+  ExtrudeFacesOptions,
+  ExtrudeFacesResult,
+} from "./extrude.js";
 export type { ConvexHullOptions, ConvexHullPoints, ConvexHullResult } from "./hull.js";
+export {
+  DEFAULT_WRAP_DETAIL,
+  DEFAULT_WRAP_MAX_VOXELS,
+  type WrapGridOptions,
+  type WrapOptions,
+  type WrapPlan,
+  type WrapResult,
+} from "./wrap.js";
 export {
   type ArrowShape,
   type BoxShape,
@@ -215,6 +237,7 @@ export {
   type AutoRepairRequest,
   type ManifoldOptions,
   type ManifoldReport,
+  type RemoveMeshOptions,
   type RepairOp,
   type RepairReport,
   type RepairReportOf,

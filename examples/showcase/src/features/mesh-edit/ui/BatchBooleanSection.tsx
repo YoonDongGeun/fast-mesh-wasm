@@ -74,7 +74,7 @@ export function BatchBooleanSection(props: { app: AppState; store: SceneStore; i
         type="button"
         data-batch-boolean-run
         disabled={busy || b.blocked !== null}
-        title={b.keepInputs ? "The result is a new mesh" : "The primary takes the result; the others are emptied (one undo step)"}
+        title={b.keepInputs ? "The result is a new mesh" : "The primary takes the result; the others are removed (one undo step)"}
         onClick={() => void b.run()}
       >
         {b.blocked === null ? `Run on ${b.inputs.length} meshes` : "Run Multi Boolean"}

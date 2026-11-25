@@ -74,8 +74,22 @@
 //! - Convex hulls: [`convex_hull`] builds the exact convex hull of points
 //!   (from one mesh, several meshes or a point cloud with its wrappers) as a
 //!   closed, outward-wound mesh, by quickhull on exact orientation predicates.
+//! - Wrapping: [`wrap()`](wrap::wrap) closes gaps and holes below a size in
+//!   one or more meshes by a voxel morphological closing, and returns a
+//!   closed, manifold envelope without self-intersections.
 //! - Registration: [`icp()`] aligns points to a mesh by rigid, point-to-plane
 //!   ICP with trimmed outlier rejection, and reports how far it got.
+//! - Denoising and Delaunay flips: [`denoise()`] smooths scan noise by
+//!   bilateral normal filtering and a vertex update while keeping edges
+//!   sharper than a feature angle; [`delaunay_flips`] flips edges towards a
+//!   Delaunay triangulation where triangles are nearly coplanar, without
+//!   moving a vertex. Both take an optional face region and report
+//!   [`SurfaceStats`] before and after.
+//! - Extrusion: [`extrude_faces`] moves a face selection along its normals
+//!   (or a direction) and walls its boundary, keeping a closed mesh closed;
+//!   [`extrude_base`] runs boundary loops to a flat, capped base, turning an
+//!   open surface into a solid. Both report the self-intersections they
+//!   would make.
 //! - Primitives: [`primitives::generate`] builds a closed, welded,
 //!   outward-wound box, cylinder, cone, UV sphere, icosphere, torus, arrow or
 //!   prism (or an open plane) from its parameters, centred on the origin.
@@ -97,7 +111,10 @@ pub mod bridge;
 mod cleanup;
 mod cut;
 pub mod deform;
+pub mod delaunay;
+pub mod denoise;
 mod error;
+pub mod extrude;
 mod fair;
 mod fill;
 mod fill_dp;
@@ -125,6 +142,7 @@ mod topology;
 #[cfg(test)]
 mod uv_table;
 mod weld;
+pub mod wrap;
 
 pub use analyze::{Analysis, AnalyzeOptions, AnalyzeOptionsBuilder, analyze};
 pub use append::{AppendReport, AppendSource, append_mesh, append_mesh_with_uvs};
@@ -138,7 +156,13 @@ pub use cleanup::{
     DegenerateReport, RemoveReport, WeldReport, remove_degenerate, remove_small_components, weld,
 };
 pub use cut::{CutOptions, CutOutput, CutReport, cut_by_plane};
+pub use delaunay::{DelaunayOptions, DelaunayReport, delaunay_flips};
+pub use denoise::{DenoiseOptions, DenoiseReport, SurfaceStats, denoise, surface_stats};
 pub use error::{OpsError, Result};
+pub use extrude::{
+    BaseLevel, BaseLoops, ExtrudeBaseOptions, ExtrudeBaseReport, ExtrudeDirection,
+    ExtrudeFacesOptions, ExtrudeFacesReport, extrude_base, extrude_faces,
+};
 pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
     fill_holes,
@@ -182,6 +206,7 @@ pub use simplify::{
     SimplifyOptionsBuilder, SimplifyReport, simplify, simplify_with,
 };
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
+pub use wrap::{WrapOptions, WrapOptionsBuilder, WrapPlan, WrapReport, wrap_meshes, wrap_plan};
 
 use fast_mesh_store::StoreError;
 

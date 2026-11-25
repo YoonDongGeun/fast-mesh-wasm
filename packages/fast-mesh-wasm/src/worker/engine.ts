@@ -550,6 +550,20 @@ class Engine {
   readonly #sectionMeshes = new Map<ClientId, ClientId[]>();
   /** Section entries ended by mesh removals this batch, reported as `null`. */
   readonly #goneEntries: { section: ClientId; mesh: ClientId }[] = [];
+  /**
+   * Meshes out of the scene that undo or redo can bring back. Their ids stay
+   * bound (requests on them fail in the scene), and the fields on them stay
+   * known: they come back with the mesh.
+   */
+  readonly #parked = new Set<ClientId>();
+  /** Parked meshes the client removed for good meanwhile: they go when they come back. */
+  readonly #doomed = new Set<ClientId>();
+  /** Meshes parked, restored or dropped by the history in this batch (see `Result.presence`). */
+  readonly #moved = new Set<ClientId>();
+  /** What those moves left of fields (see `Result.fieldTargets`). */
+  readonly #fieldTargets = new Map<ClientId, ClientId[] | null>();
+  /** The sections those moves took meshes from (see `Result.sectionMeshes`). */
+  readonly #sectionsLost = new Set<ClientId>();
   /** The active drag, by the dragged mesh's client id. */
   #drag: { id: ClientId; session: ReturnType<Scene["drag"]>; collisionActive: boolean } | undefined;
   /** Meshes whose authoritative placement must be emitted in the next result even if delta is 0. */
@@ -785,12 +799,14 @@ class Engine {
 
   /**
    * Whether an add runs in the background: the port can post updates, the
-   * mesh is large enough, and the add is not asked to run in place.
+   * mesh is large enough, and the add is not asked to run in place (nor
+   * undoable: it must land in the step it was made in).
    */
   #inBackground(req: Extract<Request, { kind: "addMesh" }>): boolean {
     return (
       this.#port.postUpdate !== undefined &&
       req.inline !== true &&
+      req.options.undoable !== true &&
       req.indices.byteLength / 12 >= this.#backgroundAdd
     );
   }
@@ -888,6 +904,7 @@ class Engine {
       case "reconstructPointCloud":
       case "convexHull":
       case "convexHullPoints":
+      case "wrap":
       case "punchDrainHole":
       case "placeMesh":
       case "moveWithCollision":
@@ -905,12 +922,16 @@ class Engine {
       case "applyDyntopo":
       case "dyntopoDab":
       case "deleteSelectedFaces":
+      case "extrudeFaces":
+      case "extrudeBase":
       case "applyFfd":
       case "applyArap":
       case "applyKelvinlet":
       case "applyXpbd":
       case "alignToFittedPrimitive":
       case "hollowMesh":
+      case "denoise":
+      case "delaunayFlips":
         return this.#pending(req.id);
       case "join":
       case "boolean":
@@ -956,6 +977,8 @@ class Engine {
             return a.options?.mesh === undefined || this.#pending(a.options.mesh);
           case "findContacts":
             return a.pairs === undefined || this.#pending(...a.pairs.flat());
+          case "wrapPlan":
+            return this.#pending(...(req.args as QueryMap["wrapPlan"]["args"]).meshes);
           default:
             return this.#pending(a.a, a.b, a.mesh, a.source, a.target);
         }
@@ -1026,12 +1049,16 @@ class Engine {
       case "applyDyntopo":
       case "dyntopoDab":
       case "deleteSelectedFaces":
+      case "extrudeFaces":
+      case "extrudeBase":
       case "splitSelectedFaces":
       case "applyFfd":
       case "applyArap":
       case "applyKelvinlet":
       case "applyXpbd":
       case "hollowMesh":
+      case "denoise":
+      case "delaunayFlips":
       case "punchDrainHole":
       case "removeMesh":
         return req.id === id;
@@ -1351,6 +1378,8 @@ class Engine {
       case "applyDyntopo":
       case "dyntopoDab":
       case "deleteSelectedFaces":
+      case "extrudeFaces":
+      case "extrudeBase":
       case "splitSelectedFaces":
       case "applyFfd":
       case "applyArap":
@@ -1358,6 +1387,8 @@ class Engine {
       case "applyXpbd":
       case "alignToFittedPrimitive":
       case "hollowMesh":
+      case "denoise":
+      case "delaunayFlips":
       case "punchDrainHole":
       case "removeMesh":
         return meshes.has(req.id);
@@ -1727,15 +1758,29 @@ class Engine {
 
   /**
    * Drops engine-side references of a removed mesh: fields on it (or only
-   * to it) and its section entries. The scene did the same with the mesh.
+   * to it) and its section entries. The scene did the same with the mesh. A
+   * `"parked"` mesh keeps the fields on it, and leaves those of other parked
+   * meshes alone: they come back together. What is left of the fields is
+   * reported when the client did not ask for the removal, or may see it in
+   * another order (`"parked"` and `"gone"`).
    */
-  #dropMeshRefs(id: ClientId): void {
+  #dropMeshRefs(id: ClientId, why: "removed" | "parked" | "gone" = "removed"): void {
     for (const [field, [on, ...to]] of this.#fieldMeshes) {
+      if (why === "parked" && this.#parked.has(on)) {
+        continue;
+      }
       if (on === id || (to.length === 1 && to[0] === id)) {
         this.#dropField(field);
+        if (why !== "removed") {
+          this.#fieldTargets.set(field, null);
+        }
       } else if (to.includes(id)) {
         // The field keeps its other targets; so does a deferred build.
-        this.#fieldMeshes.set(field, [on, ...to.filter((m) => m !== id)]);
+        const left = to.filter((m) => m !== id);
+        this.#fieldMeshes.set(field, [on, ...left]);
+        if (why !== "removed") {
+          this.#fieldTargets.set(field, left);
+        }
         const desc = this.#deferred.get(field);
         if (desc !== undefined) {
           this.#deferred.set(field, { ...desc, to: desc.to.filter((m) => m !== id) });
@@ -1749,7 +1794,70 @@ class Engine {
           meshes.filter((m) => m !== id),
         );
         this.#goneEntries.push({ section, mesh: id });
+        if (why !== "removed") {
+          this.#sectionsLost.add(section);
+        }
       }
+    }
+  }
+
+  /**
+   * After a request that may park or restore meshes (an undoable removal, an
+   * undo, a redo, a cancelled step): brings the engine's books in line with
+   * where the scene has each mesh.
+   */
+  #syncPresence(): void {
+    const left: ClientId[] = [];
+    for (const [id, h] of this.#meshes) {
+      const live = this.#scene.has(h);
+      if (live !== this.#parked.has(id)) {
+        continue;
+      }
+      this.#moved.add(id);
+      if (live) {
+        this.#parked.delete(id);
+        if (this.#doomed.delete(id)) {
+          this.#scene.removeMesh(h);
+          this.#forgetMesh(id, h);
+        }
+      } else {
+        this.#parked.add(id);
+        left.push(id);
+      }
+    }
+    for (const id of left) {
+      if (this.#drag?.id === id) {
+        this.#drag = undefined;
+      }
+      this.#dropMeshRefs(id, "parked");
+    }
+  }
+
+  /** Forgets a mesh removed for good. */
+  #forgetMesh(id: ClientId, h: MeshHandle): void {
+    this.#meshes.delete(id);
+    // `#meshIds` keeps the handle until its removal record is sent.
+    this.#removed.push(h);
+    if (this.#drag?.id === id) {
+      this.#drag = undefined;
+    }
+    this.#dropMeshRefs(id);
+  }
+
+  /** Forgets the parked meshes the history has dropped for good. */
+  #dropGone(): void {
+    for (const id of [...this.#parked]) {
+      const h = this.#meshes.get(id) as MeshHandle;
+      if (this.#scene.isRestorable(h)) {
+        continue;
+      }
+      this.#parked.delete(id);
+      this.#doomed.delete(id);
+      this.#moved.add(id);
+      this.#meshes.delete(id);
+      // `#meshIds` keeps the handle until its removal record is sent.
+      this.#removed.push(h);
+      this.#dropMeshRefs(id, "gone");
     }
   }
 
@@ -1773,15 +1881,25 @@ class Engine {
         return;
       }
       case "removeMesh": {
-        const h = this.#mesh(req.id);
-        s.removeMesh(h);
-        this.#meshes.delete(req.id);
-        // `#meshIds` keeps the handle until its removal record is sent.
-        this.#removed.push(h);
-        if (this.#drag?.id === req.id) {
-          this.#drag = undefined;
+        if (req.undoable === true) {
+          // The result says where it is, whatever comes of this.
+          this.#moved.add(req.id);
         }
-        this.#dropMeshRefs(req.id);
+        if (this.#parked.has(req.id)) {
+          // An undo or redo took it out before the client knew.
+          if (req.undoable !== true) {
+            this.#doomed.add(req.id);
+          }
+          return;
+        }
+        const h = this.#mesh(req.id);
+        if (req.undoable === true) {
+          s.removeMesh(h, { undoable: true });
+          this.#syncPresence();
+          return;
+        }
+        s.removeMesh(h);
+        this.#forgetMesh(req.id, h);
         return;
       }
       case "join": {
@@ -1904,6 +2022,16 @@ class Engine {
         b.replies.push({ qid: req.qid, ok: true, value });
         return;
       }
+      case "extrudeFaces": {
+        const value = s.extrudeFaces(this.#mesh(req.id), req.triangles, req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "extrudeBase": {
+        const value = s.extrudeBase(this.#mesh(req.id), req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
       case "extractSelectedFaces": {
         this.#ensureUnused(req.addedId);
         const added = s.extractSelectedFaces(this.#mesh(req.id), req.selectedTris, { normals: req.normals });
@@ -1984,6 +2112,23 @@ class Engine {
             : s.convexHullOfPoints(req.points, options);
         this.#bindAdded(req.addedId, r.mesh);
         const value = { inputPoints: r.inputPoints, vertices: r.vertices, triangles: r.triangles };
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "denoise": {
+        const value = s.denoise(this.#mesh(req.id), req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "delaunayFlips": {
+        const value = s.delaunayFlips(this.#mesh(req.id), req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "wrap": {
+        this.#ensureUnused(req.addedId);
+        const { mesh, ...value } = s.wrap(this.#meshList(req.meshes), req.options);
+        this.#bindAdded(req.addedId, mesh);
         b.replies.push({ qid: req.qid, ok: true, value });
         return;
       }
@@ -2080,6 +2225,7 @@ class Engine {
         if (this.#drag !== undefined && !this.#drag.session.active) {
           this.#drag = undefined;
         }
+        this.#syncPresence();
         return;
       case "redo":
         s.redo();
@@ -2087,6 +2233,7 @@ class Engine {
         if (this.#drag !== undefined && !this.#drag.session.active) {
           this.#drag = undefined;
         }
+        this.#syncPresence();
         return;
       case "clearHistory":
         if (this.#drag !== undefined) {
@@ -2116,6 +2263,7 @@ class Engine {
             if (this.#drag !== undefined && !this.#drag.session.active) {
               this.#drag = undefined;
             }
+            this.#syncPresence();
             return;
         }
         throw invalid(`unknown step phase ${(req as { phase: unknown }).phase}`);
@@ -2363,6 +2511,10 @@ class Engine {
         const a = args as QueryMap["selfIntersectingTriangles"]["args"];
         return s.selfIntersectingTriangles(this.#mesh(a.mesh));
       }
+      case "wrapPlan": {
+        const a = args as QueryMap["wrapPlan"]["args"];
+        return s.wrapPlan(this.#meshList(a.meshes), a.options);
+      }
       case "findContacts": {
         const a = args as QueryMap["findContacts"]["args"];
         const pairs = a.pairs?.map(([x, y]): [MeshHandle, MeshHandle] => [this.#mesh(x), this.#mesh(y)]);
@@ -2511,6 +2663,7 @@ class Engine {
   /** Commits the frame and packs everything that changed. */
   #result(b: Batch): Result {
     const s = this.#scene;
+    this.#dropGone();
     let frame = s.commitFrame();
     if (this.#valuesFull) {
       this.#valuesFull = false;
@@ -2556,7 +2709,7 @@ class Engine {
     }
     for (const id of forced) {
       const h = this.#meshes.get(id);
-      if (h === undefined) {
+      if (h === undefined || this.#parked.has(id)) {
         continue;
       }
       const p = s.placement(h);
@@ -2573,6 +2726,18 @@ class Engine {
     for (const { section, mesh } of this.#goneEntries.splice(0)) {
       sections.push({ section, mesh, result: null });
     }
+    const presence: NonNullable<Result["presence"]> = [...this.#moved].map((id) => ({
+      id,
+      state: this.#doomed.has(id) ? "gone" : this.#parked.has(id) ? "parked" : this.#meshes.has(id) ? "live" : "gone",
+    }));
+    this.#moved.clear();
+    const fieldTargets = [...this.#fieldTargets].map(([field, to]) => ({ field, to }));
+    this.#fieldTargets.clear();
+    const sectionMeshes = [...this.#sectionsLost].flatMap((section) => {
+      const meshes = this.#sectionMeshes.get(section);
+      return meshes === undefined ? [] : [{ section, meshes }];
+    });
+    this.#sectionsLost.clear();
     const history = { canUndo: s.canUndo(), canRedo: s.canRedo() };
     // Every landed add's record is in this frame.
     this.#packed.clear();
@@ -2593,6 +2758,9 @@ class Engine {
       placements,
       sections,
       history,
+      ...(presence.length === 0 ? {} : { presence }),
+      ...(fieldTargets.length === 0 ? {} : { fieldTargets }),
+      ...(sectionMeshes.length === 0 ? {} : { sectionMeshes }),
       status: b.status,
       replies: b.replies,
       colorings: b.colorings,
@@ -2605,8 +2773,8 @@ class Engine {
    */
   #withValues(frame: MeshChange[]): MeshChange[] {
     const out = [...frame];
-    for (const h of this.#meshes.values()) {
-      if ((this.#scene.views(h).values?.() ?? null) === null) {
+    for (const [id, h] of this.#meshes) {
+      if (this.#parked.has(id) || (this.#scene.views(h).values?.() ?? null) === null) {
         continue;
       }
       const at = out.findIndex((c) => c.mesh === h);
@@ -2651,6 +2819,7 @@ class Engine {
       id,
       added: c.added,
       removed: c.removed,
+      ...(c.restorable === true && !this.#doomed.has(id) ? { restorable: true as const } : {}),
       placementChanged: c.placementChanged,
       capacityChanged: c.capacityChanged,
       positions: c.positions,

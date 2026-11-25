@@ -32,10 +32,9 @@ impl Scene {
     /// the meshes' local positions. Otherwise the hull is built in the world
     /// and placed at [`Placement::IDENTITY`].
     ///
-    /// The new mesh is added empty and the hull lands in it as one edit, so
-    /// the hull is one undo step: undo empties the new mesh and redo fills
-    /// it again. The mesh itself stays, like the added part of
-    /// [`Scene::cut_by_plane`].
+    /// The new mesh is added as one undo step (an undoable add, see
+    /// [`MeshOptions::undoable`]): undo removes it again and redo brings it
+    /// back under the same id.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id;
@@ -101,7 +100,7 @@ impl Scene {
 
     /// Adds the convex hull of world `points` as a new closed, outward-wound
     /// mesh at [`Placement::IDENTITY`], with its origin at the centre of its
-    /// vertices' box. One undo step, as for [`Scene::convex_hull`].
+    /// vertices' box. One undoable add, as for [`Scene::convex_hull`].
     ///
     /// # Errors
     /// [`SceneError::Ops`] with
@@ -117,8 +116,8 @@ impl Scene {
         self.add_hull(&hull, points, c, c, Placement::IDENTITY)
     }
 
-    /// Adds an empty mesh with `origin` and `placement` and appends `hull`
-    /// (its points minus `offset`, as local positions) as one edit.
+    /// Builds a mesh with `origin` holding `hull` (its points minus
+    /// `offset`, as local positions) and adds it undoably with `placement`.
     fn add_hull(
         &mut self,
         hull: &ConvexHull,
@@ -128,19 +127,19 @@ impl Scene {
         placement: Placement,
     ) -> Result<ConvexHullReport> {
         let source = hull.to_append_source(points, offset)?;
-        let empty = Mesh::from_buffers_f64_with_origin(&[], &[], origin)?;
+        let mut mesh = Mesh::from_buffers_f64_with_origin(&[], &[], origin)?;
+        let mut tx = mesh.begin_edit();
+        append_mesh(&mut tx, &source)?;
+        // A patch that only adds slots reserves none: dropping it is free.
+        drop(tx.commit()?);
         let added = self.add_mesh(
-            empty,
+            mesh,
             MeshOptions {
                 placement,
+                undoable: true,
                 ..MeshOptions::default()
             },
         )?;
-        if let Err(e) = self.edit(added, |tx| append_mesh(tx, &source)) {
-            // Added and removed before any report: the scene is unchanged.
-            self.remove_mesh(added)?;
-            return Err(e);
-        }
         Ok(ConvexHullReport {
             added,
             input_points: points.len(),
@@ -224,11 +223,14 @@ mod tests {
         let changes = scene.take_changes();
         assert!(changes.iter().any(|c| c.id == r.added));
 
+        // Undo removes the hull mesh (#269); redo brings it back as it was.
         assert!(scene.undo().unwrap());
-        assert_eq!(scene.mesh(r.added).unwrap().triangle_count(), 0);
+        assert!(scene.mesh(r.added).is_err());
+        assert!(scene.is_restorable(r.added));
         assert!(!scene.can_undo(), "the hull is one step");
         assert!(scene.redo().unwrap());
         assert_eq!(scene.mesh(r.added).unwrap().triangle_count(), 12);
+        assert_eq!(scene.placement(r.added).unwrap(), placement);
         assert_eq!(scene.mesh(id).unwrap().triangle_count(), 12);
     }
 
