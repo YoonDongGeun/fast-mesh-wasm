@@ -1988,11 +1988,18 @@ export type GeodesicMethod = "dijkstra" | "heatMethod";
 
 /** Options for surface geodesic distance evaluation via {@link Scene.geodesicDistances}. */
 export interface GeodesicOptions {
-  /** `"dijkstra"` (fast graph distance, default) or `"heatMethod"` (Crane PDE diffusion). */
+  /**
+   * `"dijkstra"` (fast graph distance, default) or `"heatMethod"` (Crane PDE
+   * diffusion); `inspect.geodesicDistances` says how far off each is.
+   */
   method?: GeodesicMethod;
   /** Optional maximum distance cutoff in world units. */
   maxDistance?: number;
-  /** Dimensionless time-step scale `m` (`t = m * h^2`) for `"heatMethod"`. */
+  /**
+   * Dimensionless time-step scale `m` (`t = m * h^2`) for `"heatMethod"`,
+   * where `h` is the mean edge length, or `sqrt(area / 2000)` where that is
+   * smaller.
+   */
   timeStepScale?: number;
   /**
    * Cancels the query: its promise rejects with the signal's reason at once,

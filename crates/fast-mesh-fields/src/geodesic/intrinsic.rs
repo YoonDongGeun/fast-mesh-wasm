@@ -59,6 +59,9 @@ const CORNER: f64 = 0.01;
 /// foot of away from the ends of its edge: between two edges at a small angle,
 /// one foot would be the cause of the next for ever.
 const FOOT: f64 = 0.1;
+/// An edge with more triangles than this is a boundary of each: an edit goes
+/// around all of them.
+const MANY: usize = 64;
 /// Triangles on the way to a circumcentre at most.
 const WALK: usize = 1000;
 /// Sides looked at, or vertices put in, per step.
@@ -245,36 +248,31 @@ enum Ring {
 }
 
 impl Corners {
-    /// Calls `f` with every side at the edge of `side`, itself among them, in
-    /// ascending order.
-    fn sides(&self, triangles: &[[u32; 3]], side: u32, mut f: impl FnMut(u32)) {
+    fn ring(&self, triangles: &[[u32; 3]], side: u32) -> Ring {
         let tri = triangles[side as usize / 3];
         let k = side as usize % 3;
         let (mut at, mut to) = (tri[k], tri[(k + 1) % 3]);
         if self.around(to).len() < self.around(at).len() {
             std::mem::swap(&mut at, &mut to);
         }
+        let mut ring = Ring::One;
         for &corner in self.around(at) {
             let (t, j) = (corner as usize / 3, corner as usize % 3);
-            if triangles[t][(j + 1) % 3] == to {
-                f(corner);
-            }
-            if triangles[t][(j + 2) % 3] == to {
-                f((3 * t + (j + 2) % 3) as u32);
+            let (a, b) = ((j + 1) % 3, (j + 2) % 3);
+            let other = if triangles[t][a] == to {
+                corner
+            } else if triangles[t][b] == to {
+                (3 * t + b) as u32
+            } else {
+                continue;
+            };
+            if other != side {
+                match ring {
+                    Ring::One => ring = Ring::Two(other),
+                    _ => return Ring::More,
+                }
             }
         }
-    }
-
-    fn ring(&self, triangles: &[[u32; 3]], side: u32) -> Ring {
-        let mut ring = Ring::One;
-        self.sides(triangles, side, |other| {
-            if other != side {
-                ring = match ring {
-                    Ring::One => Ring::Two(other),
-                    _ => Ring::More,
-                };
-            }
-        });
         ring
     }
 }
@@ -334,7 +332,11 @@ fn rings(mesh: &Numbered, corners: &Corners) -> Result<Rings> {
         let p = widen(mesh.positions[v as usize]);
         for ring in sides.chunk_by(|a, b| a.0 == b.0) {
             for (k, &(_, side)) in ring.iter().enumerate() {
-                next[side as usize / 3][side as usize % 3] = ring[(k + 1) % ring.len()].1;
+                let after = match ring.len() {
+                    0..=MANY => ring[(k + 1) % ring.len()].1,
+                    _ => side,
+                };
+                next[side as usize / 3][side as usize % 3] = after;
             }
             if let &[(_, a), (_, b)] = ring {
                 if opposite(&mesh.triangles, a, b) {
