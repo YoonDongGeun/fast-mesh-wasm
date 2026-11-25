@@ -56,7 +56,7 @@ export function lazyPanel<M, P extends object>(
         aria-label={panel.title}
         aria-busy={!failed}
         data-lazy-panel={chunk.name}
-        style={{ minHeight: panel.height }}
+        style={failed ? undefined : { minHeight: panel.height }}
       >
         <h2>{panel.title}</h2>
         {failed ? <ChunkFailed chunk={chunk} what="This panel" /> : <p className="muted small lazy-note">Loading…</p>}

@@ -177,8 +177,9 @@ describe("lazyPanel", () => {
     const host = mount(<Lazy label="Edit" />);
     act(() => void chunk.load());
     await fail();
-    const place = host.querySelector("[data-lazy-panel=edit]")!;
+    const place = host.querySelector<HTMLElement>("[data-lazy-panel=edit]")!;
     expect(place.getAttribute("aria-busy")).toBe("false");
+    expect(place.style.minHeight).toBe(""); // no empty space under the message
     expect(place.querySelector("[role=alert]")?.textContent).toMatch(/did not load/);
     expect(place.querySelector("[data-action=chunk-reload]")).not.toBeNull();
 
