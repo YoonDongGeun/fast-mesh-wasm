@@ -74,10 +74,10 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
     exporter, in their own plane or flattened onto a world one, in millimetres.
 
   The math is in `src/features/polylines/ux`, all on the main thread and linear or nearly so: a tube
-  along 50,000 points and the offset of a loop of 8,000 each take a fraction of a second. The engine's
-  history knows meshes only, so each state of the list has an empty mesh in the scene as its marker
-  (`polyline-history.ts`): an edit swaps markers undoably, and undo and redo swap them back in order
-  with every other edit. Display settings (name, colour, visibility) are not undo steps.
+  along 50,000 points and the offset of a loop of 8,000 each take a fraction of a second. An edit is
+  an application entry of the scene's undo history (`store.recordEntry`, in `polyline-history.ts`),
+  undone and redone in order with every other edit. Display settings (name, colour, visibility) are
+  not undo steps.
 - **Height maps and reliefs.** The export panel's *Height map* section (Home) makes an orthographic
   depth image of a mesh, or of every visible one, from a standard view or the current one: the
   pixels along its longer side, and the meshes' own height range or a typed one. It is sampled in

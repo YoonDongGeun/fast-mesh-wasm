@@ -637,17 +637,6 @@ export class AppState {
       this.#set({ multi: [select] });
       store.select(select);
     }
-    const polylines = this.#polylineHistory.follow(store);
-    if (polylines !== null) {
-      // Display settings are not undone: they stay as they are now.
-      const shown = new Map(this.#snap.polylines.map((p) => [p.id, p]));
-      this.#setPolylines(
-        polylines.map((p) => {
-          const now = shown.get(p.id);
-          return now === undefined ? p : { ...p, name: now.name, color: now.color, visible: now.visible };
-        }),
-      );
-    }
   }
 
   /** The volumes of the meshes undo or redo can bring back. */
@@ -1180,13 +1169,13 @@ export class AppState {
    */
   editPolylines(store: SceneStore, polylines: readonly Polyline[], select?: readonly number[]): void {
     const before = this.#snap.polylines;
-    this.#polylineHistory.record(store, before, polylines);
+    this.#polylineHistory.record(store, before, polylines, (edit) => this.#setPolylines(edit(this.#snap.polylines)));
     this.#setPolylines(polylines, select);
   }
 
-  /** Replaces the polyline list for good, as opening a project does (#268). */
-  resetPolylines(store: SceneStore, polylines: readonly Polyline[]): void {
-    this.#polylineHistory.reset(store);
+  /** Replaces the polyline list for good, as opening a project does (#268): no undo changes it back. */
+  resetPolylines(polylines: readonly Polyline[]): void {
+    this.#polylineHistory.reset();
     this.#setPolylines(polylines, []);
   }
 

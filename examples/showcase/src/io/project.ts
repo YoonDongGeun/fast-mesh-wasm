@@ -680,7 +680,6 @@ export function restoreProject(store: SceneStore, app: AppState, doc: ProjectDoc
   app.setEdgeSoftness(doc.edgeSoftness);
   app.setProjectUnits(doc.units);
   app.resetPolylines(
-    store,
     (doc.polylines ?? []).map((p) => ({
       id: app.newPolylineId(),
       name: p.name,
