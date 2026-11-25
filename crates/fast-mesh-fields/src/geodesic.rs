@@ -15,6 +15,7 @@
 mod amg;
 mod diffuse;
 mod heat;
+mod intrinsic;
 
 use std::collections::BinaryHeap;
 use std::sync::Arc;
