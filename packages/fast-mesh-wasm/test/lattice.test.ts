@@ -190,7 +190,7 @@ describe("lattice infill on Scene & WorkerScene", () => {
     const parts = (await s.analyze(id)).components;
     expect(parts.length).toBeGreaterThan(1);
     expect(parts.map((c) => c.cavity)).toEqual(parts.map((_, k) => k > 0));
-    expect((await s.repair(id, { op: "orient" })).flippedTriangles).toBe(0);
+    expect((await s.repair.orient(id)).flippedTriangles).toBe(0);
     await settle(s);
     expect(liveTriangles(s, id)).toBe(12 + r.triangles);
     s.undo();
