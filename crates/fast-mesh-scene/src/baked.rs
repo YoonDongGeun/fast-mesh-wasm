@@ -105,8 +105,8 @@ const NEAR: f64 = 16.0;
 pub(crate) fn baked_in_place(entry: &Entry) -> Result<Mesh> {
     let (placement, mesh) = (entry.placement, &entry.mesh);
     let at = local_to_world(&placement, mesh.origin(), [0.0; 3]);
-    let coordinates = mesh.positions().iter().flatten();
-    let largest = coordinates.fold(0.0f32, |m, c| m.max(c.abs()));
+    let alive = (0..mesh.vertex_slots() as VertexId).filter_map(|v| mesh.position(v));
+    let largest = alive.flatten().fold(0.0f32, |m, c| m.max(c.abs()));
     let reach = NEAR * placement.max_scale() * f64::from(largest);
     if at.iter().all(|c| c.abs() <= reach) {
         return baked_copy(mesh, |p| {
@@ -188,6 +188,30 @@ mod tests {
         assert_eq!(scaled, ([0.0; 3], [2.0, 4.0, 33.0]));
         let far = placed([1.0e7, 0.0, 0.0], [1.0, 2.0, 1.0]);
         assert_eq!(far, ([1.0e7, 0.0, 0.0], [2.0, 4.0, 0.0]));
+    }
+
+    #[test]
+    fn baked_in_place_goes_by_the_vertices_there_are() {
+        let mut mesh = quad();
+        let mut tx = mesh.begin_edit();
+        tx.add_vertices(&[[900.0, 0.0, 0.0]]).unwrap();
+        let _ = tx.commit().unwrap();
+        let options = MeshOptions {
+            placement: Placement {
+                translation: [1000.0, 0.0, 0.0],
+                ..Placement::IDENTITY
+            },
+            ..MeshOptions::default()
+        };
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene.add_mesh(mesh, options).unwrap();
+        let origin = |scene: &Scene| {
+            let mesh = baked_in_place(scene.entry(id).unwrap()).unwrap();
+            mesh.origin()
+        };
+        assert_eq!(origin(&scene), [0.0; 3]);
+        scene.edit(id, |tx| tx.remove_vertices(&[4])).unwrap();
+        assert_eq!(origin(&scene), [1000.0, 0.0, 0.0]);
     }
 
     #[test]
