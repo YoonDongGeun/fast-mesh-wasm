@@ -245,10 +245,11 @@ The dev and preview servers send the cross-origin isolation headers (COOP/COEP, 
 ```
 src/
   main.tsx       boot: engine, store, React root
-  app/           App.tsx; ux/ (shortcuts, file drop, loading, display settings); state/ (app state,
-                 tool state, readouts); testing/ (window.__showcase)
+  app/           App.tsx; ui/ (the parts that load on demand); ux/ (shortcuts, file drop, loading,
+                 display settings, the feature chunks); state/ (app state, tool state, readouts);
+                 testing/ (window.__showcase, a chunk of its own)
   shell/         ribbon, status bar, command search, help and tour
-  shared/        units, persisted settings, mesh centres, LengthInput
+  shared/        units, persisted settings, mesh centres, LengthInput, chunks and lazy parts
   viewport/      the canvas (ui/Viewport.tsx); ux/: selection clicks, the sculpt stroke and mask paint
                  drivers, camera and gizmo control, raycasts, the view registry, touch, clip planes
   engine/        the workbench op bridge and the lazy wasm loader
@@ -276,6 +277,27 @@ src/
     ct/          volume rendering, MPR slices
     collision/   contact heatmap, group mode, named groups
 ```
+
+The page's own chunk (`index`) has what the first frame needs: the shell, the canvas, the mesh list
+and the app state. Everything else loads on demand, one chunk per feature:
+`features/<area>/ui/<area>-chunk.ts` exports the area's panels, layers and dialogs,
+`app/ux/feature-chunks.ts` says when they load, and `app/ui/feature-parts.tsx` wraps them, so that
+the shell uses them as if it had imported them.
+
+- **When.** The first screen's chunks load while the engine starts. The others follow one at a time
+  once the page is idle and the mesh it boots onto is here. A ribbon tab's load at once when it is
+  hovered, focused or opened, and a dialog's when it opens. Every panel is mounted once its chunk is
+  here, the hidden ones too.
+- **Until then.** A panel's heading holds its place at about its height, a layer draws nothing, and a
+  dialog that was opened can be closed. A chunk that does not load (offline, or a newer deploy) says
+  so and offers Retry.
+- **What must not wait for a chunk** is in `index`: state and its defaults, undo, keyboard shortcuts,
+  the command palette's entries. A heavy `ux/` module keeps such parts in a file of its own
+  (`align-state.ts` beside `align-tools.ts`, say). A command that presses a panel's control waits for
+  the panel (`whenPresent`, `shell/ux/panel-triggers.ts`).
+
+`test/lazy-chunk.test.ts` follows the static imports from `main.tsx` and fails if one brings a
+feature chunk back; the build warns when `index` passes 1,000 kB.
 
 Tests live in `test/`.
 
