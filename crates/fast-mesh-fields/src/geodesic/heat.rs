@@ -235,8 +235,6 @@ enum BuildStage {
     Flip {
         intrinsic: Box<Intrinsic>,
         area: f64,
-        /// The mean edge length of the mesh.
-        mean: Option<f64>,
     },
     /// Put vertices into the triangles that are too large.
     Refine(Box<Intrinsic>),
@@ -439,7 +437,7 @@ impl SolverBuild {
                         survey: Some(survey),
                     }
                 } else {
-                    flip_stage(numbered, &corners, &cots, survey.area, None)?
+                    flip_stage(numbered, &corners, &cots, survey.area)?
                 }
             }
             BuildStage::Assemble {
@@ -455,7 +453,7 @@ impl SolverBuild {
                         let (length, size) = length_and_size(mean, survey.area);
                         s.length = if self.recut { length } else { mean };
                         if self.recut && survey.radius > size {
-                            flip_stage(numbered, &corners, &cots, survey.area, Some(mean))?
+                            flip_stage(numbered, &corners, &cots, survey.area)?
                         } else {
                             BuildStage::Split {
                                 numbered,
@@ -472,25 +470,15 @@ impl SolverBuild {
             BuildStage::Flip {
                 mut intrinsic,
                 area,
-                mean,
             } => {
                 work = 1 << 18;
-                // (Before the first flip, the edges are the mesh's.)
-                let mean = match mean {
-                    Some(mean) => mean,
-                    None => intrinsic.mean_edge()?,
-                };
-                let (length, size) = length_and_size(mean, area);
-                s.length = length;
                 if intrinsic.flip()? {
+                    let (length, size) = length_and_size(intrinsic.mean_edge(), area);
+                    s.length = length;
                     intrinsic.begin_refining(size)?;
                     BuildStage::Refine(intrinsic)
                 } else {
-                    BuildStage::Flip {
-                        intrinsic,
-                        area,
-                        mean: Some(mean),
-                    }
+                    BuildStage::Flip { intrinsic, area }
                 }
             }
             BuildStage::Refine(mut intrinsic) => {
@@ -582,14 +570,12 @@ fn flip_stage(
     corners: &Corners,
     cots: &[[f64; 3]],
     area: f64,
-    mean: Option<f64>,
 ) -> Result<BuildStage> {
     // (About what it takes: triangles of the largest size allowed.)
     let extra = 4.0 * RESOLUTION;
     Ok(BuildStage::Flip {
         intrinsic: Box::new(Intrinsic::new(mesh, corners, cots, area, extra)?),
         area,
-        mean,
     })
 }
 

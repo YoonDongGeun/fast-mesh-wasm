@@ -34,7 +34,7 @@ use std::collections::BinaryHeap;
 use fast_mesh_store::par;
 
 use super::heat::{CHUNK, Corners, Flat, Numbered, bounds, by_first_corner, morton};
-use crate::geom::{dot, norm, sub, triangle_normal, widen};
+use crate::geom::{cross, dot, norm, sub, triangle_normal, widen};
 use crate::grid::{allocation_allowed, filled, push, reserve_exact};
 use crate::{FieldsError, Result};
 
@@ -277,19 +277,6 @@ impl Corners {
         });
         ring
     }
-
-    /// The side after `side` at its edge: the next larger one, or else the
-    /// smallest.
-    fn next(&self, triangles: &[[u32; 3]], side: u32) -> u32 {
-        let (mut first, mut next) = (side, NONE);
-        self.sides(triangles, side, |other| {
-            first = first.min(other);
-            if other > side {
-                next = next.min(other);
-            }
-        });
-        if next == NONE { first } else { next }
-    }
 }
 
 /// Whether two sides at an edge run along it in opposite directions.
@@ -307,8 +294,73 @@ fn across(triangles: &[[u32; 3]], next: &[[u32; 3]], side: u32) -> Option<u32> {
     (other != side && next_of(other) == side && opposite(triangles, side, other)).then_some(other)
 }
 
-/// Turns triangles over, where those next to each other do not all run the
-/// same way around, so that they do as far as possible. Returns which, if any.
+/// The sides of a mesh around its edges.
+struct Rings {
+    /// Per side, the next one at the same edge, around in a ring.
+    next: Vec<[u32; 3]>,
+    /// Per part, how many sides have just one other at their edge that runs
+    /// along it in the opposite direction.
+    joined: Vec<u32>,
+    /// Some have one that runs along it in the same direction.
+    clash: bool,
+    mean_edge: f64,
+}
+
+fn rings(mesh: &Numbered, corners: &Corners) -> Result<Rings> {
+    let mut next = filled(mesh.triangles.len(), [0u32; 3])?;
+    let mut joined = filled(mesh.parts(), 0u32)?;
+    let mut clash = false;
+    let (mut length, mut edges) = (0.0, 0usize);
+    // Of one vertex: its sides, by the vertex at their other end.
+    let mut sides: Vec<(u32, u32)> = Vec::new();
+    let mut part = 0;
+    for v in 0..mesh.positions.len() as u32 {
+        while mesh.starts[part + 1] <= v {
+            part += 1;
+        }
+        sides.clear();
+        for &corner in corners.around(v) {
+            let (t, k) = (corner as usize / 3, corner as usize % 3);
+            let (a, b) = ((k + 1) % 3, (k + 2) % 3);
+            let tri = mesh.triangles[t];
+            if tri[a] > v {
+                push(&mut sides, (tri[a], corner))?;
+            }
+            if tri[b] > v {
+                push(&mut sides, (tri[b], (3 * t + b) as u32))?;
+            }
+        }
+        sides.sort_unstable();
+        let p = widen(mesh.positions[v as usize]);
+        for ring in sides.chunk_by(|a, b| a.0 == b.0) {
+            for (k, &(_, side)) in ring.iter().enumerate() {
+                next[side as usize / 3][side as usize % 3] = ring[(k + 1) % ring.len()].1;
+            }
+            if let &[(_, a), (_, b)] = ring {
+                if opposite(&mesh.triangles, a, b) {
+                    joined[part] += 2;
+                } else {
+                    clash = true;
+                }
+            }
+            length += norm(sub(widen(mesh.positions[ring[0].0 as usize]), p));
+            edges += 1;
+        }
+    }
+    Ok(Rings {
+        next,
+        joined,
+        clash,
+        mean_edge: if edges > 0 {
+            length / edges as f64
+        } else {
+            0.0
+        },
+    })
+}
+
+/// Turns triangles over, so that those next to each other all run the same
+/// way around, as far as that is possible. Returns which.
 fn orient(triangles: &mut [[u32; 3]], next: &mut [[u32; 3]]) -> Result<Vec<bool>> {
     let next_of = |next: &[[u32; 3]], s: u32| next[s as usize / 3][s as usize % 3];
     // The other side, where there are just two.
@@ -316,16 +368,6 @@ fn orient(triangles: &mut [[u32; 3]], next: &mut [[u32; 3]]) -> Result<Vec<bool>
         let other = next_of(next, s);
         (other != s && next_of(next, other) == s).then_some(other)
     };
-    allocation_allowed()?;
-    let clash = par::map_range(triangles.len(), CHUNK, 2 * CHUNK, OOM, |range| {
-        let mut sides = 3 * range.start as u32..3 * range.end as u32;
-        Ok::<bool, FieldsError>(
-            sides.any(|s| pair(next, s).is_some_and(|other| !opposite(triangles, s, other))),
-        )
-    })?;
-    if !clash.contains(&true) {
-        return Ok(Vec::new());
-    }
     let mut seen = filled(triangles.len(), false)?;
     let mut turned = filled(triangles.len(), false)?;
     let mut stack: Vec<u32> = Vec::new();
@@ -446,6 +488,7 @@ pub(super) struct Intrinsic {
     changed: Vec<u32>,
     large: BinaryHeap<Large>,
     work: Work,
+    mean_edge: f64,
 }
 
 /// What an edit of the triangulation works in.
@@ -500,21 +543,25 @@ impl Intrinsic {
         extra: f64,
     ) -> Result<Intrinsic> {
         let count = mesh.triangles.len();
-        let mut next = filled(count, [0u32; 3])?;
-        par::for_each_chunk_mut(&mut next, CHUNK, 2 * CHUNK, |c, part| {
-            for (i, out) in part.iter_mut().enumerate() {
-                let t = 3 * (c * CHUNK + i) as u32;
-                *out = [t, t + 1, t + 2].map(|side| corners.next(&mesh.triangles, side));
+        let Rings {
+            mut next,
+            mut joined,
+            clash,
+            mean_edge,
+        } = rings(&mesh, corners)?;
+        let mut turned = Vec::new();
+        if clash {
+            turned = orient(&mut mesh.triangles, &mut next)?;
+            joined.fill(0);
+            for side in 0..3 * count as u32 {
+                let part = mesh.part_of(mesh.triangles[side as usize / 3][0]);
+                joined[part] += u32::from(across(&mesh.triangles, &next, side).is_some());
             }
-        });
-
-        let turned = orient(&mut mesh.triangles, &mut next)?;
+        }
 
         let mut todo = Vec::new();
         let mut areas = filled(mesh.parts(), 0.0f64)?;
         let mut left = filled(mesh.parts(), 0u32)?;
-        // Sides that have another triangle next to them.
-        let mut joined = filled(mesh.parts(), 0u32)?;
         for (t, (tri, cots)) in mesh.triangles.iter().zip(cots).enumerate() {
             let part = mesh.part_of(tri[0]);
             left[part] += 1;
@@ -531,8 +578,6 @@ impl Intrinsic {
                 if cots[order[k]] < 0.0 {
                     push(&mut todo, (3 * t + (k + 1) % 3) as u32)?;
                 }
-                let side = (3 * t + k) as u32;
-                joined[part] += u32::from(across(&mesh.triangles, &next, side).is_some());
             }
         }
         if let [all] = &mut areas[..] {
@@ -559,6 +604,7 @@ impl Intrinsic {
             changed: Vec::new(),
             large: BinaryHeap::new(),
             work: Work::default(),
+            mean_edge,
             vertices: mesh.vertices,
             starts: mesh.starts,
             triangles: mesh.triangles,
@@ -566,36 +612,9 @@ impl Intrinsic {
         })
     }
 
-    /// The mean length of the edges, as long as they are the mesh's.
-    pub(super) fn mean_edge(&self) -> Result<f64> {
-        allocation_allowed()?;
-        let parts = par::map_range(self.triangles.len(), CHUNK, 2 * CHUNK, OOM, |range| {
-            let (mut sum, mut count) = (0.0, 0usize);
-            for side in 3 * range.start..3 * range.end {
-                if self.is_first(side as u32) {
-                    let ends = self.ends(side as u32);
-                    let [a, b] = ends.map(|v| widen(self.positions[v as usize]));
-                    sum += norm(sub(b, a));
-                    count += 1;
-                }
-            }
-            Ok::<(f64, usize), FieldsError>((sum, count))
-        })?;
-        let (mut sum, mut count) = (0.0, 0usize);
-        for (s, c) in parts {
-            sum += s;
-            count += c;
-        }
-        Ok(if count > 0 { sum / count as f64 } else { 0.0 })
-    }
-
-    /// Whether a side is the smallest at its edge.
-    fn is_first(&self, side: u32) -> bool {
-        let mut at = self.next_of(side);
-        while at > side {
-            at = self.next_of(at);
-        }
-        at == side
+    /// The mean length of the mesh's edges.
+    pub(super) fn mean_edge(&self) -> f64 {
+        self.mean_edge
     }
 
     /// Flips and splits about [`STEP`] edges; whether the triangulation is
@@ -609,6 +628,15 @@ impl Intrinsic {
     pub(super) fn begin_refining(&mut self, size: f64) -> Result<()> {
         self.stage = Stage::Refine(size);
         for t in 0..self.triangles.len() {
+            if self.layout_of[t] == NONE {
+                // (Without a root, for most are the mesh's and small enough.)
+                let [a, b, c] = self.triangles[t].map(|v| widen(self.positions[v as usize]));
+                let (u, v) = (sub(b, a), sub(c, a));
+                let (w, n) = (sub(c, b), cross(u, v));
+                if dot(u, u) * dot(v, v) * dot(w, w) < 3.99 * size * size * dot(n, n) {
+                    continue;
+                }
+            }
             self.consider(t as u32, size)?;
         }
         Ok(())
@@ -712,8 +740,11 @@ impl Intrinsic {
                 None => plain.push(new(tri)),
             }
         }
+        if !to.is_empty() {
+            plain = by_first_corner(&plain, n, |t| *t)?;
+        }
         Ok(Numbered {
-            triangles: by_first_corner(&plain, n, |t| *t)?,
+            triangles: plain,
             flat: by_first_corner(&flat, n, |f| f.corners)?,
             vertices: self.vertices,
             starts: self.starts,
