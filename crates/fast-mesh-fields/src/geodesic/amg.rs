@@ -33,6 +33,9 @@ const MAX_LEVELS: usize = 24;
 const STALL: f64 = 0.85;
 /// A coupling counts as strong from this share of its rows' diagonals.
 const STRONG: f64 = 0.08;
+/// What of a row's entries, other blocks' ones and its diagonal together, the
+/// smoother's diagonal is at least.
+const ACROSS: f64 = 0.6;
 /// Damping of the interpolation's smoothing step: `4/3` over the largest
 /// eigenvalue of the filtered matrix scaled by its diagonal, which is at
 /// most 2 (its rows sum to at least zero and only its diagonal is positive).
@@ -215,16 +218,19 @@ impl Matrix {
         }
         for (i, out) in relax.iter_mut().enumerate() {
             // Sweeping the blocks against each other's old values converges
-            // in the energy norm from this diagonal on (a half of the l1
+            // in the energy norm from this diagonal on (six tenths of the l1
             // scaling of Baker et al. 2011, which leaves the diagonal alone
-            // unless the other blocks' entries outweigh it).
+            // unless the other blocks' entries come near outweighing it). At
+            // a half, two rows of different blocks that are coupled to little
+            // else (the ends of a needle's short side) would only swap their
+            // errors, for ever.
             let base = i - i % BLOCK;
             let others: f64 = off
                 .row(i)
                 .filter(|&(c, _)| !(base..base + BLOCK).contains(&(c as usize)))
                 .map(|(_, v)| v.abs())
                 .sum();
-            let d = diag[i].max(0.5 * (diag[i] + others));
+            let d = diag[i].max(ACROSS * (diag[i] + others));
             *out = if d > 0.0 && d.is_finite() {
                 1.0 / d
             } else {
@@ -521,7 +527,8 @@ impl AmgBuild {
     }
 }
 
-/// Splits the diagonal off a square matrix.
+/// Splits the diagonal off a square matrix whose rows sum to zero, but for
+/// rounding errors: the diagonal is what makes them.
 fn without_diagonal(mut full: Rows) -> Result<Matrix> {
     let n = full.rows();
     let mut diag = filled(n, 0.0f64)?;
@@ -531,11 +538,10 @@ fn without_diagonal(mut full: Rows) -> Result<Matrix> {
         let to = full.ptr[i + 1] as usize;
         for e in from..to {
             let c = full.col[e];
-            if c as usize == i {
-                *d = full.val[e];
-            } else {
+            if c as usize != i {
                 full.col[at] = c;
                 full.val[at] = full.val[e];
+                *d -= full.val[e];
                 at += 1;
             }
         }
@@ -626,7 +632,8 @@ fn aggregates(a: &Matrix) -> Result<(Vec<u32>, usize)> {
 
 /// Piecewise constant over the aggregates, smoothed by one damped Jacobi
 /// step of `a` without its weak couplings (which go to the diagonal, so that
-/// the rows keep their sums).
+/// the rows keep their sums). A row with none but weak ones has nothing to be
+/// smoothed with.
 fn interpolation(a: &Matrix, aggregate: &[u32], count: usize) -> Result<Rows> {
     build_rows(a.len(), count, |i, acc| {
         let own = aggregate[i];
@@ -634,12 +641,15 @@ fn interpolation(a: &Matrix, aggregate: &[u32], count: usize) -> Result<Rows> {
             return Ok(());
         }
         let mut d = a.diag[i];
+        let mut alone = true;
         for (c, v) in a.off.row(i) {
-            if !strong(a, i, c, v) {
+            if strong(a, i, c, v) {
+                alone = false;
+            } else {
                 d += v;
             }
         }
-        if !(d > 0.0 && d.is_finite()) {
+        if alone || !(d > 0.0 && d.is_finite()) {
             return acc.add(own, 1.0);
         }
         acc.add(own, 1.0 - DAMPING)?;

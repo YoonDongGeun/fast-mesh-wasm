@@ -1,5 +1,6 @@
 //! The heat method's operators and solves; see [`GeodesicHeatSolver`].
 
+use std::f64::consts::FRAC_1_SQRT_2;
 use std::ops::Range;
 
 use fast_mesh_store::{Mesh, par};
@@ -18,8 +19,8 @@ const MIN_EDGE_WEIGHT: f64 = 1e-6;
 /// The Poisson solve ends at this error, in the energy norm and relative to
 /// that of a distance field (whose gradient is 1 everywhere).
 const TOLERANCE: f64 = 1e-7;
-/// The fewest vertices an even triangulation of the whole surface may have
-/// for the time step: a coarser mesh gets more, and a smaller step.
+/// The diffusion's length is at most that of the sides of so many squares that
+/// make up the whole surface: a mesh with fewer vertices gets more.
 const RESOLUTION: f64 = 2000.0;
 /// Elements per chunk of the assembly's loops.
 pub(super) const CHUNK: usize = 8192;
@@ -69,9 +70,11 @@ pub(super) struct Flat {
 
 impl Flat {
     pub(super) fn new(corners: [u32; 3], layout: Layout) -> Flat {
+        let [length, x, y] = [layout.length, layout.x, layout.y].map(|c| c as f32);
+        // (Never without an area, however small.)
         Flat {
             corners,
-            shape: [layout.length, layout.x, layout.y].map(|c| c as f32),
+            shape: [length.max(f32::MIN_POSITIVE), x, y.max(f32::MIN_POSITIVE)],
         }
     }
 
@@ -107,7 +110,7 @@ pub struct GeodesicHeatSolver {
     local_of: Vec<u32>,
     components: Vec<Component>,
     /// The diffusion's length: its time step is the square of it.
-    size: f64,
+    length: f64,
     time_step_scale: f64,
 }
 
@@ -361,7 +364,7 @@ impl SolverBuild {
                 component_of: Vec::new(),
                 local_of: Vec::new(),
                 components: Vec::new(),
-                size: 0.0,
+                length: 0.0,
                 time_step_scale,
             },
             stage: BuildStage::Triangles,
@@ -449,12 +452,9 @@ impl SolverBuild {
                 let (laplacian, mean) = assemble(&numbered, &corners, &cots)?;
                 match survey {
                     Some(survey) => {
-                        s.size = if self.recut {
-                            size(mean, survey.area)
-                        } else {
-                            mean
-                        };
-                        if self.recut && survey.radius > s.size {
+                        let (length, size) = length_and_size(mean, survey.area);
+                        s.length = if self.recut { length } else { mean };
+                        if self.recut && survey.radius > size {
                             flip_stage(numbered, &corners, &cots, survey.area, Some(mean))?
                         } else {
                             BuildStage::Split {
@@ -480,9 +480,10 @@ impl SolverBuild {
                     Some(mean) => mean,
                     None => intrinsic.mean_edge()?,
                 };
-                s.size = size(mean, area);
+                let (length, size) = length_and_size(mean, area);
+                s.length = length;
                 if intrinsic.flip()? {
-                    intrinsic.begin_refining(s.size)?;
+                    intrinsic.begin_refining(size)?;
                     BuildStage::Refine(intrinsic)
                 } else {
                     BuildStage::Flip {
@@ -569,9 +570,10 @@ impl SolverBuild {
 }
 
 /// The length of the diffusion on a surface whose edges have a mean length of
-/// `mean`.
-fn size(mean: f64, area: f64) -> f64 {
-    mean.min((area / RESOLUTION).sqrt())
+/// `mean`, and the largest circumradius its triangles may have.
+fn length_and_size(mean: f64, area: f64) -> (f64, f64) {
+    let side = (area / RESOLUTION).sqrt();
+    (mean.min(side), mean.min(side * FRAC_1_SQRT_2))
 }
 
 /// Starts to cut the surface otherwise.
@@ -582,8 +584,8 @@ fn flip_stage(
     area: f64,
     mean: Option<f64>,
 ) -> Result<BuildStage> {
-    // (An even triangulation has twice as many triangles as vertices.)
-    let extra = 2.0 * RESOLUTION;
+    // (About what it takes: triangles of the largest size allowed.)
+    let extra = 4.0 * RESOLUTION;
     Ok(BuildStage::Flip {
         intrinsic: Box::new(Intrinsic::new(mesh, corners, cots, area, extra)?),
         area,
@@ -1103,7 +1105,7 @@ impl HeatSolve {
         solver: &GeodesicHeatSolver,
         work: usize,
     ) -> Result<Option<usize>> {
-        let time_step = self.time_step_scale * solver.size * solver.size;
+        let time_step = self.time_step_scale * solver.length * solver.length;
         let spent;
         self.stage = match std::mem::replace(&mut self.stage, SolveStage::Done) {
             SolveStage::Next => match self.todo.pop() {
@@ -1464,7 +1466,7 @@ mod tests {
             matrix: c.amg.fine(),
             mass: &c.mass,
             positions: &c.positions,
-            time_step: solver.time_step_scale * solver.size * solver.size,
+            time_step: solver.time_step_scale * solver.length * solver.length,
         };
         let mut d = Diffusion::new(c.vertices.len(), sources).unwrap();
         while d.step(&surface, 100).unwrap().is_some() {}
@@ -1489,7 +1491,7 @@ mod tests {
             ("long strip", strip(150, 1, 1.0), 1.0),
         ] {
             let solver = as_it_is(&m, scale);
-            let t = scale * solver.size * solver.size;
+            let t = scale * solver.length * solver.length;
             let n = solver.components[0].vertices.len() as u32;
             for sources in [vec![0], vec![n / 2], vec![0, n / 3, n - 1]] {
                 let (heat, passes) = diffuse(&solver, 0, &sources);
@@ -1619,7 +1621,7 @@ mod tests {
                     while !intrinsic.refine().unwrap() {
                         intrinsic.check();
                     }
-                    return Some((intrinsic.check(), build.solver.size));
+                    return Some((intrinsic.check(), build.solver.length));
                 }
                 _ => {}
             }
@@ -1670,7 +1672,7 @@ mod tests {
         // Rectangles are cut either way: rounding does not make a difference.
         for x in [1.0, 0.7, 3.3] {
             for shift in [0.0, 1000.0] {
-                let m = strip(60, 60, x);
+                let m = strip(90, 90, x);
                 let p: Vec<_> = m
                     .positions()
                     .iter()
@@ -1727,7 +1729,7 @@ mod tests {
             ("pages", book(3), true, true),
             ("two pages", book(2), true, true),
             ("many pages", book(11), true, true),
-            ("mixed", mixed(&stretched(&icosphere(), 5.0)), true, true),
+            ("mixed", mixed(&stretched(&icosphere(), 5.0)), false, true),
             (
                 "two parts",
                 two(&stretched(&icosphere(), 3.0), &fan_cylinder(20, 3, 1.0)),
@@ -1735,7 +1737,7 @@ mod tests {
                 true,
             ),
         ] {
-            let (check, size) = recut(&m).expect(name);
+            let (check, length) = recut(&m).expect(name);
             let area = area_of(&m);
             assert!(
                 (check.area - area).abs() < 1e-5 * area,
@@ -1748,8 +1750,8 @@ mod tests {
             if !check.full {
                 assert_eq!(check.negative, 0, "{name}: {check:?}");
                 assert!(
-                    check.radius < 1.2 * size || kept,
-                    "{name}: {check:?}, {size}"
+                    check.radius < 1.2 * length || kept,
+                    "{name}: {check:?}, {length}"
                 );
             }
             // The operators on it.
@@ -1803,7 +1805,7 @@ mod tests {
         let m = mesh(&p, &t);
         let (check, _) = recut(&m).unwrap();
         assert!(check.full);
-        let most = 2.0 * RESOLUTION + 1.0;
+        let most = 4.0 * RESOLUTION + 1.0;
         assert!(check.vertices - m.vertex_count() < most as usize);
     }
 

@@ -42,14 +42,21 @@ use crate::{FieldsError, Result};
 const TOLERANCE: f64 = 1e-5;
 /// A coordinate's rounding error, relative to the largest of its part: edges
 /// that rounding alone could have made negative are left alone (the diagonals
-/// of rectangles, say).
+/// of rectangles, say), up to a share of their cotangents.
 const ROUNDING: f64 = 1.0 / (1u64 << 25) as f64;
+const ROUNDED: f64 = 0.01;
 /// Flips at most, per triangle. (A sphere drawn out twenty times takes two.)
 const FLIPS: usize = 64;
 /// A flip leaves each of its two triangles at least this share of their area.
 const SLIVER: f64 = 1e-12;
 /// A vertex this near an edge, in barycentric coordinates, goes on it.
-const ON_EDGE: f64 = 1e-6;
+const ON_EDGE: f64 = 1e-3;
+/// None goes nearer to a corner than this, in barycentric coordinates.
+const CORNER: f64 = 0.01;
+/// A foot is at least this share of its distance from the corner it is the
+/// foot of away from the ends of its edge: between two edges at a small angle,
+/// one foot would be the cause of the next for ever.
+const FOOT: f64 = 0.1;
 /// Triangles on the way to a circumcentre at most.
 const WALK: usize = 1000;
 /// Sides looked at, or vertices put in, per step.
@@ -131,7 +138,8 @@ impl Layout {
     fn slack(self, noise: f64) -> f64 {
         let Layout { length, x, y } = self;
         let c = self.half_cotangent().abs();
-        TOLERANCE * c + noise * (length + x.abs() + y) / (length * y) * (1.0 + 2.0 * c)
+        let noise = noise * (length + x.abs() + y) / (length * y) * (1.0 + 2.0 * c);
+        TOLERANCE * c + noise.min(ROUNDED * (1.0 + c))
     }
 }
 
@@ -199,7 +207,7 @@ pub(super) fn survey(mesh: &Numbered, corners: &Corners, cots: &[[f64; 3]]) -> R
                 let own = mesh.layout(t).turned((k + 1) % 3);
                 let ring = corners.ring(&mesh.triangles, side);
                 let other = match ring {
-                    Ring::Two(other) if opposite(&mesh.triangles, side, other) => {
+                    Ring::Two(other) => {
                         Some(mesh.layout(other as usize / 3).turned(other as usize % 3))
                     }
                     _ => None,
@@ -287,6 +295,73 @@ fn opposite(triangles: &[[u32; 3]], a: u32, b: u32) -> bool {
     let (ta, tb) = (triangles[a as usize / 3], triangles[b as usize / 3]);
     let (ka, kb) = (a as usize % 3, b as usize % 3);
     ta[ka] == tb[(kb + 1) % 3] && ta[(ka + 1) % 3] == tb[kb]
+}
+
+/// The side across an edge that can be flipped or walked over: there are two
+/// triangles at it, next to each other.
+fn across(triangles: &[[u32; 3]], next: &[[u32; 3]], side: u32) -> Option<u32> {
+    let next_of = |s: u32| next[s as usize / 3][s as usize % 3];
+    let other = next_of(side);
+    (other != side && next_of(other) == side && opposite(triangles, side, other)).then_some(other)
+}
+
+/// Turns triangles over, where those next to each other do not all run the
+/// same way around, so that they do as far as possible. Returns which, if any.
+fn orient(triangles: &mut [[u32; 3]], next: &mut [[u32; 3]]) -> Result<Vec<bool>> {
+    let next_of = |next: &[[u32; 3]], s: u32| next[s as usize / 3][s as usize % 3];
+    // The other side, where there are just two.
+    let pair = |next: &[[u32; 3]], s: u32| {
+        let other = next_of(next, s);
+        (other != s && next_of(next, other) == s).then_some(other)
+    };
+    allocation_allowed()?;
+    let clash = par::map_range(triangles.len(), CHUNK, 2 * CHUNK, OOM, |range| {
+        let mut sides = 3 * range.start as u32..3 * range.end as u32;
+        Ok::<bool, FieldsError>(
+            sides.any(|s| pair(next, s).is_some_and(|other| !opposite(triangles, s, other))),
+        )
+    })?;
+    if !clash.contains(&true) {
+        return Ok(Vec::new());
+    }
+    let mut seen = filled(triangles.len(), false)?;
+    let mut turned = filled(triangles.len(), false)?;
+    let mut stack: Vec<u32> = Vec::new();
+    for seed in 0..triangles.len() as u32 {
+        if seen[seed as usize] {
+            continue;
+        }
+        seen[seed as usize] = true;
+        push(&mut stack, seed)?;
+        while let Some(t) = stack.pop() {
+            for side in 3 * t..3 * t + 3 {
+                let Some(other) = pair(next, side) else {
+                    continue;
+                };
+                let o = other as usize / 3;
+                if !seen[o] {
+                    seen[o] = true;
+                    turned[o] = turned[t as usize] == opposite(triangles, side, other);
+                    push(&mut stack, o as u32)?;
+                }
+            }
+        }
+    }
+    for (tri, _) in triangles.iter_mut().zip(&turned).filter(|(_, t)| **t) {
+        tri.swap(1, 2);
+    }
+    // The first and the last side of those have changed places.
+    let new = |s: u32| match turned[s as usize / 3] {
+        true => s - s % 3 + (2 - s % 3),
+        false => s,
+    };
+    for (sides, &turned) in next.iter_mut().zip(&turned) {
+        *sides = sides.map(new);
+        if turned {
+            sides.swap(0, 2);
+        }
+    }
+    Ok(turned)
 }
 
 /// A triangle that is too large.
@@ -413,9 +488,10 @@ enum Stage {
 impl Intrinsic {
     /// The triangulation of a mesh as it is, whose half cotangents are
     /// `cots` and whose area is `area`. Each part may gain half its
-    /// triangles, and `extra` ones shared out between the parts by area.
+    /// triangles, and `extra` ones shared out between the parts by area, as
+    /// far as their triangles hang together.
     pub(super) fn new(
-        mesh: Numbered,
+        mut mesh: Numbered,
         corners: &Corners,
         cots: &[[f64; 3]],
         area: f64,
@@ -430,9 +506,13 @@ impl Intrinsic {
             }
         });
 
+        let turned = orient(&mut mesh.triangles, &mut next)?;
+
         let mut todo = Vec::new();
         let mut areas = filled(mesh.parts(), 0.0f64)?;
         let mut left = filled(mesh.parts(), 0u32)?;
+        // Sides that have another triangle next to them.
+        let mut joined = filled(mesh.parts(), 0u32)?;
         for (t, (tri, cots)) in mesh.triangles.iter().zip(cots).enumerate() {
             let part = mesh.part_of(tri[0]);
             left[part] += 1;
@@ -440,19 +520,27 @@ impl Intrinsic {
                 let at = tri.map(|v| mesh.positions[v as usize]);
                 areas[part] += 0.5 * norm(triangle_normal(at));
             }
-            for (k, &c) in cots.iter().enumerate() {
+            let order = match turned.get(t) {
+                Some(true) => [0, 2, 1],
+                _ => [0, 1, 2],
+            };
+            for k in 0..3 {
                 // Only an angle above a right one can make a weight negative.
-                if c < 0.0 {
+                if cots[order[k]] < 0.0 {
                     push(&mut todo, (3 * t + (k + 1) % 3) as u32)?;
                 }
+                let side = (3 * t + k) as u32;
+                joined[part] += u32::from(across(&mesh.triangles, &next, side).is_some());
             }
         }
         if let [all] = &mut areas[..] {
             *all = area;
         }
         let mut gain = 0usize;
-        for (left, area_of) in left.iter_mut().zip(&areas) {
-            *left = (f64::from(*left) / 2.0 + extra * area_of / area) as u32;
+        for (part, left) in left.iter_mut().enumerate() {
+            let count = f64::from(*left);
+            let holds = (2.0 * f64::from(joined[part]) / (3.0 * count)).min(1.0);
+            *left = (count / 2.0 + extra * holds * areas[part] / area) as u32;
             gain += *left as usize;
         }
         Ok(Intrinsic {
@@ -537,8 +625,12 @@ impl Intrinsic {
                 return Ok(true);
             };
             let t = triangle as usize;
-            if self.layout(t).circumradius() == radius && self.left[self.part(t)] >= 2 {
-                self.insert_centre(t, size)?;
+            if self.layout(t).circumradius() == radius
+                && self.left[self.part(t)] >= 2
+                && self.insert_centre(t, size)?
+            {
+                // Something else was in the way.
+                push(&mut self.changed, triangle)?;
             }
         }
         Ok(false)
@@ -703,12 +795,8 @@ impl Intrinsic {
         [tri[k], tri[(k + 1) % 3]]
     }
 
-    /// The side across an edge that can be flipped or walked over: there are
-    /// two triangles at it, next to each other.
     fn across(&self, side: u32) -> Option<u32> {
-        let other = self.next_of(side);
-        (other != side && self.next_of(other) == side && opposite(&self.triangles, side, other))
-            .then_some(other)
+        across(&self.triangles, &self.next, side)
     }
 
     /// Looks at up to `count` sides that may have negative weights, and
@@ -727,8 +815,7 @@ impl Intrinsic {
                 {
                     self.flip_edge(side, other)?;
                 }
-            } else if negative(own, None, noise) {
-                // The foot of the corner across from it.
+            } else if negative(own, None, noise) && own.x.min(own.length - own.x) > FOOT * own.y {
                 self.split(side, own.x / own.length)?;
             }
         }
@@ -921,20 +1008,50 @@ impl Intrinsic {
         Ok(())
     }
 
-    /// Puts a vertex at the circumcentre of a triangle, or splits the edge
-    /// in the way.
-    fn insert_centre(&mut self, t: usize, size: f64) -> Result<()> {
-        match self.walk(t) {
-            Place::Inside(t, at) => {
-                if let Some(k) = (0..3).find(|&k| at[k] < ON_EDGE) {
-                    let (a, b) = (at[(k + 1) % 3], at[(k + 2) % 3]);
-                    return self.split((3 * t + (k + 1) % 3) as u32, b / (a + b));
-                }
-                self.insert(t, at)
-            }
-            Place::Edge(side) if self.layout_from(side).length > size => self.split(side, 0.5),
-            _ => Ok(()),
+    /// Puts a vertex at the circumcentre of a triangle, or else, where that
+    /// is behind an edge that is kept or near one, splits that; whether it did
+    /// the latter.
+    fn insert_centre(&mut self, t: usize, size: f64) -> Result<bool> {
+        let (t, at) = match self.walk(t) {
+            Place::Inside(t, at) => (t, at),
+            Place::Edge(side) => return self.split_long(side, size),
+            Place::Nowhere => return Ok(false),
+        };
+        if at.iter().any(|&w| w > 1.0 - CORNER) {
+            return Ok(false);
         }
+        let layout = self.layout(t);
+        for k in 0..3 {
+            let side = (3 * t + k) as u32;
+            if self.across(side).is_some() {
+                continue;
+            }
+            // Whether the vertex would see it at an obtuse angle.
+            let Layout { length, x, y } = layout.turned(k);
+            let (b, c) = (at[(k + 1) % 3], at[(k + 2) % 3]);
+            let (x, y) = (b * length + c * x, c * y);
+            if x * (x - length) + y * y < 0.0 {
+                return self.split_long(side, size);
+            }
+        }
+        match (0..3).find(|&k| at[k] < ON_EDGE) {
+            Some(k) => {
+                let (a, b) = (at[(k + 1) % 3], at[(k + 2) % 3]);
+                self.split((3 * t + (k + 1) % 3) as u32, b / (a + b))?;
+            }
+            None => self.insert(t, at)?,
+        }
+        Ok(false)
+    }
+
+    /// Splits the edge of a side in its middle, unless it is shorter than
+    /// `size`; whether it did.
+    fn split_long(&mut self, side: u32, size: f64) -> Result<bool> {
+        let before = self.positions.len();
+        if self.layout_from(side).length > size {
+            self.split(side, 0.5)?;
+        }
+        Ok(self.positions.len() > before)
     }
 
     /// Walks from a triangle to its circumcentre.
