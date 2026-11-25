@@ -191,8 +191,8 @@ pub(super) fn survey(mesh: &Numbered, corners: &Corners, cots: &[[f64; 3]]) -> R
                 continue;
             }
             // Only an angle above a right one can make a weight negative.
-            for k in 0..3 {
-                if cots[t][k] >= 0.0 {
+            for (k, &cot) in cots[t].iter().enumerate() {
+                if cot >= 0.0 {
                     continue;
                 }
                 let side = 3 * t as u32 + (k as u32 + 1) % 3;
@@ -312,6 +312,21 @@ impl PartialOrd for Large {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct Check {
+    pub(super) area: f64,
+    pub(super) radius: f64,
+    pub(super) vertices: usize,
+    /// Triangles that are not the mesh's.
+    pub(super) flat: usize,
+    /// Edges that cannot be flipped.
+    pub(super) kept: usize,
+    pub(super) negative: usize,
+    /// A part may not grow any more.
+    pub(super) full: bool,
+}
+
 /// Where a walk ended.
 enum Place {
     /// In a triangle, at these barycentric coordinates.
@@ -353,8 +368,39 @@ pub(super) struct Intrinsic {
     /// The triangles changed since the last vertex was put in.
     changed: Vec<u32>,
     large: BinaryHeap<Large>,
-    /// What [`Intrinsic::renumber`] works in.
+    work: Work,
+}
+
+/// What an edit of the triangulation works in.
+#[derive(Debug, Default)]
+struct Work {
     links: Vec<[u32; 2]>,
+    cuts: Vec<Cut>,
+    members: Vec<u32>,
+    renamed: Vec<(u32, u32)>,
+}
+
+/// A triangle `(a, b, c)` whose side from `a` to `b` is split at `m`: it
+/// becomes `(a, m, c)`, in its place, and `(m, b, c)`.
+#[derive(Debug, Clone, Copy)]
+struct Cut {
+    side: u32,
+    /// It runs the other way than the edge.
+    back: bool,
+    /// The second triangle.
+    second: u32,
+}
+
+impl Cut {
+    /// The sides from the edge's start to `m`, and from there on.
+    fn halves(self) -> [u32; 2] {
+        let (first, second) = (3 * (self.side / 3), 3 * self.second);
+        if self.back {
+            [second, first]
+        } else {
+            [first, second]
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -421,7 +467,7 @@ impl Intrinsic {
             stage: Stage::Flip,
             changed: Vec::new(),
             large: BinaryHeap::new(),
-            links: Vec::new(),
+            work: Work::default(),
             vertices: mesh.vertices,
             starts: mesh.starts,
             triangles: mesh.triangles,
@@ -707,7 +753,7 @@ impl Intrinsic {
             let found = sides.iter().find(|&&(old, _)| old == side);
             found.map_or(side, |&(_, new)| new)
         };
-        let mut links = std::mem::take(&mut self.links);
+        let mut links = std::mem::take(&mut self.work.links);
         links.clear();
         for &(old, _) in sides {
             push(&mut links, [new(self.before(old)), new(self.next_of(old))])?;
@@ -716,7 +762,7 @@ impl Intrinsic {
             self.set_next(before, to);
             self.set_next(to, next);
         }
-        self.links = links;
+        self.work.links = links;
         Ok(())
     }
 
@@ -775,33 +821,57 @@ impl Intrinsic {
     /// Splits the edge of a side at `at` of its length, and the triangles
     /// there, unless their part may not grow that much.
     fn split(&mut self, side: u32, at: f64) -> Result<()> {
+        // (`renumber` goes on working in the links.)
+        let mut work = Work {
+            links: std::mem::take(&mut self.work.links),
+            ..std::mem::take(&mut self.work)
+        };
+        std::mem::swap(&mut work.links, &mut self.work.links);
+        let done = self.split_with(&mut work, side, at);
+        work.links = std::mem::take(&mut self.work.links);
+        self.work = work;
+        done
+    }
+
+    fn split_with(&mut self, work: &mut Work, side: u32, at: f64) -> Result<()> {
+        let Work {
+            cuts,
+            members,
+            renamed,
+            ..
+        } = work;
         if !(at > 0.0 && at < 1.0) {
             return Ok(());
         }
-        // Every side at the edge, and whether it runs the other way.
-        let mut ring: Vec<(u32, bool)> = Vec::new();
-        let paired = self.across(side);
+        let paired = self.across(side).is_some();
         let from = self.ends(side)[0];
+        cuts.clear();
+        members.clear();
+        renamed.clear();
         let mut s = side;
         loop {
-            let back = if paired.is_some() {
+            let back = if paired {
                 s != side
             } else {
                 self.ends(s)[0] != from
             };
-            push(&mut ring, (s, back))?;
+            push(
+                cuts,
+                Cut {
+                    side: s,
+                    back,
+                    second: NONE,
+                },
+            )?;
+            push(members, s / 3)?;
             s = self.next_of(s);
             if s == side {
                 break;
             }
         }
         let part = self.part(side as usize / 3);
-        let count = ring.len() as u32;
+        let count = cuts.len() as u32;
         // Triangles that meet themselves at the edge cannot be cut.
-        let mut members = filled(ring.len(), 0u32)?;
-        for (m, &(s, _)) in members.iter_mut().zip(&ring) {
-            *m = s / 3;
-        }
         members.sort_unstable();
         if self.left[part] < count || members.windows(2).any(|w| w[0] == w[1]) {
             return Ok(());
@@ -811,42 +881,39 @@ impl Intrinsic {
         let [p, q] = self.ends(side).map(|v| widen(self.positions[v as usize]));
         let middle = std::array::from_fn(|k| p[k] + at * (q[k] - p[k]));
         let m = self.add_vertex(middle, part)?;
-        // `(a, b, c)` becomes `(a, m, c)`, in its place, and `(m, b, c)`.
-        let mut renamed: Vec<(u32, u32)> = Vec::new();
-        reserve_exact(&mut renamed, 2 * ring.len())?;
-        // The sides from the edge's start to `m`, and from there on.
-        let mut halves: Vec<[u32; 2]> = Vec::new();
-        reserve_exact(&mut halves, ring.len())?;
-        for &(s, back) in &ring {
-            let (t, k) = (s / 3, s % 3);
-            let [a, b] = self.ends(s);
+        for cut in cuts.iter_mut() {
+            let (t, k) = (cut.side / 3, cut.side % 3);
+            let [a, b] = self.ends(cut.side);
             let c = self.ends(3 * t + (k + 2) % 3)[0];
-            let Layout { length, x, y } = self.layout_from(s);
-            let cut = length * if back { 1.0 - at } else { at };
+            let Layout { length, x, y } = self.layout_from(cut.side);
+            let first = length * if cut.back { 1.0 - at } else { at };
             let u = self.add_triangle(
                 [m, b, c],
                 Layout {
-                    length: length - cut,
-                    x: x - cut,
+                    length: length - first,
+                    x: x - first,
                     y,
                 },
             )?;
-            push(&mut renamed, (3 * t + (k + 1) % 3, 3 * u + 1))?;
-            push(&mut renamed, (3 * t + (k + 2) % 3, 3 * t + 2))?;
-            push(
-                &mut halves,
-                if back { [3 * u, 3 * t] } else { [3 * t, 3 * u] },
-            )?;
+            cut.second = u;
+            push(renamed, (3 * t + (k + 1) % 3, 3 * u + 1))?;
+            push(renamed, (3 * t + (k + 2) % 3, 3 * t + 2))?;
             self.triangles[t as usize] = [a, m, c];
-            self.set_layout(t as usize, Layout { length: cut, x, y })?;
+            let layout = Layout {
+                length: first,
+                x,
+                y,
+            };
+            self.set_layout(t as usize, layout)?;
         }
-        self.renumber(&renamed)?;
-        for (i, &(s, _)) in ring.iter().enumerate() {
-            let (t, u) = (s / 3, renamed[2 * i].1 / 3);
+        self.renumber(renamed)?;
+        for (i, cut) in cuts.iter().enumerate() {
+            let (t, u) = (cut.side / 3, cut.second);
             self.set_next(3 * t + 1, 3 * u + 2);
             self.set_next(3 * u + 2, 3 * t + 1);
-            for half in 0..2 {
-                self.set_next(halves[i][half], halves[(i + 1) % halves.len()][half]);
+            let after = cuts[(i + 1) % cuts.len()].halves();
+            for (half, next) in cut.halves().into_iter().zip(after) {
+                self.set_next(half, next);
             }
             self.touch(t)?;
             self.touch(u)?;
@@ -920,6 +987,66 @@ impl Intrinsic {
             side = other;
         }
         Place::Nowhere
+    }
+
+    /// Checks that the triangulation hangs together: its area, the largest
+    /// circumradius, and how many sides have negative weights or are not what
+    /// they were in the mesh.
+    #[cfg(test)]
+    pub(super) fn check(&self) -> Check {
+        let mut check = Check::default();
+        let mut seen = vec![false; 3 * self.triangles.len()];
+        for t in 0..self.triangles.len() {
+            let layout = self.layout(t);
+            assert!(layout.length > 0.0 && layout.y > 0.0, "{t}: {layout:?}");
+            check.area += 0.5 * layout.length * layout.y;
+            check.radius = check.radius.max(layout.circumradius());
+            assert!(
+                self.triangles[t]
+                    .iter()
+                    .all(|&v| (v as usize) < self.positions.len())
+            );
+            for side in 3 * t as u32..3 * t as u32 + 3 {
+                if seen[side as usize] {
+                    continue;
+                }
+                // Every side at an edge has its ends and its length.
+                let (ends, length) = (self.ends(side), self.layout_from(side).length);
+                let mut ring = Vec::new();
+                let mut at = side;
+                loop {
+                    assert!(!seen[at as usize], "{side}");
+                    seen[at as usize] = true;
+                    ring.push(at);
+                    let [a, b] = self.ends(at);
+                    assert!([a, b] == ends || [b, a] == ends, "{side}: {at}");
+                    let l = self.layout_from(at).length;
+                    assert!((l - length).abs() < 1e-5 * length, "{side}: {l}, {length}");
+                    at = self.next_of(at);
+                    if at == side {
+                        break;
+                    }
+                }
+                check.kept += usize::from(self.across(side).is_none());
+                let noise = self.noise[self.part(t)];
+                check.negative += match self.across(side) {
+                    Some(other) if other / 3 == side / 3 => 0,
+                    Some(other) => usize::from(negative(
+                        self.layout_from(side),
+                        Some(self.layout_from(other)),
+                        noise,
+                    )),
+                    None => ring
+                        .iter()
+                        .filter(|&&s| negative(self.layout_from(s), None, noise))
+                        .count(),
+                };
+            }
+        }
+        check.vertices = self.positions.len();
+        check.flat = self.layouts.len();
+        check.full = self.left.contains(&0) || self.left.contains(&1);
+        check
     }
 
     /// Puts a vertex into a triangle.

@@ -1336,6 +1336,7 @@ fn flat_divergence(layout: Layout, u: [f64; 3]) -> [f64; 3] {
 
 #[cfg(test)]
 mod tests {
+    use super::super::intrinsic::Check;
     use super::*;
     use crate::grid::fail_allocations_after;
     use crate::test_util::{icosphere, mesh, terrain};
@@ -1604,6 +1605,243 @@ mod tests {
         assert!(solver.byte_size() > 0);
     }
 
+    /// The triangulation the operators of `m` are assembled on, if it is not
+    /// the mesh's own, checked on the way.
+    fn recut(m: &Mesh) -> Option<(Check, f64)> {
+        let mut build = SolverBuild::new(m, 1.0).unwrap();
+        while build.step(m).unwrap().is_some() {
+            match &mut build.stage {
+                BuildStage::Flip { intrinsic, .. } => {
+                    intrinsic.check();
+                }
+                BuildStage::Refine(intrinsic) => {
+                    assert_eq!(intrinsic.check().negative, 0);
+                    while !intrinsic.refine().unwrap() {
+                        intrinsic.check();
+                    }
+                    return Some((intrinsic.check(), build.solver.size));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn area_of(m: &Mesh) -> f64 {
+        m.triangles()
+            .iter()
+            .map(|t| 0.5 * norm(triangle_normal(t.map(|v| m.positions()[v as usize]))))
+            .sum()
+    }
+
+    /// Pages that share one edge, each a stretched strip.
+    fn book(pages: u32) -> Mesh {
+        let mut p: Vec<[f32; 3]> = (0..=8).map(|k| [0.0, 0.0, k as f32 * 4.0]).collect();
+        let mut t = Vec::new();
+        for page in 0..pages {
+            let a = page as f32 / pages as f32 * std::f32::consts::TAU;
+            let base = p.len() as u32 - 9;
+            let at = |x: u32, z: u32| if x == 0 { z } else { base + 9 * x + z };
+            for x in 1..=6 {
+                for z in 0..=8 {
+                    let r = x as f32 * 0.3;
+                    let z = z as f32 * 4.0 + r * 5.0;
+                    p.push([a.cos() * r, a.sin() * r, z]);
+                }
+            }
+            for x in 0..6 {
+                for z in 0..8 {
+                    let (a, b, c, d) = (at(x, z), at(x + 1, z), at(x + 1, z + 1), at(x, z + 1));
+                    t.push([a, b, c]);
+                    t.push([a, c, d]);
+                }
+            }
+        }
+        mesh(&p, &t)
+    }
+
+    #[test]
+    fn a_good_triangulation_is_left_alone() {
+        let m = strip(60, 60, 1.0);
+        let p = m.positions().iter();
+        let p: Vec<_> = p.map(|v| [v[0] - 0.4 * v[1], v[1], v[2]]).collect();
+        let slanted = mesh(&p, m.triangles());
+        assert!(recut(&slanted).is_none());
+        // Rectangles are cut either way: rounding does not make a difference.
+        for x in [1.0, 0.7, 3.3] {
+            for shift in [0.0, 1000.0] {
+                let m = strip(60, 60, x);
+                let p: Vec<_> = m
+                    .positions()
+                    .iter()
+                    .map(|v| [v[0] * 0.1 + shift, v[1] * 0.1 - shift, v[2]])
+                    .collect();
+                assert!(recut(&mesh(&p, m.triangles())).is_none(), "{x} {shift}");
+            }
+        }
+        // The same operators, to the bit, as without looking.
+        let a = GeodesicHeatSolver::build(&slanted, 1.0).unwrap();
+        let b = as_it_is(&slanted, 1.0);
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let (a, b) = (&a.components[0].amg.fine(), &b.components[0].amg.fine());
+        assert_eq!(bits(&a.off.val), bits(&b.off.val));
+        assert_eq!(bits(&a.diag), bits(&b.diag));
+    }
+
+    #[test]
+    fn a_bad_triangulation_is_cut_again() {
+        // Across each other, in one mesh.
+        let two = |a: &Mesh, b: &Mesh| {
+            let mut p = a.positions().to_vec();
+            let mut t = a.triangles().to_vec();
+            let base = p.len() as u32;
+            p.extend(b.positions().iter().map(|v| [v[0] + 40.0, v[1], v[2]]));
+            t.extend(b.triangles().iter().map(|tri| tri.map(|v| v + base)));
+            mesh(&p, &t)
+        };
+        // Every other triangle the other way around.
+        let mixed = |m: &Mesh| {
+            let t = m.triangles().iter().enumerate();
+            let t: Vec<_> = t
+                .map(|(k, &[a, b, c])| if k % 2 == 0 { [a, b, c] } else { [a, c, b] })
+                .collect();
+            mesh(m.positions(), &t)
+        };
+        let sheared = |m: &Mesh| {
+            let p = m.positions().iter();
+            let p: Vec<_> = p.map(|v| [v[0] + 6.0 * v[1], v[1], v[2]]).collect();
+            mesh(&p, m.triangles())
+        };
+        for (name, m, kept, grows) in [
+            ("stretched", stretched(&icosphere(), 20.0), false, true),
+            (
+                "stretched further",
+                stretched(&icosphere(), 500.0),
+                false,
+                true,
+            ),
+            ("sheared", sheared(&strip(12, 12, 1.0)), true, true),
+            ("cylinder", fan_cylinder(64, 8, 2.0), false, true),
+            ("coarse cylinder", fan_cylinder(9, 1, 2.0), false, true),
+            ("cells", stretched(&strip(30, 30, 1.0), 9.0), true, true),
+            ("pages", book(3), true, true),
+            ("two pages", book(2), true, true),
+            ("many pages", book(11), true, true),
+            ("mixed", mixed(&stretched(&icosphere(), 5.0)), true, true),
+            (
+                "two parts",
+                two(&stretched(&icosphere(), 3.0), &fan_cylinder(20, 3, 1.0)),
+                false,
+                true,
+            ),
+        ] {
+            let (check, size) = recut(&m).expect(name);
+            let area = area_of(&m);
+            assert!(
+                (check.area - area).abs() < 1e-5 * area,
+                "{name}: {} of {area}",
+                check.area
+            );
+            assert_eq!(check.kept > 0, kept, "{name}: {check:?}");
+            assert_eq!(check.vertices > m.vertex_count(), grows, "{name}");
+            assert!(check.flat > 0, "{name}");
+            if !check.full {
+                assert_eq!(check.negative, 0, "{name}: {check:?}");
+                assert!(
+                    check.radius < 1.2 * size || kept,
+                    "{name}: {check:?}, {size}"
+                );
+            }
+            // The operators on it.
+            let solver = GeodesicHeatSolver::build(&m, 1.0).unwrap();
+            let mut total = 0.0;
+            for c in &solver.components {
+                total += c.area;
+                let mass: f64 = c.mass.iter().sum();
+                assert!((mass - c.area).abs() < 1e-9 * c.area, "{name}");
+                let l = c.amg.fine();
+                for i in 0..c.vertices.len() {
+                    for (j, v) in l.off.row(i) {
+                        assert!(v < 0.0 && j as usize != i, "{name}");
+                        let back = l.off.row(j as usize).find(|e| e.0 == i as u32);
+                        assert_eq!(back.map(|e| e.1.to_bits()), Some(v.to_bits()), "{name}");
+                    }
+                }
+                let known = c.vertices.iter().enumerate().filter(|(_, v)| **v != NONE);
+                for (local, &v) in known {
+                    assert_eq!(solver.local_of[v as usize], local as u32, "{name}");
+                    assert_eq!(c.positions[local], m.positions()[v as usize], "{name}");
+                }
+            }
+            assert!((total - area).abs() < 1e-5 * area, "{name}");
+            let known: usize = solver
+                .components
+                .iter()
+                .map(|c| c.vertices.iter().filter(|&&v| v != NONE).count())
+                .sum();
+            assert_eq!(known, m.vertex_count(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_part_grows_only_so_much() {
+        // A large plane among many small spheres: all it lacks is in the plane.
+        let s = icosphere();
+        let mut p: Vec<[f32; 3]> = vec![
+            [-1e4, -1e4, -9.0],
+            [1e4, -1e4, -9.0],
+            [1e4, 1e4, -9.0],
+            [-1e4, 1e4, -9.0],
+        ];
+        let mut t = vec![[0, 1, 2], [0, 2, 3]];
+        for k in 0..30 {
+            let base = p.len() as u32;
+            let x = k as f32 * 3.0;
+            p.extend(s.positions().iter().map(|v| [v[0] + x, v[1], v[2]]));
+            t.extend(s.triangles().iter().map(|tri| tri.map(|v| v + base)));
+        }
+        let m = mesh(&p, &t);
+        let (check, _) = recut(&m).unwrap();
+        assert!(check.full);
+        let most = 2.0 * RESOLUTION + 1.0;
+        assert!(check.vertices - m.vertex_count() < most as usize);
+    }
+
+    #[test]
+    fn running_out_of_memory_while_cutting_is_an_error() {
+        let parts = [
+            stretched(&icosphere(), 6.0),
+            strip(9, 4, 8.0),
+            fan_cylinder(24, 2, 1.0),
+            book(3),
+        ];
+        for m in &parts {
+            let mut at = 0;
+            loop {
+                let mut build = SolverBuild::new(m, 1.0).unwrap();
+                while !matches!(build.stage, BuildStage::Survey(_)) {
+                    build.step(m).unwrap();
+                }
+                fail_allocations_after(Some(at));
+                let done = loop {
+                    if let Err(e) = build.step(m) {
+                        break Err(e);
+                    }
+                    if matches!(build.stage, BuildStage::Assemble { survey: None, .. }) {
+                        break Ok(());
+                    }
+                };
+                fail_allocations_after(None);
+                match done {
+                    Ok(()) => break,
+                    Err(e) => assert_eq!(e, FieldsError::OutOfMemory),
+                }
+                at += 1;
+            }
+            assert!(at > 40, "only {at} allocations");
+        }
+    }
+
     #[test]
     fn running_out_of_memory_anywhere_is_an_error() {
         // Large enough for multigrid levels, and in two parts.
@@ -1614,15 +1852,21 @@ mod tests {
         p.extend(b.positions().iter().map(|v| [v[0] + 100.0, v[1], v[2]]));
         t.extend(b.triangles().iter().map(|tri| tri.map(|v| v + base)));
         let m = mesh(&p, &t);
+        // (Not cut again, which has a test of its own: it would be much larger.)
+        let build = || {
+            let mut build = SolverBuild::new(&m, 1.0)?;
+            build.recut = false;
+            while build.step(&m)?.is_some() {}
+            Ok::<_, FieldsError>(build.finish())
+        };
         let mut want = Vec::new();
-        let solver = GeodesicHeatSolver::build(&m, 1.0).unwrap();
-        solver.solve(&[0, base], None, &mut want).unwrap();
+        build().unwrap().solve(&[0, base], None, &mut want).unwrap();
 
         let mut at = 0;
         loop {
             let mut out = vec![7.5f32];
             fail_allocations_after(Some(at));
-            let built = GeodesicHeatSolver::build(&m, 1.0);
+            let built = build();
             let solved = match &built {
                 Ok(s) => s.solve(&[0, base], None, &mut out),
                 Err(e) => Err(e.clone()),
