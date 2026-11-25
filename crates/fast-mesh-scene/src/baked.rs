@@ -93,32 +93,71 @@ pub(crate) fn baked_copy(mesh: &Mesh, map: impl Fn([f32; 3]) -> [f64; 3]) -> Res
 /// are rounded by up to eight steps of those.
 const NEAR: f64 = 16.0;
 
-/// A copy of a scene mesh as it is placed, in world axes: its positions are
-/// offsets from its own origin, in `f64`, and as precise as the mesh's,
-/// however far from the world origin it is. Slot ids match the mesh's.
-///
-/// That origin is where the mesh's own is in the world, or for a mesh near
-/// the world origin (see [`NEAR`]) zero: its positions are the world's then.
-///
-/// # Errors
-/// As for [`baked_mesh`].
-pub(crate) fn baked_in_place(entry: &Entry) -> Result<Mesh> {
-    let (placement, mesh) = (entry.placement, &entry.mesh);
-    let at = local_to_world(&placement, mesh.origin(), [0.0; 3]);
+/// The world point a mesh at `placement` is baked around when it must be
+/// measured in world axes: where its own origin is, from which its positions
+/// are small, or zero for one near the world origin (see [`NEAR`]), whose
+/// positions are the world's then.
+pub(crate) fn world_base(mesh: &Mesh, placement: &Placement) -> [f64; 3] {
+    let at = local_to_world(placement, mesh.origin(), [0.0; 3]);
     let alive = (0..mesh.vertex_slots() as VertexId).filter_map(|v| mesh.position(v));
     let largest = alive.flatten().fold(0.0f32, |m, c| m.max(c.abs()));
     let reach = NEAR * placement.max_scale() * f64::from(largest);
     if at.iter().all(|c| c.abs() <= reach) {
-        return baked_copy(mesh, |p| {
-            local_to_world(&placement, mesh.origin(), p.map(f64::from))
-        });
+        [0.0; 3]
+    } else {
+        at
     }
+}
+
+/// A copy of `mesh` as `placement` places it, in world axes, with `base` as
+/// its origin: its positions are the offsets from that world point, and as
+/// precise as the mesh's when the point is near it ([`world_base`]), however
+/// far from the world origin that is. Slot ids match the mesh's.
+///
+/// # Errors
+/// As for [`baked_mesh`].
+pub(crate) fn baked_around(mesh: &Mesh, placement: &Placement, base: [f64; 3]) -> Result<Mesh> {
+    let origin = mesh.origin();
     let turn = Placement {
         translation: [0.0; 3],
-        ..placement
+        ..*placement
     };
-    let copy = baked_copy(mesh, |p| turn.apply(p.map(f64::from)))?;
-    Ok(copy.with_origin(at)?)
+    // Around its own origin nothing large is added and taken away again.
+    let own = base != [0.0; 3] && base == local_to_world(placement, origin, [0.0; 3]);
+    let copy = baked_copy(mesh, |l| {
+        let l = l.map(f64::from);
+        if own {
+            return turn.apply(l);
+        }
+        let w = local_to_world(placement, origin, l);
+        std::array::from_fn(|k| w[k] - base[k])
+    })?;
+    Ok(copy.with_origin(base)?)
+}
+
+/// [`baked_around`] of a scene mesh at `placement`, with a BVH built by its
+/// own options.
+///
+/// # Errors
+/// As for [`baked_mesh`].
+pub(crate) fn baked_pose(
+    entry: &Entry,
+    placement: &Placement,
+    base: [f64; 3],
+) -> Result<(Mesh, Bvh)> {
+    let baked = baked_around(&entry.mesh, placement, base)?;
+    let bvh = Bvh::build(&baked, entry.bvh.options())?;
+    Ok((baked, bvh))
+}
+
+/// A copy of a scene mesh as it is placed, in world axes, around the point
+/// that keeps its precision ([`world_base`]), its origin.
+///
+/// # Errors
+/// As for [`baked_mesh`].
+pub(crate) fn baked_in_place(entry: &Entry) -> Result<Mesh> {
+    let base = world_base(&entry.mesh, &entry.placement);
+    baked_around(&entry.mesh, &entry.placement, base)
 }
 
 #[cfg(test)]

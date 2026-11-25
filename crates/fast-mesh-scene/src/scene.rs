@@ -13,6 +13,7 @@ use crate::geodesic::GeodesicCache;
 use crate::history::{Change, Done, EntryEvent, History, HistoryEntry, PermanentStep};
 use crate::id::SlotMap;
 use crate::normals::{NormalBuild, NormalState};
+use crate::placement::{local_to_world, world_to_local};
 use crate::presence::ParkedLinks;
 use crate::query::{CachedBox, ClosestCandidate, RayCandidate};
 use crate::report::Report;
@@ -561,6 +562,19 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
+    /// A world point in the mesh's stored local coordinates, which are those
+    /// of its positions: `S⁻¹ Rᵀ (q - t) - o`. The origin goes too, which
+    /// [`Placement::inverse_apply`] leaves in.
+    pub(crate) fn world_to_local(&self, q: [f64; 3]) -> [f64; 3] {
+        world_to_local(&self.placement, self.mesh.origin(), q)
+    }
+
+    /// A point in the mesh's stored local coordinates in the world:
+    /// `R (S (o + p)) + t`.
+    pub(crate) fn local_to_world(&self, p: [f64; 3]) -> [f64; 3] {
+        local_to_world(&self.placement, self.mesh.origin(), p)
+    }
+
     /// Approximate heap memory held by the mesh with everything attached to
     /// it: what an undoable add or removal counts against the history
     /// budget.

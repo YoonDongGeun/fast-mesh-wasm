@@ -876,7 +876,8 @@ pub trait SceneInspectOps {
     /// Runs read-only defect analysis on mesh `id`.
     fn analyze(&self, id: MeshId, options: &AnalyzeOptions<'_>) -> Result<Analysis>;
 
-    /// Computes surface area and watertight volume measurements on mesh `id`.
+    /// Computes surface area and watertight volume measurements on mesh `id`, in its local
+    /// units; [`Scene::measure_placed`] has them in the world's.
     fn measure(&self, id: MeshId) -> Result<MeasureReport>;
 
     /// Extracts boundary loops and open chains from mesh `id`.

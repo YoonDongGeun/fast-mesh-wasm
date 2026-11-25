@@ -33,7 +33,7 @@
 use fast_mesh_query::{Fill, Gap2, Plane, Slice, contour_gap, contour_length, signed_area};
 use fast_mesh_store::{ChangeSet, Mesh, StoreError, TriangleId, VertexId, par};
 
-use crate::placement::{Placement, local_to_world, world_to_local};
+use crate::placement::{local_to_world, plane_to_local};
 use crate::scene::Entry;
 use crate::{MeshId, Result, Scene, SceneError, SectionId, UpdateMode};
 
@@ -254,45 +254,6 @@ impl Entry {
     }
 }
 
-/// `Rᵀ d`: a world direction in the mesh's local frame.
-fn rotate_back(rotation: &[[f64; 3]; 3], d: [f64; 3]) -> [f64; 3] {
-    let r = rotation;
-    std::array::from_fn(|i| r[0][i] * d[0] + r[1][i] * d[1] + r[2][i] * d[2])
-}
-
-/// `S (Rᵀ d)`: a world direction in the mesh's scaled local frame, before
-/// normalising. With a non-uniform scale this is not a rotation: axes mapped
-/// this way are re-orthonormalised below.
-fn scale_back(p: &Placement, d: [f64; 3]) -> [f64; 3] {
-    let t = rotate_back(&p.rotation, d);
-    std::array::from_fn(|i| p.scale[i] * t[i])
-}
-
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn unit(a: [f64; 3]) -> [f64; 3] {
-    let n = dot(a, a).sqrt();
-    a.map(|c| c / n)
-}
-
-/// The world plane in the mesh's stored local frame (origin excluded). The
-/// axes are the world `(u, v)` mapped through the placement's linear inverse
-/// (`S Rᵀ`, then re-orthonormalised: a placement's rotation is only
-/// orthonormal within `1e-6`, and a non-uniform scale skews the frame), so
-/// that the local plane's zero set is the preimage of the world's, with
-/// matching sides. Cut points map back to the world and their `(u, v)` come
-/// from the world plane, so lengths and areas follow the scale exactly.
-fn local_plane(p: &Placement, mesh_origin: [f64; 3], plane: &Plane) -> Result<Plane> {
-    let origin = world_to_local(p, mesh_origin, plane.origin());
-    let u = unit(scale_back(p, plane.u()));
-    let v = scale_back(p, plane.v());
-    let d = dot(v, u);
-    let v = unit(std::array::from_fn(|k| v[k] - d * u[k]));
-    Ok(Plane::with_axes(origin, u, v)?)
-}
-
 /// Cuts the entry's mesh with `desc`'s plane; its BVH must be current.
 fn compute(entry: &Entry, desc: &SectionDesc) -> Result<Computed> {
     let plane = &desc.plane;
@@ -301,7 +262,7 @@ fn compute(entry: &Entry, desc: &SectionDesc) -> Result<Computed> {
     fast_mesh_query::slice(
         &entry.mesh,
         &entry.bvh,
-        &local_plane(p, o, plane)?,
+        &plane_to_local(p, o, plane)?,
         &mut cut,
     )?;
 
@@ -795,7 +756,7 @@ impl Scene {
         if !c.is_empty() {
             // The local plane the computation used: the plane, the placement
             // and the mesh's origin are all unchanged since.
-            let Ok(plane) = local_plane(placement, mesh.origin(), &s.desc.plane) else {
+            let Ok(plane) = plane_to_local(placement, mesh.origin(), &s.desc.plane) else {
                 return false;
             };
             #[cfg(test)]

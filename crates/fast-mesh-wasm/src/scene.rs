@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use fast_mesh_ops::repair::{FillContinuity, FillHolesOptions, FillStats, PartialBridgeOptions};
 use fast_mesh_ops::sculpt::{DyntopoMode, DyntopoOptions, DyntopoPatch};
-use fast_mesh_ops::{AnalyzeOptions, IcpOptions, IcpStatus, VolumeReason, analyze, measure_placed};
+use fast_mesh_ops::{AnalyzeOptions, IcpOptions, IcpStatus, VolumeReason, analyze};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
     BooleanMethod, BooleanOp, BooleanOptions, CoarseAlignMethod, ColorRule, Coloring, Colormap,
@@ -1044,11 +1044,7 @@ impl WasmScene {
     /// inconsistent winding only flags `orientation conflicts` without
     /// failing.
     pub fn measure(&self, index: u32, generation: u32) -> Result<Vec<f64>, Error> {
-        let id = self.id(index, generation)?;
-        let mesh = self.scene.mesh(id)?;
-        let placement = self.scene.placement(id)?;
-        let origin = mesh.origin();
-        let m = measure_placed(mesh, origin, |p| placement.apply(p)).map_err(SceneError::from)?;
+        let m = self.scene.measure_placed(self.id(index, generation)?)?;
         let reason = match m.volume_reason {
             None => 0.0,
             Some(VolumeReason::Open) => 1.0,
@@ -2513,7 +2509,7 @@ impl WasmScene {
     ) -> Result<Vec<u32>, Error> {
         let id = self.id(index, generation)?;
         let shape = crate::wave6::parse_screen_shape(shape_kind, shape_data)?;
-        let opts = crate::wave6::parse_screen_options(
+        let (camera, opts) = crate::wave6::parse_screen_options(
             view_proj16,
             camera_origin3,
             camera_forward3,
@@ -2522,7 +2518,9 @@ impl WasmScene {
             reject_backfaces,
             include_touching,
         )?;
-        Ok(self.scene.select_faces_screen(id, &shape, &opts)?)
+        Ok(self
+            .scene
+            .select_faces_screen_from(id, &shape, &camera, &opts)?)
     }
 
     pub fn select_faces_in_sphere(

@@ -24,7 +24,8 @@ use fast_mesh_ops::repair::{
 };
 use fast_mesh_scene::{
     CollisionDistanceBackend, CollisionMode, CollisionRole, CollisionRule, CollisionStepReport,
-    CutTrigger, MaterialMemory, MeshId, Placement, Scene, SceneError, SoftDeformSolver,
+    CutTrigger, MaterialMemory, MeshId, Placement, Scene, SceneError, ScreenCamera,
+    SoftDeformSolver,
 };
 use fast_mesh_store::StoreError;
 use wasm_bindgen::prelude::*;
@@ -156,6 +157,8 @@ pub(crate) fn parse_screen_shape(kind: u8, data: &[f64]) -> Result<ScreenSelecti
     }
 }
 
+/// The camera, in `f64`, and the options of a screen selection, whose own
+/// camera is not used.
 pub(crate) fn parse_screen_options(
     view_proj16: &[f64],
     camera_origin3: &[f64],
@@ -164,27 +167,36 @@ pub(crate) fn parse_screen_options(
     visible_only: bool,
     reject_backfaces: bool,
     include_touching: bool,
-) -> Result<ScreenSelectOptions, Error> {
+) -> Result<(ScreenCamera, ScreenSelectOptions), Error> {
     if view_proj16.len() != 16 {
         return Err(Error::invalid(
             "viewProj must be a 16-element column-major 4x4 matrix",
         ));
     }
-    let mut view_proj = [[0.0_f32; 4]; 4];
+    let mut view_proj = [[0.0_f64; 4]; 4];
     for c in 0..4 {
         for r in 0..4 {
-            view_proj[c][r] = f64_to_f32(view_proj16[c * 4 + r], "viewProj")?;
+            let v = view_proj16[c * 4 + r];
+            // As the engine's own matrices, it must fit `f32`.
+            f64_to_f32(v, "viewProj")?;
+            view_proj[c][r] = v;
         }
     }
-    Ok(ScreenSelectOptions {
+    let camera = ScreenCamera {
         view_proj,
-        camera_origin: vec3_f32(camera_origin3, "cameraOrigin")?,
-        camera_forward: vec3_f32(camera_forward3, "cameraForward")?,
+        origin: vec3_f64(camera_origin3, "cameraOrigin")?,
+        forward: vec3_f64(camera_forward3, "cameraForward")?,
+    };
+    let options = ScreenSelectOptions {
+        view_proj: [[0.0; 4]; 4],
+        camera_origin: [0.0; 3],
+        camera_forward: [0.0, 0.0, -1.0],
         is_orthographic,
         visible_only,
         reject_backfaces,
         include_touching,
-    })
+    };
+    Ok((camera, options))
 }
 
 pub(crate) fn parse_adjacency(code: u8) -> Result<AdjacencyKind, Error> {

@@ -13,14 +13,15 @@
 //! something in.
 
 use fast_mesh_bvh::{Aabb, Bvh};
+use fast_mesh_ops::inspect::{MeasureReport, measure_placed};
 use fast_mesh_query::{
     ClosestHit, ClosestOptions, Cull, Ray, RayHit, RayOptions, Rigid,
     shortest_surface_path as query_shortest_surface_path,
 };
 use fast_mesh_store::{Mesh, StoreError, TriangleId};
 
-use crate::baked::{baked_in_place, baked_mesh};
-use crate::placement::{is_relative_rigid, local_to_world, relative_rigid, world_to_local};
+use crate::baked::{baked_in_place, baked_mesh, baked_pose, world_base};
+use crate::placement::{is_relative_rigid, local_to_world, relative_rigid};
 use crate::scene::Entry;
 use crate::{MeshId, Placement, Result, Scene, SceneError};
 
@@ -126,7 +127,7 @@ struct LocalPoint {
 }
 
 fn local_point(entry: &Entry, q: [f64; 3]) -> Result<LocalPoint> {
-    let l = world_to_local(&entry.placement, entry.mesh.origin(), q);
+    let l = entry.world_to_local(q);
     let p = l.map(|c| c as f32);
     if !p.iter().all(|c| c.is_finite()) {
         return Err(SceneError::InvalidInput(
@@ -188,7 +189,7 @@ pub(crate) fn pair_pad(a: &Entry, wa: &Aabb64, b: &Entry, wb: &Aabb64) -> f64 {
 
 /// The world point of a mesh-local `f32` point.
 fn to_world(entry: &Entry, p: [f32; 3]) -> [f64; 3] {
-    local_to_world(&entry.placement, entry.mesh.origin(), p.map(f64::from))
+    entry.local_to_world(p.map(f64::from))
 }
 
 fn closest_hit(entry: &Entry, mesh: MeshId, hit: ClosestHit) -> SceneClosestHit {
@@ -450,8 +451,9 @@ impl Scene {
     /// placement the local distance is the world distance; with a uniform
     /// scale the local bound is the world bound divided by the scale and the
     /// local distance is multiplied back; with a non-uniform scale the query
-    /// runs on a world-baked copy of the mesh (see [`baked_mesh`]). The
-    /// world distance must then be within the exact bound.
+    /// runs on a copy of the mesh baked into the world, around a point near
+    /// it (see [`world_base`]). The world distance must then be within the
+    /// exact bound.
     ///
     /// Every Lazy BVH is brought up to date first (§15.4).
     ///
@@ -528,8 +530,9 @@ impl Scene {
     /// the mesh's local `f32` space), within `bound` (a world distance, at
     /// most the query's `max_distance` from pruning): the local Phase 3
     /// query for rigid and uniformly scaled meshes, a world-baked copy for
-    /// non-uniformly scaled ones (see [`baked_mesh`]). The hit stays in the
-    /// mesh's local space; the point and the distance are in the world.
+    /// non-uniformly scaled ones (see [`baked_pose`]). The hit
+    /// stays in the mesh's local space; the point and the distance are in the
+    /// world.
     fn closest_on(
         &self,
         id: MeshId,
@@ -564,24 +567,14 @@ impl Scene {
             }));
         }
         // A non-uniform scale distorts distances, so the query runs on a
-        // copy baked into the world, where frame distances are world
-        // distances. Triangle ids, barycentric coordinates and features
-        // carry over (affine maps preserve them); the hit's local point
-        // and distance are mapped back.
-        let o = e.mesh.origin();
-        let pl = e.placement;
-        let (baked, bvh) = baked_mesh(
-            &e.mesh,
-            |l| {
-                pl.apply([
-                    o[0] + f64::from(l[0]),
-                    o[1] + f64::from(l[1]),
-                    o[2] + f64::from(l[2]),
-                ])
-            },
-            e.bvh.options(),
-        )?;
-        let qw = p.map(|c| c as f32);
+        // copy baked into the world (around a point near the mesh, so that
+        // `f32` holds it), where frame distances are world distances.
+        // Triangle ids, barycentric coordinates and features carry over
+        // (affine maps preserve them); the hit's local point and distance
+        // are mapped back.
+        let base = world_base(&e.mesh, &e.placement);
+        let (baked, bvh) = baked_pose(e, &e.placement, base)?;
+        let qw = sub(p, base).map(|c| c as f32);
         if !qw.iter().all(|c| c.is_finite()) {
             return Err(SceneError::InvalidInput(
                 "the query point is out of f32 range in the world",
@@ -592,9 +585,9 @@ impl Scene {
         };
         let hit = fast_mesh_query::closest_point(&baked, &bvh, qw, &local)?;
         Ok(hit.filter(|h| f64::from(h.distance) <= bound).map(|h| {
-            let pw = h.point.map(f64::from);
-            let lp = world_to_local(&pl, o, pw);
-            let lq = world_to_local(&pl, o, p);
+            let pw = std::array::from_fn(|k| base[k] + f64::from(h.point[k]));
+            let lp = e.world_to_local(pw);
+            let lq = e.world_to_local(p);
             SceneClosestHit {
                 mesh: id,
                 hit: ClosestHit {
@@ -657,56 +650,28 @@ impl Scene {
 
     /// The frame a scaled pair query runs in, with B baked into it: A's
     /// local space when A is rigid or uniformly scaled (frame distances
-    /// times A's scale are world distances), else the world with A baked
-    /// too. Slot ids match the real meshes, so triangle ids carry over; the
-    /// map is a positive-determinant affine map, so intersections carry
-    /// over too. The caller brings both BVHs up to date first.
+    /// times A's scale are world distances), else the world around a point
+    /// near A, with A baked too. Slot ids match the real meshes, so triangle
+    /// ids carry over; the map is a positive-determinant affine map, so
+    /// intersections carry over too. The caller brings both BVHs up to date
+    /// first.
     ///
-    /// Returns A's mesh in the frame (`None`: the real A), B's baked mesh
-    /// with its BVH, and the frame-to-world distance factor.
+    /// Returns A's mesh in the frame (`None`: the real A; the frame's zero is
+    /// its origin otherwise), B's baked mesh with its BVH, and the
+    /// frame-to-world distance factor.
     pub(crate) fn bake_pair_inner(&self, a: MeshId, b: MeshId) -> Result<BakedPair> {
         let (ea, eb) = (self.entry(a)?, self.entry(b)?);
-        let (pa, pb) = (ea.placement, eb.placement);
-        let (oa, ob) = (ea.mesh.origin(), eb.mesh.origin());
-        if let Some(s) = pa.uniform_scale() {
-            let baked_b = {
-                let eb = self.entry(b)?;
-                baked_mesh(
-                    &eb.mesh,
-                    |l| world_to_local(&pa, oa, local_to_world(&pb, ob, l.map(f64::from))),
-                    eb.bvh.options(),
-                )?
-            };
+        if let Some(s) = ea.placement.uniform_scale() {
+            let baked_b = baked_mesh(
+                &eb.mesh,
+                |l| ea.world_to_local(eb.local_to_world(l.map(f64::from))),
+                eb.bvh.options(),
+            )?;
             return Ok((None, baked_b, s));
         }
-        let baked_a = {
-            let ea = self.entry(a)?;
-            baked_mesh(
-                &ea.mesh,
-                |l| {
-                    pa.apply([
-                        oa[0] + f64::from(l[0]),
-                        oa[1] + f64::from(l[1]),
-                        oa[2] + f64::from(l[2]),
-                    ])
-                },
-                ea.bvh.options(),
-            )?
-        };
-        let baked_b = {
-            let eb = self.entry(b)?;
-            baked_mesh(
-                &eb.mesh,
-                |l| {
-                    pb.apply([
-                        ob[0] + f64::from(l[0]),
-                        ob[1] + f64::from(l[1]),
-                        ob[2] + f64::from(l[2]),
-                    ])
-                },
-                eb.bvh.options(),
-            )?
-        };
+        let base = world_base(&ea.mesh, &ea.placement);
+        let baked_a = baked_pose(ea, &ea.placement, base)?;
+        let baked_b = baked_pose(eb, &eb.placement, base)?;
         Ok((Some(baked_a), baked_b, 1.0))
     }
 
@@ -718,15 +683,18 @@ impl Scene {
     }
 
     /// Maps a frame point of a scaled pair query back to the world: through
-    /// A's placement when A is real (rigid or uniform), directly when the
-    /// frame is the world.
-    fn frame_to_world(&self, a: MeshId, real_a: bool, p: [f32; 3]) -> Result<[f64; 3]> {
-        if real_a {
-            let e = self.entry(a)?;
-            Ok(to_world(e, p))
-        } else {
-            Ok(p.map(f64::from))
-        }
+    /// A's placement when A is real (rigid or uniform), from the zero of the
+    /// frame when it is the world.
+    fn frame_to_world(
+        &self,
+        a: MeshId,
+        baked_a: Option<&(Mesh, Bvh)>,
+        p: [f32; 3],
+    ) -> Result<[f64; 3]> {
+        Ok(match baked_a {
+            None => to_world(self.entry(a)?, p),
+            Some((mesh, _)) => std::array::from_fn(|k| mesh.origin()[k] + f64::from(p[k])),
+        })
     }
 
     /// The mesh's BVH, in mesh-local `f32` space, for running Phase 3
@@ -777,8 +745,7 @@ impl Scene {
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn world_to_local(&self, id: MeshId, q: [f64; 3]) -> Result<[f64; 3]> {
-        let e = self.entry(id)?;
-        Ok(world_to_local(&e.placement, e.mesh.origin(), q))
+        Ok(self.entry(id)?.world_to_local(q))
     }
 
     /// A point in mesh `id`'s local coordinates in the world, origin
@@ -787,8 +754,7 @@ impl Scene {
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn local_to_world(&self, id: MeshId, p: [f64; 3]) -> Result<[f64; 3]> {
-        let e = self.entry(id)?;
-        Ok(local_to_world(&e.placement, e.mesh.origin(), p))
+        Ok(self.entry(id)?.local_to_world(p))
     }
 
     fn check_ids(&self, a: MeshId, b: MeshId) -> Result<()> {
@@ -916,7 +882,6 @@ impl Scene {
                 }));
         }
         let (ta, tb, s) = self.bake_pair(a, b)?;
-        let real_a = ta.is_none();
         let ea = self.entry(a)?;
         let (ma, ba) = match &ta {
             None => (&ea.mesh, &ea.bvh),
@@ -934,8 +899,8 @@ impl Scene {
             Some(d) if s * f64::from(d.distance) <= max_distance => Some(SceneMeshDistance {
                 distance: s * f64::from(d.distance),
                 // Both points are in A's frame.
-                point_a: self.frame_to_world(a, real_a, d.point_a)?,
-                point_b: self.frame_to_world(a, real_a, d.point_b)?,
+                point_a: self.frame_to_world(a, ta.as_ref(), d.point_a)?,
+                point_b: self.frame_to_world(a, ta.as_ref(), d.point_b)?,
                 triangle_a: d.triangle_a,
                 triangle_b: d.triangle_b,
             }),
@@ -1071,6 +1036,28 @@ impl Scene {
                 .map(|(t, _)| t as TriangleId),
         );
         Ok(())
+    }
+
+    /// Measures mesh `id` as it is placed, in world units: its total area
+    /// always, its enclosed volume when watertight (see
+    /// [`measure`](fast_mesh_ops::inspect::measure)). Far from the world
+    /// origin it is summed around a point near the mesh, where the terms of
+    /// the volume are no larger than it.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`]; [`SceneError::Ops`] when memory runs out.
+    pub fn measure_placed(&self, id: MeshId) -> Result<MeasureReport> {
+        let Entry {
+            mesh, placement, ..
+        } = self.entry(id)?;
+        if world_base(mesh, placement) == [0.0; 3] {
+            return Ok(measure_placed(mesh, mesh.origin(), |p| placement.apply(p))?);
+        }
+        let turn = Placement {
+            translation: [0.0; 3],
+            ..*placement
+        };
+        Ok(measure_placed(mesh, [0.0; 3], |p| turn.apply(p))?)
     }
 
     /// Extracts the intrinsic shortest path along mesh `id` from `sources` to

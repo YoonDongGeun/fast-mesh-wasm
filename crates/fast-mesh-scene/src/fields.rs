@@ -82,8 +82,8 @@ pub use fast_mesh_fields::{
 use fast_mesh_query::{NearSearch, Rigid};
 use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, StoreError, TriangleId, VertexId, par};
 
-use crate::baked::baked_mesh;
-use crate::placement::{is_relative_rigid, local_to_world, relative_rigid, world_to_local};
+use crate::baked::{baked_around, baked_copy, baked_in_place, baked_mesh, baked_pose, world_base};
+use crate::placement::{is_relative_rigid, relative_rigid};
 
 use crate::query::round_up;
 use crate::scene::{Entry, FIELD_PREFIX};
@@ -329,6 +329,9 @@ struct FieldJob {
     /// Frame distances times this are world distances: A's uniform scale
     /// when the frame is A's local space, 1 when it is the world.
     frame_scale: f64,
+    /// The world point the baked copies are around when the frame is the
+    /// world (see [`world_base`]).
+    frame_base: [f64; 3],
     /// Per target: the baked copy in the frame with its BVH and sign data,
     /// for non-uniformly scaled targets (`None`: the real target is used).
     temp_targets: Vec<Option<TempTarget>>,
@@ -1791,9 +1794,6 @@ impl Scene {
     /// BVH cannot be brought up to date, the kernel fails, or memory runs
     /// out.
     fn compute_curv_field(&mut self, c: usize) -> Result<()> {
-        use fast_mesh_bvh::BuildOptions;
-        use fast_mesh_store::Mesh;
-
         let (on, channel) = {
             let f = &self.curv[c];
             (f.desc.on, f.channel.clone())
@@ -1802,36 +1802,22 @@ impl Scene {
         // reads the mesh itself.
         self.prepare(Some(&[on]))?;
         let ea = self.entry(on)?;
-        let (placement, origin) = (ea.placement, ea.mesh.origin());
         let slots = ea.mesh.vertex_slots();
         // Where the kernel runs, and what turns its local curvatures into
         // world ones: a rigid placement changes nothing, a uniform scale `s`
-        // divides (curvature is 1/length), and anything else runs on a baked
-        // world-frame copy.
+        // divides (curvature is 1/length), and anything else runs on a copy
+        // baked in place.
         let mut scale = 1.0f32;
-        let mut baked: Option<(Mesh, Bvh)> = None;
-        if placement.is_scaled() {
-            if let Some(s) = placement.uniform_scale() {
-                scale = s as f32;
-            } else {
-                baked = Some(baked_mesh(
-                    &ea.mesh,
-                    |p| {
-                        placement.apply([
-                            origin[0] + f64::from(p[0]),
-                            origin[1] + f64::from(p[1]),
-                            origin[2] + f64::from(p[2]),
-                        ])
-                    },
-                    &BuildOptions::default(),
-                )?);
-            }
+        let mut baked: Option<Mesh> = None;
+        match ea.placement.uniform_scale() {
+            Some(s) => scale = s as f32,
+            None => baked = Some(baked_in_place(ea)?),
         }
         let mut values = Vec::new();
         values.try_reserve_exact(slots).map_err(|_| oom())?;
         values.resize(slots, f32::NAN);
         match &baked {
-            Some((mesh, _)) => {
+            Some(mesh) => {
                 curvatures(mesh, &mut values)?;
             }
             None => {
@@ -1903,7 +1889,6 @@ impl Scene {
     /// runs out.
     fn compute_thick_field(&mut self, t: usize) -> Result<()> {
         use fast_mesh_bvh::BuildOptions;
-        use fast_mesh_store::Mesh;
 
         let (on, max_distance, channel) = {
             let f = &self.thick[t];
@@ -1912,28 +1897,18 @@ impl Scene {
         // The mesh's own BVH is what the kernel reads.
         self.prepare(Some(&[on]))?;
         let ea = self.entry(on)?;
-        let (placement, origin) = (ea.placement, ea.mesh.origin());
         let slots = ea.mesh.vertex_slots();
         // Where the kernel runs, and what turns its local distances into
         // world ones: a rigid placement changes nothing, a uniform scale
-        // multiplies, and anything else runs on a baked world-frame copy.
+        // multiplies, and anything else runs on a copy baked in place.
         let mut scale = 1.0f32;
         let mut baked: Option<(Mesh, Bvh)> = None;
-        if placement.is_scaled() {
-            if let Some(s) = placement.uniform_scale() {
-                scale = s as f32;
-            } else {
-                baked = Some(baked_mesh(
-                    &ea.mesh,
-                    |p| {
-                        placement.apply([
-                            origin[0] + f64::from(p[0]),
-                            origin[1] + f64::from(p[1]),
-                            origin[2] + f64::from(p[2]),
-                        ])
-                    },
-                    &BuildOptions::default(),
-                )?);
+        match ea.placement.uniform_scale() {
+            Some(s) => scale = s as f32,
+            None => {
+                let mesh = baked_in_place(ea)?;
+                let bvh = Bvh::build(&mesh, &BuildOptions::default())?;
+                baked = Some((mesh, bvh));
             }
         }
         let mut values = Vec::new();
@@ -3230,6 +3205,7 @@ impl Scene {
             live_travel,
             scaled: false,
             frame_scale: 1.0,
+            frame_base: [0.0; 3],
             temp_targets: Vec::new(),
         })
     }
@@ -3266,37 +3242,30 @@ impl Scene {
         hook_a: FieldHook,
     ) -> Result<FieldJob> {
         let n = to.len();
-        let (pa, oa) = {
-            let ea = self.entry(on)?;
-            (ea.placement, ea.mesh.origin())
-        };
         // The frame the update measures in: A's local space when A is rigid
         // or uniformly scaled (frame distances times `frame_scale` are world
-        // distances), else the world. Non-uniform targets are baked into it.
-        let in_a_frame = pa.uniform_scale().is_some();
-        let frame_scale = pa.uniform_scale().unwrap_or(1.0);
+        // distances), else the world around a point near A. Non-uniform
+        // targets are baked into it.
+        let ea = self.entry(on)?;
+        let uniform = ea.placement.uniform_scale();
+        let frame_scale = uniform.unwrap_or(1.0);
+        let frame_base = match uniform {
+            Some(_) => [0.0; 3],
+            None => world_base(&ea.mesh, &ea.placement),
+        };
         let mut temp_targets: Vec<Option<TempTarget>> = Vec::new();
         temp_targets.try_reserve_exact(n).map_err(|_| oom())?;
         for &m in &to {
-            let (pb, ob, options) = {
-                let eb = self.entry(m)?;
-                (eb.placement, eb.mesh.origin(), *eb.bvh.options())
-            };
-            if pb.is_scaled() && pb.uniform_scale().is_none() {
-                let map = |l: [f32; 3]| {
-                    let full = [
-                        ob[0] + f64::from(l[0]),
-                        ob[1] + f64::from(l[1]),
-                        ob[2] + f64::from(l[2]),
-                    ];
-                    if in_a_frame {
-                        world_to_local(&pa, oa, pb.apply(full))
-                    } else {
-                        pb.apply(full)
-                    }
+            let (ea, eb) = (self.entry(on)?, self.entry(m)?);
+            if eb.placement.uniform_scale().is_none() {
+                let (mut mesh, bvh) = match uniform {
+                    Some(_) => baked_mesh(
+                        &eb.mesh,
+                        |l| ea.world_to_local(eb.local_to_world(l.map(f64::from))),
+                        eb.bvh.options(),
+                    )?,
+                    None => baked_pose(eb, &eb.placement, frame_base)?,
                 };
-                let eb = self.entry(m)?;
-                let (mut mesh, bvh) = baked_mesh(&eb.mesh, map, &options)?;
                 let mode = self.fields[i].desc.sign;
                 let sign = SignData::build(&mut mesh, &bvh, mode)?;
                 temp_targets.push(Some(TempTarget { mesh, bvh, sign }));
@@ -3327,6 +3296,7 @@ impl Scene {
             live_travel: 0.0,
             scaled: true,
             frame_scale,
+            frame_base,
             temp_targets,
         })
     }
@@ -3668,8 +3638,9 @@ impl Scene {
     ///
     /// The frame the candidates are measured in is A's local space when A
     /// is rigid or uniformly scaled (frame distances times
-    /// [`FieldJob::frame_scale`] are world distances), else the world. Each
-    /// target is measured in its own local space, where the kernel runs:
+    /// [`FieldJob::frame_scale`] are world distances), else the world around
+    /// [`FieldJob::frame_base`]. Each target is measured in its own local
+    /// space, where the kernel runs:
     /// - a rigid target: the frame point goes to the world and back into the
     ///   target's local space; the kernel's bound and values are world ones;
     /// - a uniformly scaled target: the same, through the target's inverse;
@@ -3700,11 +3671,11 @@ impl Scene {
             return Err(SceneError::InvalidInput("too many targets"));
         }
         let ea = self.entry(f.desc.on)?;
-        let (pa, oa) = (ea.placement, ea.mesh.origin());
-        let in_a_frame = pa.uniform_scale().is_some();
+        let in_a_frame = ea.placement.uniform_scale().is_some();
         let md = f.desc.max_distance;
-        // The candidates' frame points in f64 (`None` for dead or unused
-        // vertices, which read NaN), and the positions of the defined ones.
+        // The candidates in A's local space, or their world points, in f64
+        // (`None` for dead or unused vertices, which read NaN), and the
+        // positions of the defined ones.
         let mut frame: Vec<Option<[f64; 3]>> = Vec::new();
         frame
             .try_reserve_exact(candidates.len())
@@ -3715,15 +3686,8 @@ impl Scene {
                     .position(v)
                     .filter(|_| ea.mesh.is_vertex_alive(v) && ea.mesh.corner_count(v) > 0)
                     .map(|p| {
-                        if in_a_frame {
-                            [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]
-                        } else {
-                            pa.apply([
-                                oa[0] + f64::from(p[0]),
-                                oa[1] + f64::from(p[1]),
-                                oa[2] + f64::from(p[2]),
-                            ])
-                        }
+                        let p = p.map(f64::from);
+                        if in_a_frame { p } else { ea.local_to_world(p) }
                     }),
             );
         }
@@ -3765,26 +3729,20 @@ impl Scene {
                     )
                 }
             };
-            let (pb, ob) = (eb.placement, eb.mesh.origin());
             let temp = job.temp_targets[k].is_some();
             let mut points: Vec<[f32; 3]> = Vec::new();
             points.try_reserve_exact(fpts.len()).map_err(|_| oom())?;
             for &q in &fpts {
                 // Into the target's measuring space: a baked copy lives in
-                // the frame already, so its points go in directly; a real
-                // target's go to the world first (A's placement), then back
-                // into its stored local space (the placement inverse, minus
-                // its origin).
-                let l = if temp {
-                    q
-                } else {
-                    let w = if in_a_frame {
-                        pa.apply([oa[0] + q[0], oa[1] + q[1], oa[2] + q[2]])
-                    } else {
-                        q
-                    };
-                    let m = pb.inverse_apply(w);
-                    [m[0] - ob[0], m[1] - ob[1], m[2] - ob[2]]
+                // the frame already, so its points go in directly (but for
+                // the base of a world frame); a real target's go to the
+                // world first (A's placement), then into its stored local
+                // space.
+                let l = match (temp, in_a_frame) {
+                    (true, true) => q,
+                    (true, false) => std::array::from_fn(|c| q[c] - job.frame_base[c]),
+                    (false, true) => eb.world_to_local(ea.local_to_world(q)),
+                    (false, false) => eb.world_to_local(q),
                 };
                 points.push([l[0] as f32, l[1] as f32, l[2] as f32]);
             }
@@ -4104,16 +4062,6 @@ pub(crate) mod counter {
     }
 }
 
-pub(crate) fn baked_world_mesh(entry: &Entry) -> Result<(Mesh, Bvh)> {
-    let placement = entry.placement;
-    let origin = entry.mesh.origin();
-    baked_mesh(
-        &entry.mesh,
-        |l| local_to_world(&placement, origin, l.map(f64::from)),
-        entry.bvh.options(),
-    )
-}
-
 fn scale_finite_values(values: &mut [f32], scale: f64) {
     for v in values {
         if v.is_finite() {
@@ -4182,7 +4130,7 @@ impl Scene {
             return Ok(report);
         }
 
-        let (baked, _) = baked_world_mesh(entry)?;
+        let baked = baked_in_place(entry)?;
         Ok(field_overhangs(&baked, options, vertex_angles_deg)?)
     }
 
@@ -4207,7 +4155,7 @@ impl Scene {
                 vertex_quality,
             )?);
         }
-        let (baked, _) = baked_world_mesh(entry)?;
+        let baked = baked_in_place(entry)?;
         Ok(field_triangle_quality(
             &baked,
             metric,
@@ -4288,14 +4236,9 @@ impl Scene {
                 let baked_src = {
                     let es = self.entry(source)?;
                     let et = self.entry(target)?;
-                    let (ps, pt) = (es.placement, et.placement);
-                    let (os, ot) = (es.mesh.origin(), et.mesh.origin());
-                    baked_mesh(
-                        &es.mesh,
-                        |l| world_to_local(&pt, ot, local_to_world(&ps, os, l.map(f64::from))),
-                        es.bvh.options(),
-                    )?
-                    .0
+                    baked_copy(&es.mesh, |l| {
+                        et.world_to_local(es.local_to_world(l.map(f64::from)))
+                    })?
                 };
                 let target_sign = if options.signed {
                     let et = self
@@ -4325,8 +4268,11 @@ impl Scene {
             }
         }
 
-        let (baked_src, _) = baked_world_mesh(self.entry(source)?)?;
-        let (mut baked_tgt, baked_tgt_bvh) = baked_world_mesh(self.entry(target)?)?;
+        let et = self.entry(target)?;
+        let es = self.entry(source)?;
+        let base = world_base(&et.mesh, &et.placement);
+        let baked_src = baked_around(&es.mesh, &es.placement, base)?;
+        let (mut baked_tgt, baked_tgt_bvh) = baked_pose(et, &et.placement, base)?;
         let target_sign = if options.signed {
             Some(SignData::build(
                 &mut baked_tgt,

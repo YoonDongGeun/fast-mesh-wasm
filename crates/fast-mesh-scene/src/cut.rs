@@ -20,7 +20,7 @@ use fast_mesh_store::{StoreError, Transaction, TriangleId, VertexId};
 use crate::baked::baked_in_place;
 use crate::curve_surface::{CurvePoint, CurveSurface, Fans, distinct};
 use crate::ops::{CutOptions as OpsCutOptions, cut_by_plane as ops_cut_by_plane};
-use crate::placement::{local_to_world, world_to_local};
+use crate::placement::{local_to_world, plane_to_local, world_to_local};
 use crate::{MeshId, MeshOptions, Plane, Result, Scene, SceneError};
 
 /// What to cut: a world plane and whether to cap.
@@ -111,29 +111,6 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn unit(a: [f64; 3]) -> [f64; 3] {
-    let n = dot(a, a).sqrt();
-    a.map(|c| c / n)
-}
-
-/// The world plane in the mesh's stored local frame (origin excluded), as
-/// for a section: the axes are the world `(u, v)` mapped through the
-/// placement's linear inverse, then re-orthonormalised, so that the local
-/// plane's zero set is the preimage of the world's, with matching sides.
-/// `s >= 0` then means the same side in both frames.
-fn local_plane(
-    placement: &crate::Placement,
-    mesh_origin: [f64; 3],
-    plane: &Plane,
-) -> Result<Plane> {
-    let origin = world_to_local(placement, mesh_origin, plane.origin());
-    let u = unit(placement.inverse_direction(plane.u()));
-    let v = placement.inverse_direction(plane.v());
-    let d = dot(v, u);
-    let v = unit(std::array::from_fn(|k| v[k] - d * u[k]));
-    Ok(Plane::with_axes(origin, u, v)?)
-}
-
 impl Scene {
     /// Cuts the mesh with a world plane: the `+` side
     /// (`signed_distance >= 0`) stays on the mesh and the `-` side is added
@@ -166,7 +143,7 @@ impl Scene {
         let (local, placement, mode) = {
             let entry = self.entry(id)?;
             (
-                local_plane(&entry.placement, entry.mesh.origin(), &options.plane)?,
+                plane_to_local(&entry.placement, entry.mesh.origin(), &options.plane)?,
                 entry.placement,
                 entry.mode,
             )
@@ -362,6 +339,10 @@ struct TrimMesh<'a, 'b> {
     new_verts: Vec<VertexId>,
     slots: usize,
     orig_tri_count: usize,
+    /// What the curve is traced in: the placement's scale when it differs by
+    /// axis, else the local coordinates themselves. A straight line between
+    /// two points of the curve is the world's then, not the mesh's.
+    scale: [f64; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -376,6 +357,7 @@ impl<'a, 'b> TrimMesh<'a, 'b> {
     fn new(
         tx: &'a mut Transaction<'b>,
         surface: CurveSurface,
+        placement: &crate::Placement,
     ) -> std::result::Result<Self, SceneError> {
         let slots = tx.mesh().triangle_slots();
         let mut tris = Vec::new();
@@ -396,12 +378,27 @@ impl<'a, 'b> TrimMesh<'a, 'b> {
             new_verts: Vec::new(),
             slots,
             orig_tri_count,
+            scale: match placement.uniform_scale() {
+                Some(_) => [1.0; 3],
+                None => placement.scale,
+            },
         })
     }
 
     #[inline]
     fn pos(&self, v: VertexId) -> [f64; 3] {
         self.tx.mesh().positions()[v as usize].map(f64::from)
+    }
+
+    /// A local point in the coordinates the curve is traced in.
+    #[inline]
+    fn scaled(&self, p: [f64; 3]) -> [f64; 3] {
+        std::array::from_fn(|k| self.scale[k] * p[k])
+    }
+
+    #[inline]
+    fn scaled_pos(&self, v: VertexId) -> [f64; 3] {
+        self.scaled(self.pos(v))
     }
 
     #[inline]
@@ -725,7 +722,7 @@ fn run_trim_in_tx(
     origin: [f64; 3],
     world_snap_tol: f64,
 ) -> std::result::Result<TrimReport, SceneError> {
-    let mut tm = TrimMesh::new(tx, surface)?;
+    let mut tm = TrimMesh::new(tx, surface, placement)?;
     let snap = SnapContext {
         local_tol: local_snap_tol,
         world_tol: world_snap_tol,
@@ -742,7 +739,7 @@ fn run_trim_in_tx(
         } else {
             let mut cands = Vec::new();
             tm.collect_live_descendants(root_lt, &mut cands);
-            let target_f64 = point.local.map(f64::from);
+            let target_f64 = tm.scaled(point.local.map(f64::from));
             let mut best = None;
             let mut best_d2 = f64::INFINITY;
             for lt in cands {
@@ -750,9 +747,9 @@ fn run_trim_in_tx(
                     continue;
                 };
                 let (d2, b) = closest_barycentric_on_triangle(
-                    tm.pos(verts[0]),
-                    tm.pos(verts[1]),
-                    tm.pos(verts[2]),
+                    tm.scaled_pos(verts[0]),
+                    tm.scaled_pos(verts[1]),
+                    tm.scaled_pos(verts[2]),
                     target_f64,
                 );
                 if d2 < best_d2 {
@@ -854,8 +851,8 @@ fn trace_curve_segment(
             return Ok(());
         }
 
-        let p_cur = tm.pos(cur);
-        let p_end = tm.pos(v_end);
+        let p_cur = tm.scaled_pos(cur);
+        let p_end = tm.scaled_pos(v_end);
         let d = sub3(p_end, p_cur);
         let cur_dist_sq = dot(d, d);
         if cur_dist_sq <= 1e-24 {
@@ -916,8 +913,8 @@ fn find_march_step(
         if prev == Some(b) || prev == Some(c) {
             continue;
         }
-        let pb = tm.pos(b);
-        let pc = tm.pos(c);
+        let pb = tm.scaled_pos(b);
+        let pc = tm.scaled_pos(c);
         let e1 = sub3(pb, p_cur);
         let e2 = sub3(pc, p_cur);
         let n = cross3(e1, e2);
@@ -1013,13 +1010,13 @@ fn dijkstra_seam_fallback(
         if dist.get(&v).is_some_and(|&best| cost > best) {
             continue;
         }
-        let pv = tm.pos(v);
+        let pv = tm.scaled_pos(v);
         for (_, verts) in tm.fan(v) {
             for &nb in &verts {
                 if nb == v {
                     continue;
                 }
-                let next_cost = cost + dist_sq(pv, tm.pos(nb)).sqrt();
+                let next_cost = cost + dist_sq(pv, tm.scaled_pos(nb)).sqrt();
                 if dist.get(&nb).is_none_or(|&best| next_cost < best) {
                     dist.insert(nb, next_cost);
                     prev.insert(nb, v);

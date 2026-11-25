@@ -198,5 +198,5 @@ pub use report::{FieldId, MeshChanges, SubscriberId};
 pub use scene::{MeshBuild, MeshOptions, Scene, SceneOptions, UpdateMode};
 pub use sculpt::{Dab, DabReport};
 pub use sections::{Gap, SectionContour, SectionDesc, SectionResult, SectionStatus};
-pub use wave6_ops::Vec3;
+pub use wave6_ops::{ScreenCamera, Vec3};
 pub use wrap::SceneWrapReport;
