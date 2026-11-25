@@ -673,13 +673,7 @@ impl Scene {
                 let eb = self.entry(b)?;
                 baked_mesh(
                     &eb.mesh,
-                    |l| {
-                        pa.inverse_apply(pb.apply([
-                            ob[0] + f64::from(l[0]),
-                            ob[1] + f64::from(l[1]),
-                            ob[2] + f64::from(l[2]),
-                        ]))
-                    },
+                    |l| world_to_local(&pa, oa, local_to_world(&pb, ob, l.map(f64::from))),
                     eb.bvh.options(),
                 )?
             };

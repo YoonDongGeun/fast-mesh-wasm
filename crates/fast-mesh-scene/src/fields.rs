@@ -83,7 +83,7 @@ use fast_mesh_query::{NearSearch, Rigid};
 use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, StoreError, TriangleId, VertexId, par};
 
 use crate::baked::baked_mesh;
-use crate::placement::{is_relative_rigid, local_to_world, relative_rigid};
+use crate::placement::{is_relative_rigid, local_to_world, relative_rigid, world_to_local};
 
 use crate::query::round_up;
 use crate::scene::{Entry, FIELD_PREFIX};
@@ -3266,7 +3266,10 @@ impl Scene {
         hook_a: FieldHook,
     ) -> Result<FieldJob> {
         let n = to.len();
-        let pa = self.entry(on)?.placement;
+        let (pa, oa) = {
+            let ea = self.entry(on)?;
+            (ea.placement, ea.mesh.origin())
+        };
         // The frame the update measures in: A's local space when A is rigid
         // or uniformly scaled (frame distances times `frame_scale` are world
         // distances), else the world. Non-uniform targets are baked into it.
@@ -3287,7 +3290,7 @@ impl Scene {
                         ob[2] + f64::from(l[2]),
                     ];
                     if in_a_frame {
-                        pa.inverse_apply(pb.apply(full))
+                        world_to_local(&pa, oa, pb.apply(full))
                     } else {
                         pb.apply(full)
                     }
@@ -4286,10 +4289,10 @@ impl Scene {
                     let es = self.entry(source)?;
                     let et = self.entry(target)?;
                     let (ps, pt) = (es.placement, et.placement);
-                    let os = es.mesh.origin();
+                    let (os, ot) = (es.mesh.origin(), et.mesh.origin());
                     baked_mesh(
                         &es.mesh,
-                        |l| pt.inverse_apply(local_to_world(&ps, os, l.map(f64::from))),
+                        |l| world_to_local(&pt, ot, local_to_world(&ps, os, l.map(f64::from))),
                         es.bvh.options(),
                     )?
                     .0
