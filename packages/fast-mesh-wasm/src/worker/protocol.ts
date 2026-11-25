@@ -352,7 +352,16 @@ export type Request =
   | { kind: "moveWithCollision"; rev: number; id: ClientId; placement: PlacementInput; isRelease: boolean; qid: number }
   | { kind: "commitCollisionInteraction"; rev: number; id: ClientId; qid: number }
   | { kind: "alignToFittedPrimitive"; rev: number; id: ClientId; primitive: FittedPrimitive; targetAxis: Vec3; targetOrigin: Vec3; qid: number }
-  | { kind: "reconstructPointCloud"; rev: number; addedId: ClientId; cloud: Float32Array; options: SurfaceReconstructOptions; qid: number }
+  /** `Scene.reconstructPointCloud` of a cloud's buffer, around its `origin` if it has one. */
+  | {
+      kind: "reconstructPointCloud";
+      rev: number;
+      addedId: ClientId;
+      cloud: Float32Array;
+      origin?: Vec3;
+      options: SurfaceReconstructOptions;
+      qid: number;
+    }
   /** `Scene.addHeightfield` of heights that are transferred; replies with the relief's counts. */
   | { kind: "addHeightfield"; rev: number; addedId: ClientId; field: CheckedHeightfield; placement: CheckedHeightfieldPlacement; qid: number }
   /** `Scene.convexHull`; replies with the hull's counts. */

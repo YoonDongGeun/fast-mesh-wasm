@@ -371,6 +371,7 @@ export {
   type MaterialMemory,
   type OutlierReport,
   type PackedPointCloud,
+  type ParsePointCloudOptions,
   type PlaceMeshOptions,
   type PlaceMeshReport,
   type PlaceMode,

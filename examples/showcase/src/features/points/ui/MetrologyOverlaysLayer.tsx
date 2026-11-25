@@ -1,5 +1,7 @@
 // 3D viewport overlays for #234: active packed point cloud (`THREE.Points`),
 // sliced contour loops (`THREE.LineSegments`), and fitted primitive datum guides.
+// Each is drawn around a point near it, so that it is as fine far from the
+// world origin as near it (#280).
 import "@react-three/fiber";
 import type {
   ContourSlice,
@@ -13,6 +15,7 @@ import * as THREE from "three";
 import { type AppState, useApp } from "../../../app/state/app-state";
 import { unpackPointCloudLocal } from "../../../engine/wave6-wasm-lazy";
 import { type Wave6MetrologyState } from "../../../app/state/wave6-state";
+import { drawOrigin } from "../../../shared/ux/draw-origin";
 
 export interface MetrologyOverlaysLayerProps {
   app: AppState;
@@ -29,6 +32,7 @@ const INITIAL_METROLOGY: Wave6MetrologyState = {
   pointCloudReport: null,
 };
 const RING_SEGMENTS = 32;
+const WORLD_ORIGIN: Vec3 = [0, 0, 0];
 
 function emptyGeometry(): THREE.BufferGeometry {
   const geo = new THREE.BufferGeometry();
@@ -53,7 +57,10 @@ function normalizeColorBuffer(raw: Float32Array): Float32Array {
   return scaled;
 }
 
-/** Builds a `THREE.BufferGeometry` holding positions (and optional normals/colors) for a `PackedPointCloud`. */
+/**
+ * Builds a `THREE.BufferGeometry` holding positions (and optional normals/colors) for a `PackedPointCloud`.
+ * The positions are the cloud's own, relative to its `origin`.
+ */
 export function buildPointCloudGeometry(cloud: PackedPointCloud | null): THREE.BufferGeometry {
   if (cloud === null || cloud.count === 0) {
     return emptyGeometry();
@@ -71,27 +78,35 @@ export function buildPointCloudGeometry(cloud: PackedPointCloud | null): THREE.B
   return geo;
 }
 
-/** Builds `THREE.LineSegments` geometry from one or more `ContourSlice` loop lists. */
-export function buildContourSegmentsGeometry(slices: readonly ContourSlice[] | null): THREE.BufferGeometry {
+/** Where the slices are drawn around. */
+export function contourDrawOrigin(slices: readonly ContourSlice[] | null): Vec3 {
+  return drawOrigin(slices?.[0]?.planeOrigin ?? WORLD_ORIGIN);
+}
+
+/** Builds `THREE.LineSegments` geometry from one or more `ContourSlice` loop lists, as offsets from `around`. */
+export function buildContourSegmentsGeometry(
+  slices: readonly ContourSlice[] | null,
+  around: Readonly<Vec3> = WORLD_ORIGIN,
+): THREE.BufferGeometry {
   if (slices === null || slices.length === 0) {
     return emptyGeometry();
   }
   const verts: number[] = [];
   for (const slice of slices) {
     for (const loop of slice.loops) {
-      const pts = loop.points3d;
+      const pts = loop.points3d64 ?? loop.points3d;
       const n = Math.floor(pts.length / 3);
       if (n < 2) {
         continue;
       }
+      const push = (i: number) => verts.push(...around.map((o, k) => pts[3 * i + k] - o));
       for (let i = 0; i < n - 1; i++) {
-        const a = 3 * i;
-        const b = 3 * (i + 1);
-        verts.push(pts[a], pts[a + 1], pts[a + 2], pts[b], pts[b + 1], pts[b + 2]);
+        push(i);
+        push(i + 1);
       }
       if (loop.closed) {
-        const last = 3 * (n - 1);
-        verts.push(pts[last], pts[last + 1], pts[last + 2], pts[0], pts[1], pts[2]);
+        push(n - 1);
+        push(0);
       }
     }
   }
@@ -141,8 +156,28 @@ function pushRing(
   }
 }
 
-/** Builds wireframe datum guide segments (`THREE.LineSegments`) for a `FittedPrimitiveReport`. */
-export function buildPrimitiveGuideSegments(report: FittedPrimitiveReport | null): THREE.BufferGeometry {
+/** Where a primitive's guides are drawn around. */
+export function primitiveDrawOrigin(report: FittedPrimitiveReport | null): Vec3 {
+  const p = report?.primitive;
+  switch (p?.kind) {
+    case undefined:
+      return WORLD_ORIGIN;
+    case "plane":
+      return drawOrigin(p.origin);
+    case "sphere":
+      return drawOrigin(p.center);
+    case "cylinder":
+      return drawOrigin(p.axisOrigin);
+    case "cone":
+      return drawOrigin(p.apex);
+  }
+}
+
+/** Builds wireframe datum guide segments (`THREE.LineSegments`) for a `FittedPrimitiveReport`, as offsets from `around`. */
+export function buildPrimitiveGuideSegments(
+  report: FittedPrimitiveReport | null,
+  around: Readonly<Vec3> = WORLD_ORIGIN,
+): THREE.BufferGeometry {
   if (report === null) {
     return emptyGeometry();
   }
@@ -213,7 +248,8 @@ export function buildPrimitiveGuideSegments(report: FittedPrimitiveReport | null
   }
 
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.Float32BufferAttribute(Float32Array.from(verts), 3));
+  const offsets = Float32Array.from(verts, (c, k) => c - around[k % 3]);
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(offsets, 3));
   geo.computeBoundingSphere();
   return geo;
 }
@@ -264,6 +300,7 @@ export function MetrologyOverlaysLayer({ app, store }: MetrologyOverlaysLayerPro
     const nextGeo = buildPointCloudGeometry(metrology.pointCloud);
     const prevGeo = pointsObj.geometry;
     pointsObj.geometry = nextGeo;
+    pointsObj.position.set(...(metrology.pointCloud?.origin ?? WORLD_ORIGIN));
     prevGeo.dispose();
 
     const mat = pointsObj.material as THREE.PointsMaterial;
@@ -279,18 +316,22 @@ export function MetrologyOverlaysLayer({ app, store }: MetrologyOverlaysLayerPro
   }, [pointsObj, metrology.pointCloud, metrology.showPointCloudOverlay]);
 
   useLayoutEffect(() => {
-    const nextGeo = buildContourSegmentsGeometry(metrology.contourSlices);
+    const around = contourDrawOrigin(metrology.contourSlices);
+    const nextGeo = buildContourSegmentsGeometry(metrology.contourSlices, around);
     const prevGeo = contourLinesObj.geometry;
     contourLinesObj.geometry = nextGeo;
+    contourLinesObj.position.set(...around);
     prevGeo.dispose();
     contourLinesObj.visible =
       metrology.showContoursOverlay && metrology.contourSlices !== null && metrology.contourSlices.length > 0;
   }, [contourLinesObj, metrology.contourSlices, metrology.showContoursOverlay]);
 
   useLayoutEffect(() => {
-    const nextGeo = buildPrimitiveGuideSegments(metrology.fittedPrimitive);
+    const around = primitiveDrawOrigin(metrology.fittedPrimitive);
+    const nextGeo = buildPrimitiveGuideSegments(metrology.fittedPrimitive, around);
     const prevGeo = primitiveLinesObj.geometry;
     primitiveLinesObj.geometry = nextGeo;
+    primitiveLinesObj.position.set(...around);
     prevGeo.dispose();
     primitiveLinesObj.visible = metrology.showPrimitiveOverlay && metrology.fittedPrimitive !== null;
   }, [primitiveLinesObj, metrology.fittedPrimitive, metrology.showPrimitiveOverlay]);

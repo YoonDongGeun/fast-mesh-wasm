@@ -3101,7 +3101,10 @@ impl WasmScene {
     }
 
     /// Reconstructs a surface from a packed cloud as a new mesh, one undo step
-    /// (undo removes it). Returns `[index, generation]`.
+    /// (undo removes it). The cloud's positions are relative to `origin` (a
+    /// world point, zero by default), which is the mesh's origin. Returns
+    /// `[index, generation]`.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconstruct_point_cloud(
         &mut self,
         packed_cloud: &[f32],
@@ -3110,11 +3113,18 @@ impl WasmScene {
         ball_radius: f64,
         k_neighbors: f64,
         normals: bool,
+        origin: Option<Vec<f64>>,
     ) -> Result<Vec<u32>, Error> {
         let cloud = crate::wave6::decode_point_cloud_f32(packed_cloud)?;
         let opts =
             crate::wave6::parse_reconstruct_options(method, voxel_size, ball_radius, k_neighbors)?;
-        let id = self.scene.reconstruct_point_cloud(&cloud, &opts)?;
+        let origin = match origin {
+            Some(o) => crate::wave6::vec3_f64(&o, "origin")?,
+            None => [0.0; 3],
+        };
+        let id = self
+            .scene
+            .reconstruct_point_cloud_at(&cloud, origin, &opts)?;
         self.added(id, normals)
     }
 
@@ -3196,7 +3206,9 @@ impl WasmScene {
     }
 
     /// Places a stamp on the target, one undo step: kept separate, it is added
-    /// as a new mesh, which undo removes.
+    /// as a new mesh, which undo removes. `stamp_anchor` is the point of the
+    /// stamp, in its own coordinates, that goes to the hit point; without it
+    /// see `Scene::place_mesh_world`.
     #[allow(clippy::too_many_arguments)]
     pub fn place_mesh(
         &mut self,
@@ -3214,6 +3226,7 @@ impl WasmScene {
         conform_to_surface: bool,
         boolean_method: u8,
         normals: bool,
+        stamp_anchor: Option<Vec<f64>>,
     ) -> Result<Vec<f64>, Error> {
         let target = self.id(target_index, target_generation)?;
         let stamp = self.id(stamp_index, stamp_generation)?;
@@ -3228,9 +3241,16 @@ impl WasmScene {
             conform_to_surface,
             boolean_method,
         )?;
-        let (rep, added) = self
-            .scene
-            .place_mesh_world(target, stamp, hp, hn, &params)?;
+        let (rep, added) = match stamp_anchor {
+            Some(a) => {
+                let anchor = crate::wave6::vec3_f64(&a, "stampAnchor")?;
+                self.scene
+                    .place_mesh_anchored(target, stamp, anchor, hp, hn, &params)?
+            }
+            None => self
+                .scene
+                .place_mesh_world(target, stamp, hp, hn, &params)?,
+        };
         let added_pair = match added {
             Some(new_id) => {
                 let pair = self.added(new_id, normals)?;

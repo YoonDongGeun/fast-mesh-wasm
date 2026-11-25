@@ -1284,6 +1284,39 @@ pub fn parse_point_cloud_bytes(bytes: &[u8]) -> Result<Vec<f32>, Error> {
     encode_point_cloud_f32(&cloud)
 }
 
+/// [`parse_point_cloud_text`] with the positions relative to the centre of
+/// their bounds, in `f64`: `[center x, y, z, ...packedCloud]`.
+#[wasm_bindgen(js_name = parsePointCloudTextCentered)]
+pub fn parse_point_cloud_text_centered(text: &str, format: u8) -> Result<Vec<f64>, Error> {
+    let (cloud, center) = match format {
+        0 => PointCloud::parse_xyz_centered(text)?,
+        1 => PointCloud::parse_pcd_ascii_centered(text)?,
+        2 => PointCloud::parse_ply_points_centered(text.as_bytes())?,
+        _ => {
+            return Err(Error::invalid(
+                "point cloud text format must be 0 (xyz), 1 (pcd) or 2 (ply)",
+            ));
+        }
+    };
+    encode_centered_cloud(&cloud, center)
+}
+
+/// [`parse_point_cloud_bytes`] as [`parse_point_cloud_text_centered`].
+#[wasm_bindgen(js_name = parsePointCloudBytesCentered)]
+pub fn parse_point_cloud_bytes_centered(bytes: &[u8]) -> Result<Vec<f64>, Error> {
+    let (cloud, center) = PointCloud::parse_ply_points_centered(bytes)?;
+    encode_centered_cloud(&cloud, center)
+}
+
+fn encode_centered_cloud(cloud: &PointCloud, center: [f64; 3]) -> Result<Vec<f64>, Error> {
+    let packed = encode_point_cloud_f32(cloud)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(3 + packed.len()).map_err(|_| oom())?;
+    out.extend(center);
+    out.extend(packed.into_iter().map(f64::from));
+    Ok(out)
+}
+
 /// Runs Statistical Outlier Removal on a packed point cloud and returns
 /// `[keptCount, removedCount, meanDistance, stdDev, threshold, ...packedCloud]`.
 #[wasm_bindgen(js_name = pointCloudSor)]
@@ -1895,9 +1928,22 @@ mod tests {
         let sor = point_cloud_sor(&pc_n, 3.0, 2.0).unwrap();
         assert_eq!(sor[0], 8.0);
         let recon = ws
-            .reconstruct_point_cloud(&pc_n, 0, 0.4, f64::NAN, 4.0, true)
+            .reconstruct_point_cloud(&pc_n, 0, 0.4, f64::NAN, 4.0, true, None)
             .unwrap();
         assert_eq!(recon.len(), 2);
+        // The same cloud around a far point of its own.
+        let centered = parse_point_cloud_text_centered(xyz, 0).unwrap();
+        assert_eq!(centered[..6], [0.5, 0.5, 0.5, 8.0, 0.0, 0.0]);
+        assert_eq!(centered[6..9], [-0.5, -0.5, -0.5]);
+        let origin = vec![1.0e5, -2.0e5, 3.0e5];
+        let far = ws
+            .reconstruct_point_cloud(&pc_n, 0, 0.4, f64::NAN, 4.0, true, Some(origin.clone()))
+            .unwrap();
+        assert_eq!(ws.origin(far[0], far[1]).unwrap(), origin);
+        assert!(
+            ws.reconstruct_point_cloud(&pc_n, 0, 0.4, f64::NAN, 4.0, true, Some(vec![1.0]))
+                .is_err()
+        );
 
         // 5. #236 Hollow, Drain Holes & Place Mesh
         let (sb_p, sb_i) = unit_box_at(10.0, 0.0, 0.0, 2.0);
@@ -1955,8 +2001,31 @@ mod tests {
                 false,
                 0,
                 true,
+                None,
             )
             .unwrap();
         assert!(pl[16] >= 0.0);
+        let by = |ws: &mut WasmScene, anchor: Vec<f64>| {
+            ws.place_mesh(
+                solid[0],
+                solid[1],
+                stamp[0],
+                stamp[1],
+                &[12.0, 0.0, 0.0],
+                &[0.0, 0.0, 1.0],
+                1,
+                0.0,
+                1.0,
+                0.0,
+                0,
+                false,
+                0,
+                true,
+                Some(anchor),
+            )
+        };
+        let pl = by(&mut ws, vec![0.0, 0.0, -0.4]).unwrap();
+        assert_eq!(pl[9..12], [12.0, 0.0, 0.4]);
+        assert!(by(&mut ws, vec![f64::NAN, 0.0, 0.0]).is_err());
     }
 }

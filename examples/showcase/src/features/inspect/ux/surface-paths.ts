@@ -316,11 +316,15 @@ export function pathCurve(path: SurfacePath): Vec3[] {
 
 /**
  * The path's legs as line segments for drawing (two endpoints per segment,
- * each `x, y, z`), every point moved `offset` along its face's normal. A
- * negative offset goes under the surface: drawn at both, the line shows
- * over the surface from either side of an open mesh.
+ * each `x, y, z` from `around`), every point moved `offset` along its face's
+ * normal. A negative offset goes under the surface: drawn at both, the line
+ * shows over the surface from either side of an open mesh.
  */
-export function pathSegments(path: SurfacePath | null, offset: number): Float32Array {
+export function pathSegments(
+  path: SurfacePath | null,
+  offset: number,
+  around: Readonly<Vec3> = [0, 0, 0],
+): Float32Array {
   if (path === null) {
     return new Float32Array(0);
   }
@@ -332,9 +336,9 @@ export function pathSegments(path: SurfacePath | null, offset: number): Float32A
     const n = leg.normals;
     for (let i = 3; i + 2 < p.length; i += 3) {
       for (const j of [i - 3, i]) {
-        out[at++] = p[j] + offset * n[j];
-        out[at++] = p[j + 1] + offset * n[j + 1];
-        out[at++] = p[j + 2] + offset * n[j + 2];
+        out[at++] = p[j] - around[0] + offset * n[j];
+        out[at++] = p[j + 1] - around[1] + offset * n[j + 1];
+        out[at++] = p[j + 2] - around[2] + offset * n[j + 2];
       }
     }
   }

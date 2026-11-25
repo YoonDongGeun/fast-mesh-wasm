@@ -4,7 +4,7 @@
 import type { Positions64 } from "./api.js";
 import { FastMeshError } from "./core.js";
 import type { MeshHandle } from "./scene.js";
-import type { PackedPointCloud } from "./wave6.js";
+import { cloudOrigin, type PackedPointCloud } from "./wave6.js";
 
 function invalid(message: string): FastMeshError {
   return new FastMeshError("INVALID_ARGUMENT", message);
@@ -19,7 +19,8 @@ export interface ConvexHullOptions {
 /**
  * Points for `convexHullOfPoints`: flat world positions `[x0, y0, z0, x1, ...]`
  * (`Float32Array`, `Float64Array` or numbers), or a {@link PackedPointCloud},
- * whose positions are used (its normals and colours are ignored). A bare
+ * whose positions are used (its normals and colours are ignored), around its
+ * `origin` if it has one. A bare
  * `Float32Array` is always read as flat positions, never as a packed cloud.
  */
 export type ConvexHullPoints = Positions64 | PackedPointCloud;
@@ -76,7 +77,9 @@ export function hullPointsBuffer(points: ConvexHullPoints): Float64Array {
     throw invalid("points must be flat positions or a PackedPointCloud");
   }
   let flat: ArrayLike<number>;
+  let origin: readonly number[] = [0, 0, 0];
   if (isPackedCloud(points)) {
+    origin = cloudOrigin(points) ?? origin;
     const count = points.data[0];
     if (!Number.isInteger(count) || count < 0 || points.data.length < 3 + 3 * count) {
       throw invalid("packed point cloud buffer length mismatch");
@@ -94,7 +97,7 @@ export function hullPointsBuffer(points: ConvexHullPoints): Float64Array {
     if (typeof v !== "number" || !Number.isFinite(v)) {
       throw invalid(`points[${i}] must be a finite number`);
     }
-    out[i] = v;
+    out[i] = v + origin[i % 3];
   }
   return out;
 }

@@ -36,7 +36,7 @@ import {
   type SectionPlane,
 } from "../scene.js";
 import type { MeshViews } from "../views.js";
-import type { CollisionStepReport } from "../wave6.js";
+import { type CollisionStepReport, wrapPackedPointCloud } from "../wave6.js";
 import {
   type ClientId,
   type ColorRuleWire,
@@ -2208,7 +2208,7 @@ class Engine {
       }
       case "reconstructPointCloud": {
         this.#ensureUnused(req.addedId);
-        const added = s.reconstructPointCloud(req.cloud, req.options);
+        const added = s.reconstructPointCloud(wrapPackedPointCloud(req.cloud, req.origin), req.options);
         this.#bindAdded(req.addedId, added);
         b.replies.push({ qid: req.qid, ok: true, value: undefined });
         return;
@@ -2475,12 +2475,14 @@ class Engine {
           for (const loop of (value as QueryMap["sliceContours"]["value"]).loops) {
             pushOwned(loop.points2d);
             pushOwned(loop.points3d);
+            pushOwned(loop.points3d64);
           }
         } else if (req.name === "sliceContourStack") {
           for (const slice of value as QueryMap["sliceContourStack"]["value"]) {
             for (const loop of slice.loops) {
               pushOwned(loop.points2d);
               pushOwned(loop.points3d);
+              pushOwned(loop.points3d64);
             }
           }
         } else if (req.name === "overhangs") {

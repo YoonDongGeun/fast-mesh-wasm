@@ -5,12 +5,12 @@ import type { MeshHandle, PackedPointCloud, Vec3 } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { ensureWave6Wasm, packPointCloudLocal, unpackPointCloudLocal } from "../../../engine/wave6-wasm-lazy";
 
-/** Computes axis-aligned bounds of a packed point cloud, or `null` when empty. */
+/** Computes the world's axis-aligned bounds of a packed point cloud, or `null` when empty. */
 export function computePointCloudBounds(cloud: PackedPointCloud): { min: Vec3; max: Vec3 } | null {
   if (cloud.count === 0) {
     return null;
   }
-  const { positions } = unpackPointCloudLocal(cloud);
+  const { positions, origin } = unpackPointCloudLocal(cloud);
   let minX = Infinity;
   let minY = Infinity;
   let minZ = Infinity;
@@ -29,8 +29,8 @@ export function computePointCloudBounds(cloud: PackedPointCloud): { min: Vec3; m
     if (z > maxZ) maxZ = z;
   }
   return {
-    min: [minX, minY, minZ],
-    max: [maxX, maxY, maxZ],
+    min: [minX + origin[0], minY + origin[1], minZ + origin[2]],
+    max: [maxX + origin[0], maxY + origin[1], maxZ + origin[2]],
   };
 }
 
@@ -85,25 +85,26 @@ export function normalizePtsText(raw: string): string {
   return rows.join("\n");
 }
 
-/** Parses `.xyz`, `.ply`, `.pts`, or `.pcd` file bytes using SDK parsers. */
+/** Parses `.xyz`, `.ply`, `.pts`, or `.pcd` file bytes using SDK parsers, around the points' centre. */
 export async function parsePointCloudFileContent(fileName: string, bytes: Uint8Array): Promise<PackedPointCloud> {
+  const options = { center: true };
   const { parsePointCloudBytes, parsePointCloudText } = await ensureWave6Wasm();
   const lower = fileName.toLowerCase();
   if (lower.endsWith(".ply")) {
-    return parsePointCloudBytes(bytes);
+    return parsePointCloudBytes(bytes, options);
   }
   if (lower.endsWith(".pcd")) {
     const head = new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, Math.min(bytes.length, 1024)));
     if (/\bDATA\s+ascii\b/i.test(head)) {
-      return parsePointCloudText(new TextDecoder().decode(bytes), "pcd");
+      return parsePointCloudText(new TextDecoder().decode(bytes), "pcd", options);
     }
-    return parsePointCloudBytes(bytes);
+    return parsePointCloudBytes(bytes, options);
   }
   const text = new TextDecoder().decode(bytes);
   if (lower.endsWith(".pts")) {
-    return parsePointCloudText(normalizePtsText(text), "xyz");
+    return parsePointCloudText(normalizePtsText(text), "xyz", options);
   }
-  return parsePointCloudText(text, "xyz");
+  return parsePointCloudText(text, "xyz", options);
 }
 
 function transformPoint(m: ArrayLike<number>, x: number, y: number, z: number): [number, number, number] {
@@ -116,7 +117,8 @@ function transformPoint(m: ArrayLike<number>, x: number, y: number, z: number): 
 
 /**
  * Samples world-space vertices (and triangle surface subdivisions for coarse
- * meshes) with outward normals from an active scene mesh into a `PackedPointCloud`.
+ * meshes) with outward normals from an active scene mesh into a `PackedPointCloud`,
+ * around where the mesh's origin is in the world.
  */
 export function sampleMeshToPointCloud(
   scene: SceneStore["scene"],
@@ -137,7 +139,7 @@ export function sampleMeshToPointCloud(
   const m = scene.matrix4(mesh);
 
   const vertCount = Math.floor(localPos.length / 3);
-  const worldPos = new Float32Array(vertCount * 3);
+  const worldPos = new Float64Array(vertCount * 3);
   for (let i = 0; i < vertCount; i++) {
     const [wx, wy, wz] = transformPoint(m, localPos[3 * i], localPos[3 * i + 1], localPos[3 * i + 2]);
     worldPos[3 * i] = wx;
@@ -237,8 +239,9 @@ export function sampleMeshToPointCloud(
   }
 
   return packPointCloudLocal(
-    Float32Array.from(outPos),
+    outPos,
     Float32Array.from(outNorm),
     outCol === undefined ? undefined : Float32Array.from(outCol),
+    [m[12], m[13], m[14]],
   );
 }

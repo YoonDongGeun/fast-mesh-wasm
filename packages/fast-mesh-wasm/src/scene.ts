@@ -164,6 +164,7 @@ import {
   checkNonNegativeArg,
   checkU32Arg,
   cloudBuffer,
+  cloudOrigin,
   decodeCollisionRule,
   decodeCollisionStepReport,
   decodeContourSlices,
@@ -276,6 +277,7 @@ export {
   type MaterialMemory,
   type OutlierReport,
   type PackedPointCloud,
+  type ParsePointCloudOptions,
   type PlaceMeshOptions,
   type PlaceMeshReport,
   type PlaceMode,
@@ -1981,7 +1983,7 @@ export interface GeodesicOptions {
 
 /** Sample point along an intrinsic surface shortest path. */
 export interface SurfacePathPoint {
-  /** World-space position on the surface. */
+  /** World-space position on the surface, as precise as the mesh's local positions wherever it is. */
   position: Vec3;
   /** Triangle slot index containing this point. */
   triangle: number;
@@ -6624,7 +6626,10 @@ export class Scene implements SceneLike {
 
   // ---- #234 Primitive Fit, Contours & Point Cloud ----
 
-  /** Fits a geometric primitive (`plane`, `sphere`, `cylinder`, `cone`, or `auto`) in world space. */
+  /**
+   * Fits a geometric primitive (`plane`, `sphere`, `cylinder`, `cone`, or
+   * `auto`) in world space, as precisely far from the world origin as near it.
+   */
   fitPrimitive(mesh: MeshHandle, options: FitPrimitiveOptions = {}): FittedPrimitiveReport {
     const { index, generation } = this.#id(mesh);
     const n = normalizeFitPrimitiveArgs(options);
@@ -6660,14 +6665,18 @@ export class Scene implements SceneLike {
     );
   }
 
-  /** Slices world-space planar contours through `mesh`. */
+  /**
+   * Slices world-space planar contours through `mesh`, as precisely far from
+   * the world origin as near it: take the points from `points3d64` there
+   * (`points3d` is `f32`). `origin` may be anywhere on the plane.
+   */
   sliceContours(mesh: MeshHandle, origin: Readonly<Vec3>, normal: Readonly<Vec3>): ContourSlice {
     const { index, generation } = this.#id(mesh);
     const n = normalizeSliceContoursArgs(origin, normal);
     return decodeContourSlices(call(() => this.#peek().slice_contours(index, generation, n.origin, n.normal)))[0];
   }
 
-  /** Slices an evenly spaced stack of `count` parallel contours through `mesh`. */
+  /** Slices an evenly spaced stack of `count` parallel contours through `mesh`, each as {@link Scene.sliceContours}. */
   sliceContourStack(
     mesh: MeshHandle,
     origin: Readonly<Vec3>,
@@ -6686,15 +6695,22 @@ export class Scene implements SceneLike {
    * Reconstructs a triangle mesh from a packed point cloud and adds it to the
    * scene, as one undo step: {@link Scene.undo} removes it and
    * {@link Scene.redo} brings it back with the same handle.
+   *
+   * The cloud's `origin` is the mesh's {@link Scene.origin}. Without one, and
+   * for a bare buffer, the positions are world positions in `f32`, which far
+   * from the world origin are off by up to half of its steps (0.004 at 1e5):
+   * see {@link PackedPointCloud} for clouds there.
    */
   reconstructPointCloud(
     cloud: PackedPointCloud | Float32Array,
     options: SurfaceReconstructOptions = {},
   ): MeshHandle {
     const buf = cloudBuffer(cloud);
+    const at = cloudOrigin(cloud);
+    const origin = at === undefined ? undefined : Float64Array.from(at);
     const n = normalizeReconstructArgs(options);
     const id = call(() =>
-      this.#scene().reconstruct_point_cloud(buf, n.method, n.voxelSize, n.ballRadius, n.kNeighbors, n.normals),
+      this.#scene().reconstruct_point_cloud(buf, n.method, n.voxelSize, n.ballRadius, n.kNeighbors, n.normals, origin),
     );
     return this.#meshHandle(id[0], id[1]);
   }
@@ -6838,6 +6854,12 @@ export class Scene implements SceneLike {
    * in one undo step. Kept separate, the placed stamp is a new mesh with the hit point as its
    * {@link Scene.origin}, which {@link Scene.undo} removes and {@link Scene.redo} brings back with
    * the same handle.
+   *
+   * The zero of the stamp's own coordinates goes to the hit point, or `options.stampAnchor`, which
+   * says what happens with a stamp far from that zero. A `stampAnchor` far from the stamp puts it
+   * as far from the hit point: kept separate (and not conforming) it is placed as precisely there,
+   * around an origin of its own; merged into a target it has the precision of that mesh's `f32`
+   * positions at that distance.
    */
   placeMesh(target: MeshHandle, stamp: MeshHandle, options: PlaceMeshOptions): PlaceMeshReport {
     const t = this.#id(target);
@@ -6860,6 +6882,7 @@ export class Scene implements SceneLike {
         n.conformToSurface,
         n.booleanMethod,
         normals,
+        n.stampAnchor,
       ),
     );
     return decodePlaceMeshReport(raw, (i, g) => this.#meshHandle(i, g));

@@ -12,6 +12,7 @@ import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
 import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
 import { type AppState, useApp } from "../../../app/state/app-state";
+import { drawOrigin } from "../../../shared/ux/draw-origin";
 import { formatLength } from "../../../shared/ux/units";
 import { pathLength, pathSegments, SURFACE_LINE_OFFSET } from "../ux/surface-paths";
 import { useSurfacePickPointer } from "../ux/use-surface-pick";
@@ -58,14 +59,18 @@ export function SurfacePathLayer(props: { app: AppState; store: SceneStore }) {
     path?.points.forEach((p, i) => ball(p.point, i === 0 ? parts.firstMaterial : parts.pathPointMaterial));
 
     const offset = r * SURFACE_LINE_OFFSET;
-    const above = pathSegments(path, offset);
-    const below = pathSegments(path, -offset);
+    const around = drawOrigin(path?.points[0]?.point ?? [0, 0, 0]);
+    for (const line of [parts.pathEdge, parts.pathLine, parts.pathThrough]) {
+      line.position.set(...around);
+    }
+    const above = pathSegments(path, offset, around);
+    const below = pathSegments(path, -offset, around);
     const both = new Float32Array(above.length + below.length);
     both.set(above);
     both.set(below, above.length);
     setFat(parts.pathEdge, both);
     setFat(parts.pathLine, both);
-    setFat(parts.pathThrough, pathSegments(path, 0));
+    setFat(parts.pathThrough, pathSegments(path, 0, around));
     setLines(parts.iso, tool.isoLines ?? new Float32Array(0));
 
     if (path !== null && path.legs.length > 0) {

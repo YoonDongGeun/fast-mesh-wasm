@@ -88,21 +88,37 @@ pub(crate) fn baked_copy(mesh: &Mesh, map: impl Fn([f32; 3]) -> [f64; 3]) -> Res
     Ok(baked)
 }
 
-/// A copy of a scene mesh as it is placed, in world axes around the point
-/// where its origin is: the copy's own origin is that point, in `f64`, and its
-/// positions, the offsets from there, are as precise as the mesh's, however
-/// far from the world origin it is. Slot ids match the mesh's.
+/// How far from the world origin a mesh may be, in units of its largest local
+/// coordinate, for `f32` world positions to be about as good as its own: they
+/// are rounded by up to eight steps of those.
+const NEAR: f64 = 16.0;
+
+/// A copy of a scene mesh as it is placed, in world axes: its positions are
+/// offsets from its own origin, in `f64`, and as precise as the mesh's,
+/// however far from the world origin it is. Slot ids match the mesh's.
+///
+/// That origin is where the mesh's own is in the world, or for a mesh near
+/// the world origin (see [`NEAR`]) zero: its positions are the world's then.
 ///
 /// # Errors
 /// As for [`baked_mesh`].
 pub(crate) fn baked_in_place(entry: &Entry) -> Result<Mesh> {
+    let (placement, mesh) = (entry.placement, &entry.mesh);
+    let at = local_to_world(&placement, mesh.origin(), [0.0; 3]);
+    let coordinates = mesh.positions().iter().flatten();
+    let largest = coordinates.fold(0.0f32, |m, c| m.max(c.abs()));
+    let reach = NEAR * placement.max_scale() * f64::from(largest);
+    if at.iter().all(|c| c.abs() <= reach) {
+        return baked_copy(mesh, |p| {
+            local_to_world(&placement, mesh.origin(), p.map(f64::from))
+        });
+    }
     let turn = Placement {
         translation: [0.0; 3],
-        ..entry.placement
+        ..placement
     };
-    let copy = baked_copy(&entry.mesh, |p| turn.apply(p.map(f64::from)))?;
-    let origin = local_to_world(&entry.placement, entry.mesh.origin(), [0.0; 3]);
-    Ok(copy.with_origin(origin)?)
+    let copy = baked_copy(mesh, |p| turn.apply(p.map(f64::from)))?;
+    Ok(copy.with_origin(at)?)
 }
 
 #[cfg(test)]
@@ -111,6 +127,7 @@ mod tests {
     use fast_mesh_store::Mesh;
 
     use super::*;
+    use crate::{MeshOptions, Scene, SceneOptions};
 
     fn quad() -> Mesh {
         Mesh::from_buffers(
@@ -143,6 +160,34 @@ mod tests {
         let (empty, _) =
             baked_mesh(&Mesh::new(), |p| p.map(f64::from), &BuildOptions::default()).unwrap();
         assert_eq!(empty.triangle_slots(), 0);
+    }
+
+    #[test]
+    fn baked_in_place_is_around_the_world_origin_only_near_it() {
+        let placed = |translation: [f64; 3], scale: [f64; 3]| {
+            let mut scene = Scene::new(SceneOptions::default());
+            let placement = Placement {
+                translation,
+                scale,
+                ..Placement::IDENTITY
+            };
+            let options = MeshOptions {
+                placement,
+                ..MeshOptions::default()
+            };
+            let id = scene.add_mesh(quad(), options).unwrap();
+            let mesh = baked_in_place(scene.entry(id).unwrap()).unwrap();
+            (mesh.origin(), mesh.position(2).unwrap())
+        };
+        // Positions of up to 2: near is up to 32 away.
+        let near = placed([-32.0, 0.0, 31.0], [1.0; 3]);
+        assert_eq!(near, ([0.0; 3], [-30.0, 2.0, 31.0]));
+        let far = placed([-32.0, 0.0, 33.0], [1.0; 3]);
+        assert_eq!(far, ([-32.0, 0.0, 33.0], [2.0, 2.0, 0.0]));
+        let scaled = placed([0.0, 0.0, 33.0], [1.0, 2.0, 1.0]);
+        assert_eq!(scaled, ([0.0; 3], [2.0, 4.0, 33.0]));
+        let far = placed([1.0e7, 0.0, 0.0], [1.0, 2.0, 1.0]);
+        assert_eq!(far, ([1.0e7, 0.0, 0.0], [2.0, 4.0, 0.0]));
     }
 
     #[test]

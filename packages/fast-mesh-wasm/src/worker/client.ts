@@ -199,6 +199,7 @@ import {
   checkPositiveArg,
   checkU32Arg,
   cloudBuffer,
+  cloudOrigin,
   type CollisionRule,
   type CollisionRuleInput,
   type CollisionStepReport,
@@ -3586,14 +3587,16 @@ export class WorkerScene implements SceneLike {
       (rev, qid) => {
         this.#alive();
         const buf = cloudBuffer(cloud).slice();
+        const origin = cloudOrigin(cloud);
         normalizeReconstructArgs(options);
         const normals = checkBooleanArg(options?.normals, true, "options.normals");
-        added = this.#allocMeshState([0, 0, 0], normals);
+        added = this.#allocMeshState(origin ?? [0, 0, 0], normals);
         return {
           kind: "reconstructPointCloud",
           rev,
           addedId: added.id,
           cloud: buf,
+          ...(origin === undefined ? {} : { origin }),
           options: copyInput(options, "options"),
           qid,
         };
