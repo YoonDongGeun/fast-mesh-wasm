@@ -40,8 +40,9 @@ use crate::{
     FieldId, GeodesicOptions, JoinOptions, JoinReport, LandmarkAlignment, LandmarkPair, MeshId,
     OverhangOptions, OverhangReport, Placement, QualityMetric, QualityReport, RegisterOptions,
     RegisterReport, RegistrationOptions, RegistrationReport, Result, Scene, SceneClosestHit,
-    SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions, SectionDesc, SectionId,
-    SurfacePathPoint, SymmetryPlaneReport, ThicknessField, TrimCurveOptions, TrimReport, Vec3,
+    SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions, SceneSurfacePathPoint,
+    SectionDesc, SectionId, SymmetryPlaneReport, ThicknessField, TrimCurveOptions, TrimReport,
+    Vec3,
 };
 
 /// Repair domain operations on [`Scene`].
@@ -980,7 +981,7 @@ pub trait SceneInspectOps {
         distances: &[f32],
         sources: &[u32],
         target_vertex: u32,
-        out: &mut Vec<SurfacePathPoint>,
+        out: &mut Vec<SceneSurfacePathPoint>,
     ) -> Result<()>;
 
     /// Fits an analytical geometric primitive to `id` (or `subset_tris`) in world space.
@@ -1148,7 +1149,7 @@ impl SceneInspectOps for Scene {
         distances: &[f32],
         sources: &[u32],
         target_vertex: u32,
-        out: &mut Vec<SurfacePathPoint>,
+        out: &mut Vec<SceneSurfacePathPoint>,
     ) -> Result<()> {
         Scene::shortest_surface_path(self, id, distances, sources, target_vertex, out)
     }

@@ -418,7 +418,7 @@ fn test_fit_noisy_primitives_and_auto_classification() {
 fn test_section_contours_metrology_and_exports() {
     // 1. Sphere cross-section circle checks
     let sphere = build_uv_sphere([0.0, 0.0, 0.0], 2.0, 32, 64);
-    let z_cut = 1.0_f32;
+    let z_cut = 1.0_f64;
     let r_expected = (4.0_f64 - 1.0_f64).sqrt();
     let s_slice =
         slice_contours(&sphere, [0.0, 0.0, z_cut], [0.0, 0.0, 1.0]).expect("slice sphere contour");
@@ -760,4 +760,133 @@ end_header
             .map(|l| (l.closed, l.points_2d.len(), l.enclosed_area, l.centroid_2d))
             .collect::<Vec<_>>()
     );
+}
+
+/// Four points 1e5 from zero, whose differences `f32` there cannot hold.
+const FAR_POINTS: [[f64; 3]; 4] = [
+    [100_000.001_25, -250_000.002_5, 73_000.003_75],
+    [100_001.017, -250_000.9, 73_000.5],
+    [100_000.3, -250_001.11, 73_002.25],
+    [99_999.75, -250_000.123_456, 73_001.75],
+];
+const FAR_NORMAL: [f64; 3] = [0.6, 0.0, 0.8];
+
+/// A `.ply` file of [`FAR_POINTS`] with normals and colors, ending in `body`.
+fn far_ply(format: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = format!("ply\nformat {format} 1.0\nelement vertex 4\n").into_bytes();
+    for name in ["x", "y", "z", "nx", "ny", "nz"] {
+        out.extend(format!("property double {name}\n").bytes());
+    }
+    for name in ["red", "green", "blue"] {
+        out.extend(format!("property uchar {name}\n").bytes());
+    }
+    out.extend(b"end_header\n");
+    out.extend_from_slice(body);
+    out
+}
+
+#[test]
+fn centered_parsers_keep_the_digits_of_far_points() {
+    let row = |p: &[f64; 3]| {
+        let n = FAR_NORMAL;
+        format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?}",
+            p[0], p[1], p[2], n[0], n[1], n[2]
+        )
+    };
+    let rows: Vec<String> = FAR_POINTS.iter().map(row).collect();
+    let xyz = rows.join("\n");
+    let pcd = format!(
+        "FIELDS x y z normal_x normal_y normal_z\nSIZE 8 8 8 8 8 8\nTYPE F F F F F F\nCOUNT 1 1 1 1 1 1\nPOINTS 4\nDATA ascii\n{xyz}\n"
+    );
+    let colored: Vec<String> = rows.iter().map(|r| format!("{r} 255 0 51")).collect();
+    let ascii = far_ply("ascii", (colored.join("\n") + "\n").as_bytes());
+    let binary = |little: bool| {
+        let mut body = Vec::new();
+        for p in &FAR_POINTS {
+            for v in p.iter().chain(&FAR_NORMAL) {
+                body.extend(if little {
+                    v.to_le_bytes()
+                } else {
+                    v.to_be_bytes()
+                });
+            }
+            body.extend([255, 0, 51]);
+        }
+        let name = if little { "little" } else { "big" };
+        far_ply(&format!("binary_{name}_endian"), &body)
+    };
+    let (little, big) = (binary(true), binary(false));
+    let ply = PointCloud::parse_ply_points_centered;
+    let parsed = [
+        (
+            PointCloud::parse_xyz_centered(&xyz).unwrap(),
+            parse_xyz(&xyz).unwrap(),
+        ),
+        (
+            PointCloud::parse_pcd_ascii_centered(&pcd).unwrap(),
+            parse_pcd_ascii(&pcd).unwrap(),
+        ),
+        (ply(&ascii).unwrap(), parse_ply_points(&ascii).unwrap()),
+        (ply(&little).unwrap(), parse_ply_points(&little).unwrap()),
+        (ply(&big).unwrap(), parse_ply_points(&big).unwrap()),
+    ];
+    for (i, ((cloud, origin), plain)) in parsed.iter().enumerate() {
+        // The centre of the bounds, which the points are around.
+        for k in 0..3 {
+            let coords = FAR_POINTS.map(|p| p[k]);
+            let lo = coords.into_iter().fold(f64::INFINITY, f64::min);
+            let hi = coords.into_iter().fold(f64::NEG_INFINITY, f64::max);
+            assert!((origin[k] - 0.5 * (lo + hi)).abs() < 1e-9, "{i}");
+        }
+        assert_eq!(cloud.len(), FAR_POINTS.len());
+        let off = |at: [f64; 3], positions: &[[f32; 3]]| -> f64 {
+            positions
+                .iter()
+                .zip(&FAR_POINTS)
+                .flat_map(|(q, p)| (0..3).map(move |k| (at[k] + f64::from(q[k]) - p[k]).abs()))
+                .fold(0.0, f64::max)
+        };
+        assert!(off(*origin, &cloud.positions) < 1e-7, "{i}");
+        // Read as f32 they are off by its steps; the rest is the same.
+        assert!(off([0.0; 3], &plain.positions) > 1e-3, "{i}");
+        assert!(cloud.normals.is_some());
+        assert_eq!(cloud.normals, plain.normals, "{i}");
+        assert_eq!(cloud.colors, plain.colors, "{i}");
+        assert_eq!(cloud.colors.is_some(), i >= 2);
+    }
+
+    let (empty, origin) = PointCloud::parse_xyz_centered("# nothing\n").unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(origin, [0.0; 3]);
+    for bad in ["1 2\n", "1 2 x\n", "1 2 inf\n"] {
+        assert!(PointCloud::parse_xyz_centered(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn contours_and_fits_of_a_mesh_with_a_far_origin() {
+    let far = [148_000.3, -77_000.7, 91_234.1];
+    let sphere = || build_uv_sphere([0.0; 3], 1.5, 24, 48);
+    let (near, moved) = (sphere(), sphere().with_origin(far).unwrap());
+    let cut = |mesh: &Mesh, o: [f64; 3]| slice_contours(mesh, o, [0.36, 0.48, 0.8]).unwrap();
+    let at = [0.1, 0.2, 0.3];
+    let moved_at = std::array::from_fn(|k| far[k] + at[k]);
+    let (a, b) = (cut(&near, at), cut(&moved, moved_at));
+    assert_eq!(a.loops.len(), 1);
+    assert_eq!(b.loops.len(), 1);
+    for (p, q) in a.loops[0].points_3d.iter().zip(&b.loops[0].points_3d) {
+        assert!(norm3(sub3(sub3(*q, far), *p)) < 1e-6, "{p:?} {q:?}");
+    }
+    let fit = |mesh: &Mesh| {
+        let options = FitPrimitiveOptions::default();
+        let report = fit_primitive_mesh(mesh, None, PrimitiveKind::Sphere, &options).unwrap();
+        match report.primitive {
+            FittedPrimitive::Sphere { center, radius } => (center, radius),
+            other => panic!("{other:?}"),
+        }
+    };
+    let ((c0, r0), (c1, r1)) = (fit(&near), fit(&moved));
+    assert_eq!(r0, r1);
+    assert!(norm3(sub3(sub3(c1, far), c0)) < 1e-9, "{c0:?} {c1:?}");
 }

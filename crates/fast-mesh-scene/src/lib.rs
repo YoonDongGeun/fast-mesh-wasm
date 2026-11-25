@@ -186,7 +186,7 @@ pub use join::{JoinOptions, JoinReport};
 pub use placement::Placement;
 pub use query::{
     SceneClosestHit, SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions,
-    SurfacePathPoint,
+    SceneSurfacePathPoint,
 };
 pub use register::{
     CoarseAlignMethod, DEFAULT_MAX_RMSE_FRACTION, IcpObjective, LandmarkAlignment, LandmarkPair,

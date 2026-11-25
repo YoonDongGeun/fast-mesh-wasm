@@ -11,7 +11,9 @@
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_store::{Mesh, StoreError, TriangleId, VertexId};
 
-use crate::{Result, SceneError};
+use crate::placement::local_to_world;
+use crate::scene::Entry;
+use crate::{Placement, Result, SceneError};
 
 fn oom() -> SceneError {
     SceneError::Store(StoreError::OutOfMemory)
@@ -84,6 +86,23 @@ pub(crate) fn baked_copy(mesh: &Mesh, map: impl Fn([f32; 3]) -> [f64; 3]) -> Res
         let _ = tx.commit()?;
     }
     Ok(baked)
+}
+
+/// A copy of a scene mesh as it is placed, in world axes around the point
+/// where its origin is: the copy's own origin is that point, in `f64`, and its
+/// positions, the offsets from there, are as precise as the mesh's, however
+/// far from the world origin it is. Slot ids match the mesh's.
+///
+/// # Errors
+/// As for [`baked_mesh`].
+pub(crate) fn baked_in_place(entry: &Entry) -> Result<Mesh> {
+    let turn = Placement {
+        translation: [0.0; 3],
+        ..entry.placement
+    };
+    let copy = baked_copy(&entry.mesh, |p| turn.apply(p.map(f64::from)))?;
+    let origin = local_to_world(&entry.placement, entry.mesh.origin(), [0.0; 3]);
+    Ok(copy.with_origin(origin)?)
 }
 
 #[cfg(test)]

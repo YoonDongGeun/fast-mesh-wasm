@@ -1020,9 +1020,9 @@ pub(crate) fn encode_contour_slices(slices: &[ContourSlice]) -> Result<Vec<f64>,
     out.push(count(slices.len()));
     for s in slices {
         out.extend_from_slice(&[
-            f64::from(s.plane_origin[0]),
-            f64::from(s.plane_origin[1]),
-            f64::from(s.plane_origin[2]),
+            s.plane_origin[0],
+            s.plane_origin[1],
+            s.plane_origin[2],
             f64::from(s.plane_normal[0]),
             f64::from(s.plane_normal[1]),
             f64::from(s.plane_normal[2]),
@@ -1056,7 +1056,7 @@ pub(crate) fn encode_contour_slices(slices: &[ContourSlice]) -> Result<Vec<f64>,
                 out.extend_from_slice(p2);
             }
             for p3 in l.points_3d.iter().take(npts) {
-                out.extend_from_slice(&[f64::from(p3[0]), f64::from(p3[1]), f64::from(p3[2])]);
+                out.extend_from_slice(p3);
             }
         }
     }
@@ -1094,7 +1094,7 @@ pub(crate) fn decode_contour_slices(flat: &[f64]) -> Result<Vec<ContourSlice>, E
     let mut slices = Vec::new();
     slices.try_reserve(slice_count).map_err(|_| oom())?;
     for _ in 0..slice_count {
-        let plane_origin = next3_f32(&mut cur, "planeOrigin")?;
+        let plane_origin = next3_f64(&mut cur, "planeOrigin")?;
         let plane_normal = next3_f32(&mut cur, "planeNormal")?;
         let u_axis = next3_f64(&mut cur, "uAxis")?;
         let v_axis = next3_f64(&mut cur, "vAxis")?;
@@ -1120,7 +1120,7 @@ pub(crate) fn decode_contour_slices(flat: &[f64]) -> Result<Vec<ContourSlice>, E
             let mut points_3d = Vec::new();
             points_3d.try_reserve(point_count).map_err(|_| oom())?;
             for _ in 0..point_count {
-                points_3d.push(next3_f32(&mut cur, "point3d")?);
+                points_3d.push(next3_f64(&mut cur, "point3d")?);
             }
             loops.push(ContourLoop {
                 points_3d,

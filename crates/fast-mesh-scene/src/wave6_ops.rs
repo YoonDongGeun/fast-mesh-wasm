@@ -2,10 +2,12 @@
 
 use std::f64::consts::PI;
 
+use fast_mesh_bvh::Bvh;
 use fast_mesh_ops::OpsError;
 use fast_mesh_ops::boolean::{
     DrainHoleOptions, DrainHoleReport, DrainHoleSpec, HollowOptions, HollowReport, PlaceMeshParams,
-    PlaceMeshReport, PlaceMode, compute_place_transform, hollow_mesh, place_mesh, punch_drain_hole,
+    PlaceMeshReport, PlaceMode, PlaceUpAxis, compute_place_transform, hollow_mesh, place_mesh,
+    punch_drain_hole,
 };
 use fast_mesh_ops::deform::{
     FfdBasis, FfdLattice, FreeformOp, FreeformReport, apply_freeform, apply_freeform_protected,
@@ -24,8 +26,7 @@ use fast_mesh_ops::repair::{
 };
 use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId, UV_CHANNEL, VertexId};
 
-use crate::baked::baked_mesh;
-use crate::fields::baked_world_mesh;
+use crate::baked::{baked_in_place, baked_mesh};
 use crate::placement::{Placement, local_to_world, orthonormalize, world_to_local};
 use crate::{MeshId, MeshOptions, Result, Scene, SceneError};
 
@@ -279,10 +280,58 @@ fn shrink_vertex_adjacent(mesh: &Mesh, sel: &FaceSelection, rings: usize) -> Res
     Ok(cur)
 }
 
-fn stamp_mesh_with_scale_and_origin(entry: &crate::scene::Entry) -> Result<Mesh> {
+/// How many times its size a stamp may be from a point for `f32` to hold the
+/// stamp around it: to 1/4096 of that size.
+const STAMP_REACH: f64 = 4096.0;
+
+/// The bounds of a mesh's live triangles in its local coordinates, with no
+/// triangle `None`.
+fn triangle_bounds(mesh: &Mesh) -> Option<(Vec3, Vec3)> {
+    let pos = mesh.positions();
+    let mut bounds = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    let triangles = (0..mesh.triangle_slots() as TriangleId).filter_map(|t| mesh.triangle(t));
+    for v in triangles.flatten() {
+        for (k, &c) in pos[v as usize].iter().enumerate() {
+            bounds.0[k] = bounds.0[k].min(f64::from(c));
+            bounds.1[k] = bounds.1[k].max(f64::from(c));
+        }
+    }
+    (bounds.0[0] <= bounds.1[0]).then_some(bounds)
+}
+
+/// Whether the stamp is out of reach (see [`STAMP_REACH`]) of `point`, in its
+/// own coordinates.
+fn is_stamp_far(stamp: &Mesh, (lo, hi): (Vec3, Vec3), point: Vec3) -> bool {
+    let o = stamp.origin();
+    let size = (0..3).fold(0.0, |m: f64, k| m.max(hi[k] - lo[k]));
+    (0..3).any(|k| (o[k] - point[k] + 0.5 * (lo[k] + hi[k])).abs() > STAMP_REACH * size)
+}
+
+/// The point of a stamp, in its own coordinates, that goes to the hit point:
+/// their zero, or with that out of reach the middle of its underside.
+fn default_stamp_anchor(stamp: &Mesh, up_axis: PlaceUpAxis) -> Vec3 {
+    let Some((lo, hi)) = triangle_bounds(stamp) else {
+        return [0.0; 3];
+    };
+    if !is_stamp_far(stamp, (lo, hi), [0.0; 3]) {
+        return [0.0; 3];
+    }
+    let (o, up) = (stamp.origin(), up_axis.unit_vector());
+    std::array::from_fn(|k| {
+        o[k] + match up[k] {
+            u if u > 0.0 => lo[k],
+            u if u < 0.0 => hi[k],
+            _ => 0.5 * (lo[k] + hi[k]),
+        }
+    })
+}
+
+/// The stamp around `base`, a point given like `anchor` in its own
+/// coordinates but relative to that: scaled as placed, not turned or moved.
+fn stamp_around(entry: &crate::scene::Entry, anchor: Vec3, base: Vec3) -> Result<Mesh> {
     let scale = entry.placement.scale;
-    let origin = entry.mesh.origin();
     let m = &entry.mesh;
+    let origin: Vec3 = std::array::from_fn(|k| m.origin()[k] - anchor[k] - base[k]);
     let mut flat_pos = Vec::new();
     flat_pos
         .try_reserve(m.vertex_count().saturating_mul(3))
@@ -457,7 +506,10 @@ impl Scene {
             )?;
             Ok(sel.to_triangles(&entry.mesh))
         } else {
-            let (baked, baked_bvh) = baked_world_mesh(entry)?;
+            let baked = baked_in_place(entry)?;
+            let baked_bvh = Bvh::build(&baked, entry.bvh.options())?;
+            let at = baked.origin();
+            let center = std::array::from_fn(|k| world_center[k] - at[k]);
             let world_cone = match world_normal_cone {
                 Some((axis, max_angle_rad)) => {
                     let deg = (max_angle_rad.to_degrees() as f32).clamp(0.0, 180.0);
@@ -468,7 +520,7 @@ impl Scene {
             let sel = select_faces_in_sphere(
                 &baked,
                 Some(&baked_bvh),
-                vec3_to_f32(world_center, "sphere center overflows f32")?,
+                vec3_to_f32(center, "sphere center overflows f32")?,
                 world_radius as f32,
                 world_cone,
             )?;
@@ -495,7 +547,7 @@ impl Scene {
             let sel = select_by_crease_angle(&entry.mesh, &[seed_tri], max_deg)?;
             Ok(sel.to_triangles(&entry.mesh))
         } else {
-            let (baked, _) = baked_world_mesh(entry)?;
+            let baked = baked_in_place(entry)?;
             let sel = select_by_crease_angle(&baked, &[seed_tri], max_deg)?;
             Ok(sel.to_triangles(&entry.mesh))
         }
@@ -532,7 +584,7 @@ impl Scene {
             let sel = select_small_face_islands(&entry.mesh, max_face_count, local_max_area)?;
             Ok(sel.to_triangles(&entry.mesh))
         } else {
-            let (baked, _) = baked_world_mesh(entry)?;
+            let baked = baked_in_place(entry)?;
             let area = max_area.map_or(f32::MAX, |a| a as f32);
             let sel = select_small_face_islands(&baked, max_face_count, area)?;
             Ok(sel.to_triangles(&entry.mesh))
@@ -832,11 +884,10 @@ impl Scene {
         kind: Option<PrimitiveKind>,
         options: &FitPrimitiveOptions,
     ) -> Result<FitPrimitiveReport> {
-        let entry = self.entry(id)?;
-        let (world_mesh, _) = baked_world_mesh(entry)?;
+        let placed = baked_in_place(self.entry(id)?)?;
         let tri_subset = subset_tris.filter(|s| !s.is_empty());
         Ok(fit_primitive_mesh(
-            &world_mesh,
+            &placed,
             tri_subset,
             kind.unwrap_or(PrimitiveKind::Auto),
             options,
@@ -879,10 +930,10 @@ impl Scene {
         normal: Vec3,
     ) -> Result<ContourSlice> {
         let entry = self.entry(id)?;
-        let o32 = vec3_to_f32(origin, "contour slice origin must be finite")?;
-        let n32 = vec3_to_f32(normal, "contour slice normal must be finite")?;
-        let (world_mesh, _) = baked_world_mesh(entry)?;
-        Ok(slice_contours(&world_mesh, o32, n32)?)
+        finite_vec3(origin, "contour slice origin must be finite")?;
+        finite_vec3(normal, "contour slice normal must be finite")?;
+        let placed = baked_in_place(entry)?;
+        Ok(slice_contours(&placed, origin, normal)?)
     }
 
     /// Slices `count` parallel contour layers starting at `(origin, normal)` separated by world `spacing`.
@@ -895,18 +946,18 @@ impl Scene {
         count: usize,
     ) -> Result<Vec<ContourSlice>> {
         let entry = self.entry(id)?;
-        let o32 = vec3_to_f32(origin, "contour slice origin must be finite")?;
-        let n32 = vec3_to_f32(normal, "contour slice normal must be finite")?;
+        finite_vec3(origin, "contour slice origin must be finite")?;
+        finite_vec3(normal, "contour slice normal must be finite")?;
         if !spacing.is_finite() {
             return Err(SceneError::Ops(OpsError::InvalidInput(
                 "contour stack spacing must be finite",
             )));
         }
-        let (world_mesh, _) = baked_world_mesh(entry)?;
+        let placed = baked_in_place(entry)?;
         Ok(slice_contour_stack(
-            &world_mesh,
-            o32,
-            n32,
+            &placed,
+            origin,
+            normal,
             spacing as f32,
             count,
         )?)
@@ -917,14 +968,38 @@ impl Scene {
     /// The new mesh is added as one undo step (an undoable add, see
     /// [`MeshOptions::undoable`]): undo removes it again and redo brings it
     /// back under the same id.
+    ///
+    /// The cloud's positions are `f32` world coordinates, which far from the
+    /// world origin hold points only to their steps there (0.008 at 1e5): for
+    /// one there, see [`Scene::reconstruct_point_cloud_at`].
     pub fn reconstruct_point_cloud(
         &mut self,
         cloud: &PointCloud,
         options: &SurfaceReconstructOptions,
     ) -> Result<MeshId> {
+        self.reconstruct_point_cloud_at(cloud, [0.0; 3], options)
+    }
+
+    /// [`Scene::reconstruct_point_cloud`] of a cloud whose positions are
+    /// relative to the world point `origin`, in `f64`: a point near them, so
+    /// that `f32` holds them precisely wherever that is. It is the origin of
+    /// the new mesh. See
+    /// [`PointCloud::parse_xyz_centered`](fast_mesh_ops::inspect::PointCloud::parse_xyz_centered)
+    /// and its like for files.
+    ///
+    /// # Errors
+    /// As for [`Scene::reconstruct_point_cloud`], and for an `origin` that is
+    /// not finite.
+    pub fn reconstruct_point_cloud_at(
+        &mut self,
+        cloud: &PointCloud,
+        origin: Vec3,
+        options: &SurfaceReconstructOptions,
+    ) -> Result<MeshId> {
+        finite_vec3(origin, "point cloud origin must be finite")?;
         let mesh = reconstruct_surface(cloud, options)?;
         self.add_mesh(
-            mesh,
+            mesh.with_origin(origin)?,
             MeshOptions {
                 undoable: true,
                 ..MeshOptions::default()
@@ -1063,6 +1138,12 @@ impl Scene {
     /// undoable step. Returns `(report, Some(new_id))` in `PlaceMode::KeepSeparate` (undo removes
     /// the new mesh, redo brings it back under the same id) or `(report, None)` for CSG / shell
     /// merge modes.
+    ///
+    /// The zero of the stamp's own coordinates (its `f64` origin plus its positions) goes to the
+    /// hit point; of its placement, only the scale counts. A stamp more than 4096 times its size
+    /// away from that zero, such as one modelled far from the world origin, stands on the hit
+    /// point with the middle of its underside (the side of its bounds away from
+    /// `params.up_axis`). [`Scene::place_mesh_anchored`] takes the point.
     pub fn place_mesh_world(
         &mut self,
         target: MeshId,
@@ -1071,18 +1152,56 @@ impl Scene {
         hit_normal_world: Vec3,
         params: &PlaceMeshParams,
     ) -> Result<(PlaceMeshReport, Option<MeshId>)> {
+        self.entry(target)?;
+        let anchor = default_stamp_anchor(&self.entry(stamp)?.mesh, params.up_axis);
+        self.place_mesh_anchored(
+            target,
+            stamp,
+            anchor,
+            hit_point_world,
+            hit_normal_world,
+            params,
+        )
+    }
+
+    /// [`Scene::place_mesh_world`] with the point of the stamp that goes to the hit point:
+    /// `stamp_anchor`, in the stamp's own coordinates (its `f64` origin plus its positions, not
+    /// placed).
+    ///
+    /// # Errors
+    /// As for [`Scene::place_mesh_world`], and for an anchor that is not finite.
+    pub fn place_mesh_anchored(
+        &mut self,
+        target: MeshId,
+        stamp: MeshId,
+        stamp_anchor: Vec3,
+        hit_point_world: Vec3,
+        hit_normal_world: Vec3,
+        params: &PlaceMeshParams,
+    ) -> Result<(PlaceMeshReport, Option<MeshId>)> {
         self.drop_field_unit();
         self.entry(target)?;
-        let (target_placement, target_origin, target_mode, target_tris, stamp_mesh) = {
+        finite_vec3(stamp_anchor, "stamp_anchor must be finite")?;
+        // Around its anchor, or on its own and far from that around itself.
+        let mut stamp_base = [0.0; 3];
+        let (target_placement, target_origin, target_mode, target_tris, stamp_mesh, stamp_scale) = {
             let t_entry = self.entry(target)?;
             let s_entry = self.entry(stamp)?;
-            let sm = stamp_mesh_with_scale_and_origin(s_entry)?;
+            let alone = params.mode == PlaceMode::KeepSeparate && !params.conform_to_surface;
+            if alone
+                && let Some(bounds) = triangle_bounds(&s_entry.mesh)
+                && is_stamp_far(&s_entry.mesh, bounds, stamp_anchor)
+            {
+                let o = s_entry.mesh.origin();
+                stamp_base = std::array::from_fn(|k| o[k] - stamp_anchor[k]);
+            }
             (
                 t_entry.placement,
                 t_entry.mesh.origin(),
                 t_entry.mode,
                 t_entry.mesh.triangle_count(),
-                sm,
+                stamp_around(s_entry, stamp_anchor, stamp_base)?,
+                s_entry.placement.scale,
             )
         };
 
@@ -1095,13 +1214,15 @@ impl Scene {
             ..*params
         };
         let mut world_transform = compute_place_transform(&world_params)?;
-        for (t, h) in world_transform
-            .rigid
-            .translation
-            .iter_mut()
-            .zip(hit_point_world)
-        {
-            *t += h;
+        // The anchor and the base, scaled like the stamp, from the hit point.
+        let turned = |p: Vec3| {
+            let scaled = std::array::from_fn(|k| world_transform.scale * stamp_scale[k] * p[k]);
+            mat3_vec3(world_transform.rigid.rotation, scaled)
+        };
+        let (anchor_offset, base_offset) = (turned(stamp_anchor), turned(stamp_base));
+        let placed_origin: Vec3 = std::array::from_fn(|k| hit_point_world[k] + base_offset[k]);
+        for (k, t) in world_transform.rigid.translation.iter_mut().enumerate() {
+            *t += hit_point_world[k] - anchor_offset[k];
         }
 
         if params.mode == PlaceMode::KeepSeparate {
@@ -1122,7 +1243,7 @@ impl Scene {
             report.transform = world_transform;
             let placed = report.placed_mesh.take().ok_or(SceneError::Corrupted)?;
             let new_id = self.add_mesh(
-                placed.with_origin(hit_point_world)?,
+                placed.with_origin(placed_origin)?,
                 MeshOptions {
                     placement: Placement::IDENTITY,
                     mode: target_mode,

@@ -194,7 +194,7 @@ impl CurveSurface {
     /// landed on another one touching it there. When there are several, it is
     /// the one the first point landed on, or else the one with the smallest
     /// triangle id among those at the first point. `query` is the mesh the
-    /// points were projected on (`mesh`, or a copy of it in world coordinates
+    /// points were projected on (`mesh`, or a copy of it as placed in the world,
     /// with the same triangles).
     ///
     /// # Errors

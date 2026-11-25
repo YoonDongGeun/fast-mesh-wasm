@@ -3,7 +3,7 @@
 use std::f64::consts::FRAC_PI_2;
 
 use fast_mesh_query::Rigid;
-use fast_mesh_store::{Mesh, TriangleId};
+use fast_mesh_store::{Mesh, TriangleId, VertexId};
 
 use crate::align::jacobi_eigen_3x3;
 use crate::error::{OpsError, Result};
@@ -66,6 +66,20 @@ pub enum FittedPrimitive {
     },
 }
 
+impl FittedPrimitive {
+    /// The primitive moved by `by`.
+    fn moved(mut self, by: [f64; 3]) -> Self {
+        let point = match &mut self {
+            Self::Plane { origin, .. } => origin,
+            Self::Sphere { center, .. } => center,
+            Self::Cylinder { axis_origin, .. } => axis_origin,
+            Self::Cone { apex, .. } => apex,
+        };
+        *point = add(*point, by);
+        self
+    }
+}
+
 /// Configuration options for RANSAC outlier rejection and nonlinear refinement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FitPrimitiveOptions {
@@ -114,6 +128,10 @@ pub struct FitPrimitiveReport {
 }
 
 /// Fit an analytical primitive to a slice of 3D points (and optional normals).
+///
+/// The points are `f32`, which far from zero holds them only to its steps there (0.008 at 1e5).
+/// Subtract a common point from them in `f64` first and add it to the primitive after, as
+/// [`fit_primitive_mesh`] does with [`Mesh::origin`].
 pub fn fit_primitive_points(
     points: &[[f32; 3]],
     normals: Option<&[[f32; 3]]>,
@@ -163,6 +181,9 @@ pub fn fit_primitive_points(
 }
 
 /// Fit an analytical primitive to vertices of a mesh (all alive vertices or selected triangles).
+///
+/// Fitted around [`Mesh::origin`], so the primitive, in world coordinates, is as precise far from
+/// the world origin as near it.
 pub fn fit_primitive_mesh(
     mesh: &Mesh,
     triangles: Option<&[TriangleId]>,
@@ -178,6 +199,7 @@ pub fn fit_primitive_mesh(
     allocation_allowed()?;
     let mut selected = filled(v_slots, false)?;
     let mut accum_nrm = filled(v_slots, [0.0f64; 3])?;
+    let position = |v: VertexId| mesh.position(v).map(|p| p.map(f64::from));
 
     match triangles {
         Some(tri_ids) => {
@@ -193,11 +215,7 @@ pub fn fit_primitive_mesh(
                 selected[a as usize] = true;
                 selected[b as usize] = true;
                 selected[c as usize] = true;
-                let (Some(pa), Some(pb), Some(pc)) = (
-                    mesh.world_position(a),
-                    mesh.world_position(b),
-                    mesh.world_position(c),
-                ) else {
+                let (Some(pa), Some(pb), Some(pc)) = (position(a), position(b), position(c)) else {
                     return Err(OpsError::InvalidInput("triangle references dead vertex"));
                 };
                 let area_n = cross(sub(pb, pa), sub(pc, pa));
@@ -212,11 +230,7 @@ pub fn fit_primitive_mesh(
                 let Some([a, b, c]) = mesh.triangle(tid) else {
                     continue;
                 };
-                let (Some(pa), Some(pb), Some(pc)) = (
-                    mesh.world_position(a),
-                    mesh.world_position(b),
-                    mesh.world_position(c),
-                ) else {
+                let (Some(pa), Some(pb), Some(pc)) = (position(a), position(b), position(c)) else {
                     continue;
                 };
                 let area_n = cross(sub(pb, pa), sub(pc, pa));
@@ -225,8 +239,7 @@ pub fn fit_primitive_mesh(
                 accum_nrm[c as usize] = add(accum_nrm[c as usize], area_n);
             }
             for (vi, flag) in selected.iter_mut().enumerate() {
-                let vid = vi as fast_mesh_store::VertexId;
-                if mesh.is_vertex_alive(vid) {
+                if mesh.is_vertex_alive(vi as VertexId) {
                     *flag = true;
                 }
             }
@@ -241,8 +254,7 @@ pub fn fit_primitive_mesh(
         if !is_sel {
             continue;
         }
-        let vid = vi as fast_mesh_store::VertexId;
-        let Some(p) = mesh.world_position(vid) else {
+        let Some(p) = position(vi as VertexId) else {
             continue;
         };
         if !p.iter().all(|c| c.is_finite()) {
@@ -277,7 +289,7 @@ pub fn fit_primitive_mesh(
     }
 
     Ok(FitPrimitiveReport {
-        primitive: report.primitive,
+        primitive: report.primitive.moved(mesh.origin()),
         rms_error: report.rms_error,
         max_error: report.max_error,
         inlier_count: report.inlier_count,

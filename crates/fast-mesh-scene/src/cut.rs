@@ -13,11 +13,12 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
+use fast_mesh_bvh::Bvh;
 use fast_mesh_query::{ClosestOptions, closest_point};
 use fast_mesh_store::{StoreError, Transaction, TriangleId, VertexId};
 
+use crate::baked::baked_in_place;
 use crate::curve_surface::{CurvePoint, CurveSurface, Fans, distinct};
-use crate::fields::baked_world_mesh;
 use crate::ops::{CutOptions as OpsCutOptions, cut_by_plane as ops_cut_by_plane};
 use crate::placement::{local_to_world, world_to_local};
 use crate::{MeshId, MeshOptions, Plane, Result, Scene, SceneError};
@@ -245,10 +246,14 @@ impl Scene {
                 return Err(SceneError::InvalidInput("mesh has no triangles to trim"));
             }
             // The nearest point is the world's: found on the mesh itself under
-            // a uniform scale, else on its world copy.
+            // a uniform scale, else on a copy of it as placed.
             let baked = match entry.placement.uniform_scale() {
                 Some(_) => None,
-                None => Some(baked_world_mesh(entry)?),
+                None => {
+                    let copy = baked_in_place(entry)?;
+                    let bvh = Bvh::build(&copy, entry.bvh.options())?;
+                    Some((copy, bvh))
+                }
             };
             let query = match &baked {
                 Some((mesh, bvh)) => (mesh, bvh),
@@ -259,7 +264,10 @@ impl Scene {
                 let local = world_to_local(&entry.placement, entry.mesh.origin(), world_pt)
                     .map(|c| c as f32);
                 let at = match &baked {
-                    Some(_) => world_pt.map(|c| c as f32),
+                    Some((copy, _)) => {
+                        let o = copy.origin();
+                        std::array::from_fn(|k| (world_pt[k] - o[k]) as f32)
+                    }
                     None => local,
                 };
                 let hit = closest_point(query.0, query.1, at, &ClosestOptions::default())?.ok_or(

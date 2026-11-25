@@ -1721,9 +1721,7 @@ impl WasmScene {
             .shortest_surface_path(id, distances, sources, target_vertex, &mut path)?;
         let mut out = Vec::with_capacity(path.len() * 7);
         for pt in path {
-            out.push(f64::from(pt.position[0]));
-            out.push(f64::from(pt.position[1]));
-            out.push(f64::from(pt.position[2]));
+            out.extend(pt.position);
             out.push(f64::from(pt.triangle));
             out.push(f64::from(pt.barycentric[0]));
             out.push(f64::from(pt.barycentric[1]));

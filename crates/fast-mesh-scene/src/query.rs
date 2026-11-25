@@ -13,15 +13,13 @@
 //! something in.
 
 use fast_mesh_bvh::{Aabb, Bvh};
-pub use fast_mesh_query::SurfacePathPoint;
 use fast_mesh_query::{
     ClosestHit, ClosestOptions, Cull, Ray, RayHit, RayOptions, Rigid,
     shortest_surface_path as query_shortest_surface_path,
 };
 use fast_mesh_store::{Mesh, StoreError, TriangleId};
 
-use crate::baked::baked_mesh;
-use crate::fields::baked_world_mesh;
+use crate::baked::{baked_in_place, baked_mesh};
 use crate::placement::{is_relative_rigid, local_to_world, relative_rigid, world_to_local};
 use crate::scene::Entry;
 use crate::{MeshId, Placement, Result, Scene, SceneError};
@@ -302,6 +300,17 @@ pub struct SceneMeshDistance {
     pub triangle_a: TriangleId,
     /// The triangle of B that `point_b` lies on.
     pub triangle_b: TriangleId,
+}
+
+/// A point of a path along a mesh, from [`Scene::shortest_surface_path`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneSurfacePathPoint {
+    /// Where it is in the world.
+    pub position: [f64; 3],
+    /// The triangle it lies on.
+    pub triangle: TriangleId,
+    /// Its barycentric coordinates there: not negative, with the sum 1.
+    pub barycentric: [f32; 3],
 }
 
 impl Scene {
@@ -1074,53 +1083,52 @@ impl Scene {
     /// `target_vertex` following gradient descent on `distances` (such as
     /// computed by [`Scene::geodesic_distances`]).
     ///
-    /// Appends [`SurfacePathPoint`] samples ordered from the reached source to
-    /// `target_vertex`, with `position` mapped into world space. Does not
-    /// modify the scene or its history.
+    /// Appends the path's points, ordered from the reached source to `target_vertex`.
+    /// Does not modify the scene or its history.
     pub fn shortest_surface_path(
         &self,
         id: MeshId,
         distances: &[f32],
         sources: &[u32],
         target_vertex: u32,
-        out: &mut Vec<SurfacePathPoint>,
+        out: &mut Vec<SceneSurfacePathPoint>,
     ) -> Result<()> {
         let entry = self.entry(id)?;
-        let orig_len = out.len();
-        if let Some(s) = entry.placement.uniform_scale() {
-            if s == 1.0 {
-                query_shortest_surface_path(&entry.mesh, distances, sources, target_vertex, out)?;
-            } else {
-                let mut local_dist = Vec::new();
-                local_dist
-                    .try_reserve_exact(distances.len())
-                    .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
-                for &d in distances {
-                    let scaled = if d.is_finite() && d >= 0.0 {
-                        (f64::from(d) / s) as f32
-                    } else {
-                        d
-                    };
-                    local_dist.push(scaled);
-                }
-                query_shortest_surface_path(&entry.mesh, &local_dist, sources, target_vertex, out)?;
+        let mut path = Vec::new();
+        let (placement, origin) = match entry.placement.uniform_scale() {
+            Some(s) => {
+                let scaled: Vec<f32>;
+                let distances = if s == 1.0 {
+                    distances
+                } else {
+                    let mut local = try_vec(distances.len())?;
+                    local.extend(distances.iter().map(|&d| {
+                        if d.is_finite() && d >= 0.0 {
+                            (f64::from(d) / s) as f32
+                        } else {
+                            d
+                        }
+                    }));
+                    scaled = local;
+                    &scaled
+                };
+                let mesh = &entry.mesh;
+                query_shortest_surface_path(mesh, distances, sources, target_vertex, &mut path)?;
+                (entry.placement, mesh.origin())
             }
-            let origin = entry.mesh.origin();
-            for pt in &mut out[orig_len..] {
-                let w = local_to_world(&entry.placement, origin, pt.position.map(f64::from));
-                pt.position = w.map(|c| c as f32);
+            None => {
+                let mesh = baked_in_place(entry)?;
+                query_shortest_surface_path(&mesh, distances, sources, target_vertex, &mut path)?;
+                (Placement::IDENTITY, mesh.origin())
             }
-            return Ok(());
-        }
-
-        let (baked, _) = baked_world_mesh(entry)?;
-        Ok(query_shortest_surface_path(
-            &baked,
-            distances,
-            sources,
-            target_vertex,
-            out,
-        )?)
+        };
+        out.try_reserve(path.len()).map_err(|_| oom())?;
+        out.extend(path.iter().map(|p| SceneSurfacePathPoint {
+            position: local_to_world(&placement, origin, p.position.map(f64::from)),
+            triangle: p.triangle,
+            barycentric: p.barycentric,
+        }));
+        Ok(())
     }
 }
 
@@ -2415,8 +2423,8 @@ pub(crate) mod tests {
             )
             .unwrap();
         for i in 0..3 {
-            assert!((f64::from(path[0].position[i]) - expected_start[i]).abs() < 1e-4);
-            assert!((f64::from(path.last().unwrap().position[i]) - expected_end[i]).abs() < 1e-4);
+            assert!((path[0].position[i] - expected_start[i]).abs() < 1e-4);
+            assert!((path.last().unwrap().position[i] - expected_end[i]).abs() < 1e-4);
         }
     }
 
