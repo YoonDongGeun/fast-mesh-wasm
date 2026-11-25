@@ -1507,7 +1507,7 @@ export interface PlaceMeshOptions {
   /**
    * The point of the stamp that goes to the hit point, in the stamp's own
    * coordinates: those it was added with, before its placement (of which only
-   * the scale counts). Defaults to their zero; for a stamp more than 4096
+   * the scale counts). Defaults to their zero; for a stamp more than 1024
    * times its size away from that, such as one modelled far from the world
    * origin, to the middle of its underside (the side of its bounds away from
    * `upAxis`).

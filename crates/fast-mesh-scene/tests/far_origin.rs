@@ -1298,6 +1298,25 @@ fn stamps_far_from_their_own_zero_stand_on_the_hit_point() {
 }
 
 #[test]
+fn stamps_near_their_own_zero_are_placed_by_it() {
+    let params = PlaceMeshParams {
+        mode: PlaceMode::KeepSeparate,
+        ..PlaceMeshParams::default()
+    };
+    let (up, zero) = (PlaceUpAxis::PosZ, Some([0.0; 3]));
+    // The stamp is 0.3 large: in reach of its zero up to 307.2 from it.
+    for (x, in_reach) in [(0.5, true), (300.0, true), (-300.0, true), (310.0, false)] {
+        let at = |s: &mut Scene| add_stamp_at(s, [x, 0.0, 0.0], up);
+        let by_default = placed_on_top(Pose::NEAR, at, None, &params);
+        let by_zero = placed_on_top(Pose::NEAR, at, zero, &params);
+        assert_eq!(by_default == by_zero, in_reach, "{x}");
+        let underside = placed_on_top(Pose::NEAR, at, Some([x, 0.0, 0.0]), &params);
+        let off_underside = off(&by_default, &underside, [0.0; 3]);
+        assert_eq!(off_underside < 1e-6, !in_reach, "{x}");
+    }
+}
+
+#[test]
 fn a_stamp_by_its_far_zero_keeps_local_precision() {
     let params = PlaceMeshParams {
         mode: PlaceMode::KeepSeparate,

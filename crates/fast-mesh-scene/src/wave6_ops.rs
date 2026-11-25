@@ -280,9 +280,9 @@ fn shrink_vertex_adjacent(mesh: &Mesh, sel: &FaceSelection, rings: usize) -> Res
     Ok(cur)
 }
 
-/// How many times its size a stamp may be from a point for `f32` to hold the
-/// stamp around it: to 1/4096 of that size.
-const STAMP_REACH: f64 = 4096.0;
+/// How many times its size a stamp may be from a point to be placed by it: so
+/// far from it `f32` still holds the stamp to 1/16384 of that size.
+const STAMP_REACH: f64 = 1024.0;
 
 /// The bounds of a mesh's live triangles in its local coordinates, with no
 /// triangle `None`.
@@ -326,8 +326,8 @@ fn default_stamp_anchor(stamp: &Mesh, up_axis: PlaceUpAxis) -> Vec3 {
     })
 }
 
-/// The stamp around `base`, a point given like `anchor` in its own
-/// coordinates but relative to that: scaled as placed, not turned or moved.
+/// The stamp around `anchor + base`, a point in its own coordinates: scaled as
+/// placed, not turned or moved.
 fn stamp_around(entry: &crate::scene::Entry, anchor: Vec3, base: Vec3) -> Result<Mesh> {
     let scale = entry.placement.scale;
     let m = &entry.mesh;
@@ -1140,7 +1140,7 @@ impl Scene {
     /// merge modes.
     ///
     /// The zero of the stamp's own coordinates (its `f64` origin plus its positions) goes to the
-    /// hit point; of its placement, only the scale counts. A stamp more than 4096 times its size
+    /// hit point; of its placement, only the scale counts. A stamp more than 1024 times its size
     /// away from that zero, such as one modelled far from the world origin, stands on the hit
     /// point with the middle of its underside (the side of its bounds away from
     /// `params.up_axis`). [`Scene::place_mesh_anchored`] takes the point.
@@ -1182,7 +1182,8 @@ impl Scene {
         self.drop_field_unit();
         self.entry(target)?;
         finite_vec3(stamp_anchor, "stamp_anchor must be finite")?;
-        // Around its anchor, or on its own and far from that around itself.
+        // Built around its anchor, or far from that and left alone around its
+        // own origin, where its positions are small.
         let mut stamp_base = [0.0; 3];
         let (target_placement, target_origin, target_mode, target_tris, stamp_mesh, stamp_scale) = {
             let t_entry = self.entry(target)?;
