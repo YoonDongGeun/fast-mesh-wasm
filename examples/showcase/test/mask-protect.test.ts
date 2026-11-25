@@ -34,6 +34,46 @@ function strip(n: number): { positions: number[]; indices: number[]; slots: numb
 /** The strip's slots at x < `x`. */
 const leftOf = (x: number) => Array.from({ length: 2 * x }, (_, i) => i);
 
+describe("the mask tracker's hooks", () => {
+  const cube = {
+    positions: [0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1],
+    indices: [
+      0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 0, 1, 5, 0, 5, 4, 2, 6, 7, 2, 7, 3, 0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6,
+    ],
+  };
+
+  it("keep_the_methods_of_the_domains", () => {
+    const scene = new Scene();
+    const store = createSceneStore(scene);
+    const mesh = scene.addMesh(Float64Array.from(cube.positions), Uint32Array.from(cube.indices));
+    scene.commitFrame();
+    const repair = scene.repair;
+    const names = (f: object) => Object.keys(f).sort();
+    const before = { repair: names(scene.repair), sculpt: names(scene.sculpt) };
+    expect(before.repair).toContain("selectFacesInSphere");
+
+    const tracker = new MaskLiveTracker(scene, store);
+    tracker.attach();
+    expect(scene.repair).not.toBe(repair);
+    expect({ repair: names(scene.repair), sculpt: names(scene.sculpt) }).toEqual(before);
+
+    // Reading tells the tracker nothing; editing does, like `scene.repair(mesh, op)`.
+    const version = tracker.topologyVersion(mesh);
+    expect(scene.repair.selectConnectedShell(mesh, 0)).toHaveLength(12);
+    expect(scene.repair.selectFacesInSphere(mesh, [0, 0, 0], 0.1).length).toBeGreaterThan(0);
+    expect(tracker.topologyVersion(mesh)).toBe(version);
+    expect(scene.repair.deleteSelectedFaces(mesh, Uint32Array.from([0])).removedTriangles).toBe(1);
+    const deleted = tracker.topologyVersion(mesh);
+    expect(deleted).toBeGreaterThan(version);
+    expect(scene.repair.weld(mesh, 0).mergedVertices).toBe(0);
+    expect(tracker.topologyVersion(mesh)).toBeGreaterThan(deleted);
+    expect(scene.repair(mesh, { op: "orient" }).flippedTriangles).toBe(0);
+
+    tracker.dispose();
+    expect(scene.repair).toBe(repair);
+  });
+});
+
 const inflateAt = (center: [number, number, number], radius: number): RepairOp => ({
   op: "inflate",
   center,

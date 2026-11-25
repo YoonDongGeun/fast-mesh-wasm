@@ -631,20 +631,60 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
   );
 }
 
+/** The methods of `scene.repair` and `scene.sculpt` that change no mesh they are given. */
+const READING_METHODS = new Set([
+  "analyze",
+  "selectFacesScreen",
+  "selectFacesInSphere",
+  "selectByCreaseAngle",
+  "selectConnectedShell",
+  "selectSmallFaceIslands",
+  "growFaceSelection",
+  "shrinkFaceSelection",
+  "fillSelectionHoles",
+  "smoothSelectionBoundary",
+  "faceSelectionToVertexMask",
+  "vertexMaskToFaceSelection",
+  "extractSelectedFaces",
+  "verticesInSphere",
+  "getDyntopo",
+]);
+
+/**
+ * Puts the methods of a callable domain (`scene.repair.weld`, ...) on the
+ * function standing in for it; `wrap` gets those that change a mesh, which do
+ * not go through the domain's own call.
+ */
+function carryMethods(domain: object, standIn: object, wrap: (name: string, orig: AnyMethod) => AnyMethod): void {
+  for (const [name, value] of Object.entries(domain)) {
+    const changes = typeof value === "function" && !READING_METHODS.has(name);
+    Object.defineProperty(standIn, name, {
+      value: changes ? wrap(name, value as AnyMethod) : value,
+      configurable: true,
+      enumerable: true,
+      writable: true,
+    });
+  }
+}
+
+type AnyMethod = (...args: unknown[]) => unknown;
+
 function hookMethod(
   target: object,
   key: string,
-  makeWrapper: (orig: (...args: unknown[]) => unknown) => (...args: unknown[]) => unknown,
+  makeWrapper: (orig: AnyMethod) => AnyMethod,
+  wrapMethod: (name: string, orig: AnyMethod) => AnyMethod,
 ): (() => void) | null {
   const rec = target as Record<string, unknown>;
   const fn = rec[key];
   if (typeof fn !== "function") {
     return null;
   }
-  const orig = fn as (...args: unknown[]) => unknown;
+  const orig = fn as AnyMethod;
   const existed = Object.prototype.hasOwnProperty.call(target, key);
   const prevDesc = Object.getOwnPropertyDescriptor(target, key);
   const wrapper = makeWrapper(orig);
+  carryMethods(orig, wrapper, wrapMethod);
   try {
     Object.defineProperty(target, key, {
       value: wrapper,
@@ -734,17 +774,7 @@ export class MaskLiveTracker {
     const cleanups: (() => void)[] = [];
     cleanups.push(this.#scene.onChanges((changes) => this.#onChanges(changes)));
 
-    const addHook = (target: object | null, key: string, wrap: (orig: (...args: unknown[]) => unknown) => (...args: unknown[]) => unknown) => {
-      if (target === null) {
-        return;
-      }
-      const unhook = hookMethod(target, key, wrap);
-      if (unhook !== null) {
-        cleanups.push(unhook);
-      }
-    };
-
-    const wrapGlobalMutation = (target: object, trackAsyncStatus: boolean) => (orig: (...args: unknown[]) => unknown) =>
+    const wrapGlobalMutation = (target: object, trackAsyncStatus: boolean) => (orig: AnyMethod): AnyMethod =>
       function (this: unknown, ...args: unknown[]): unknown {
         if (trackAsyncStatus) {
           tracker.#pendingAsyncHistory++;
@@ -770,7 +800,7 @@ export class MaskLiveTracker {
         }
       };
 
-    const wrapMeshMutation = (target: object) => (orig: (...args: unknown[]) => unknown) =>
+    const wrapMeshMutation = (target: object) => (orig: AnyMethod): AnyMethod =>
       function (this: unknown, ...args: unknown[]): unknown {
         const mesh = args[0] as MeshHandle | undefined;
         tracker.noteTopologyMutation(mesh);
@@ -784,7 +814,7 @@ export class MaskLiveTracker {
         return result;
       };
 
-    const wrapRepairOrSculpt = (target: object) => (orig: (...args: unknown[]) => unknown) =>
+    const wrapRepairOrSculpt = (target: object) => (orig: AnyMethod): AnyMethod =>
       function (this: unknown, ...args: unknown[]): unknown {
         const mesh = args[0] as MeshHandle | undefined;
         const op = args[1];
@@ -821,6 +851,19 @@ export class MaskLiveTracker {
       };
 
     const tracker = this;
+    const addHook = (target: object | null, key: string, wrap: (orig: AnyMethod) => AnyMethod) => {
+      if (target === null) {
+        return;
+      }
+      // A join takes a second mesh out of the scene.
+      const wrapMethod = (name: string, orig: AnyMethod) =>
+        name === "join" ? wrapGlobalMutation(target, false)(orig) : wrapMeshMutation(target)(orig);
+      const unhook = hookMethod(target, key, wrap, wrapMethod);
+      if (unhook !== null) {
+        cleanups.push(unhook);
+      }
+    };
+
     addHook(this.#scene, "undo", wrapGlobalMutation(this.#scene, false));
     addHook(this.#scene, "redo", wrapGlobalMutation(this.#scene, false));
     addHook(this.#scene, "cancelStep", wrapGlobalMutation(this.#scene, false));

@@ -27,6 +27,8 @@
 //   at softness 0 (the exact path), within four with softness (the filter
 //   sums in f32 on the GPU).
 // - select: a click on A in the canvas selects it.
+// - face-select: through the Select tab's panel on A, a box drag selects some
+//   faces, a shell click all of them, grow and clear work.
 // - multiselect: shift-clicking B adds it (the primary stays A), and the
 //   Repair panel seeds its Join source from the queue.
 // - drag: dragging the gizmo's centre handle moves A (one undo step).
@@ -559,6 +561,40 @@ try {
   await click(at.x, at.y);
   const selected = await waitFor(`__showcase.selected() === ${JSON.stringify(A)}`, 5000);
   verdict("select", selected === true, `clicked (${fmt(at.x)}, ${fmt(at.y)}); selected ${await hook("selected()")}`);
+
+  // ---- face-select: the face selection panel on A ----
+  const faces = () =>
+    page(`(() => { const el = document.querySelector("[data-select-readout]"); return el && [Number(el.dataset.selectCount), Number(el.dataset.selectTotal)]; })()`);
+  const facesWhen = async (extra) =>
+    (await waitFor(
+      `(() => { const el = document.querySelector("[data-select-readout]"); const n = Number(el.dataset.selectCount), total = Number(el.dataset.selectTotal); return ${extra} && [n, total]; })()`,
+      5000,
+    )) ?? (await faces());
+  await clickOn("[data-ribbon-tab=select]");
+  await clickOn("[data-select-tool=box]");
+  await mouse("mouseMoved", at.x - 30, at.y - 30, { button: "none" });
+  await mouse("mousePressed", at.x - 30, at.y - 30, { buttons: 1 });
+  for (let i = 1; i <= 6; i++) {
+    await mouse("mouseMoved", at.x - 30 + 10 * i, at.y - 30 + 10 * i, { buttons: 1 });
+    await sleep(16);
+  }
+  await mouse("mouseReleased", at.x + 30, at.y + 30, { buttons: 0 });
+  const boxed = await facesWhen("n > 0");
+  await clickOn("[data-select-action=grow]");
+  const grown = await facesWhen(`n > ${boxed[0]}`);
+  await clickOn("[data-select-action=clear]");
+  const cleared = await facesWhen("n === 0");
+  await clickOn("[data-select-tool=shell]");
+  await click(at.x, at.y);
+  const shell = await facesWhen("n === total && n > 0");
+  await clickOn("[data-select-action=clear]");
+  await clickOn("[data-select-tool=off]");
+  await clickOn("[data-ribbon-tab=home]");
+  verdict(
+    "face-select",
+    boxed[0] > 0 && boxed[0] < boxed[1] && grown[0] > boxed[0] && cleared[0] === 0 && shell[0] === shell[1] && shell[0] > 0,
+    `of ${boxed[1]} faces: box ${boxed[0]}, grown ${grown[0]}, cleared ${cleared[0]}, shell ${shell[0]}`,
+  );
 
   // ---- multiselect: shift-click B in the canvas ----
   const atB = await hook(`screenPoint(${JSON.stringify(B)})`);
