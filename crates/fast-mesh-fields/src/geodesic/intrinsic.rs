@@ -64,12 +64,19 @@ const FOOT: f64 = 0.1;
 const MANY: usize = 64;
 /// Triangles on the way to a circumcentre at most.
 const WALK: usize = 1000;
-/// Sides looked at, or vertices put in, per step.
+/// Sides looked at, and triangles that are too large, per step.
 const STEP: usize = 1 << 16;
+const LARGE_STEP: usize = 1 << 12;
 /// What is not there.
 const NONE: u32 = u32::MAX;
 
 const OOM: fn() -> FieldsError = || FieldsError::OutOfMemory;
+
+/// (The squares are far within the range of `f64`; the library function costs
+/// several times as much, and is not the same everywhere.)
+pub(super) fn hypot(x: f64, y: f64) -> f64 {
+    (x * x + y * y).sqrt()
+}
 
 /// A triangle laid out flat: side 0, from corner 0 to corner 1, along x from
 /// the origin, and corner 2 at `(x, y)`, `y > 0`.
@@ -97,7 +104,7 @@ impl Layout {
         let Layout { length, x, y } = self;
         match side {
             1 => {
-                let l = (x - length).hypot(y);
+                let l = hypot(x - length, y);
                 Layout {
                     length: l,
                     x: length * (length - x) / l,
@@ -105,7 +112,7 @@ impl Layout {
                 }
             }
             2 => {
-                let l = x.hypot(y);
+                let l = hypot(x, y);
                 Layout {
                     length: l,
                     x: (x * (x - length) + y * y) / l,
@@ -130,7 +137,7 @@ impl Layout {
 
     fn circumradius(self) -> f64 {
         let Layout { length, x, y } = self;
-        0.5 * (x - length).hypot(y) * x.hypot(y) / y
+        0.5 * hypot(x - length, y) * hypot(x, y) / y
     }
 
     fn circumcentre(self) -> [f64; 2] {
@@ -644,12 +651,12 @@ impl Intrinsic {
         Ok(())
     }
 
-    /// Puts in about [`STEP`] more; whether that was all.
+    /// Goes over up to [`LARGE_STEP`] of these; whether that was all.
     pub(super) fn refine(&mut self) -> Result<bool> {
         let Stage::Refine(size) = self.stage else {
             return Ok(true);
         };
-        for _ in 0..STEP / 16 {
+        for _ in 0..LARGE_STEP {
             while !self.settle(STEP)? {}
             while let Some(t) = self.changed.pop() {
                 self.consider(t, size)?;
@@ -919,7 +926,7 @@ impl Intrinsic {
         self.set_next(3 * o + 2, 3 * t + 2);
         self.triangles[t as usize] = [c, a, d];
         self.triangles[o as usize] = [d, b, c];
-        let ca = cx.hypot(cy);
+        let ca = hypot(cx, cy);
         self.set_layout(
             t as usize,
             Layout {
@@ -928,7 +935,7 @@ impl Intrinsic {
                 y: left / ca,
             },
         )?;
-        let db = (length - dx).hypot(dy);
+        let db = hypot(length - dx, dy);
         self.set_layout(
             o as usize,
             Layout {
@@ -1131,7 +1138,7 @@ impl Intrinsic {
                 _ => ([x, y], [0.0, 0.0]),
             };
             let e = [to[0] - from[0], to[1] - from[1]];
-            let l = e[0].hypot(e[1]);
+            let l = hypot(e[0], e[1]);
             let d = [at[0] - from[0], at[1] - from[1]];
             at = [
                 l - (d[0] * e[0] + d[1] * e[1]) / l,

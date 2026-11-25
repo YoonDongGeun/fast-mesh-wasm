@@ -7,7 +7,7 @@ use fast_mesh_store::{Mesh, par};
 
 use super::amg::{Amg, AmgBuild, Matrix, PAR_MIN_ROWS, Rows, Solve, sum_range};
 use super::diffuse::{Diffusion, Heat, Surface};
-use super::intrinsic::{Intrinsic, Layout, Survey, survey};
+use super::intrinsic::{Intrinsic, Layout, Survey, hypot, survey};
 use super::{GeodesicPhase, MeshState, validate_max_distance, validate_options};
 use crate::geom::{add, cross, dot, norm, scale, sub, triangle_normal, widen};
 use crate::grid::{allocation_allowed, filled, push, reserve, reserve_exact};
@@ -1312,7 +1312,7 @@ fn flat_divergence(layout: Layout, u: [f64; 3]) -> [f64; 3] {
     let Layout { length, x, y } = layout;
     let gx = (u[1] - u[0]) / length;
     let gy = (u[2] - u[0] - gx * x) / y;
-    let len = gx.hypot(gy);
+    let len = hypot(gx, gy);
     if !(len.is_finite() && len > 0.0) {
         return [0.0; 3];
     }
