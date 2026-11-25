@@ -15,7 +15,8 @@
 //!   [`raycast_all`] (every hit, sorted) and [`raycast_many`] (a batch). The
 //!   ray-triangle test is watertight: a ray through a shared edge or vertex
 //!   never slips between the triangles meeting there. Ties go to the smallest
-//!   triangle id.
+//!   triangle id. A [`RayGrid`] casts a regular grid of parallel rays (a depth
+//!   image) a tile at a time, several times faster than one by one.
 //! - Region queries: [`triangles_in`] and [`vertices_in`] find the triangles
 //!   that touch, or the vertices inside, a [`Region`] (a box or a sphere). The
 //!   box is an [`Aabb`], re-exported from `fast_mesh_bvh` so that callers need
@@ -55,6 +56,7 @@ mod pairs;
 mod plane;
 mod polylines;
 mod ray;
+mod ray_grid;
 mod region;
 mod rigid;
 mod section;
@@ -79,6 +81,7 @@ pub use pairs::*;
 pub use plane::Plane;
 pub use polylines::{PairSegment, Polyline, intersecting_segments, intersection_polylines};
 pub use ray::*;
+pub use ray_grid::{RAY_TILE, RayGrid, TileT};
 pub use region::*;
 pub use rigid::Rigid;
 pub use section::{Fill, Gap2, contour_gap, contour_length, fill, signed_area};

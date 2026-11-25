@@ -21,6 +21,10 @@ import type {
   IcpObjective,
   LandmarkAlignment,
   LandmarkPair,
+  LatticeOptions,
+  LatticePlan,
+  LatticePreview,
+  LatticeReport,
   MeshHandle,
   OffsetAlgorithm,
   OffsetReport,
@@ -43,6 +47,7 @@ import type { AppState, Item, OverlayBand, SurfaceColormap, SurfaceFieldState } 
 import { selectMesh } from "../features/select/ux/selection";
 import { liveVertexIds } from "../features/transform/ux/transform-math";
 import type { BooleanMethod, BooleanOptions, CsgNode, IsotropicRemeshOptions, SurfaceRemeshReport } from "fast-mesh-wasm";
+import type { Heightfield, PlacementInput, PrimitiveMesh } from "fast-mesh-wasm";
 import type { WrapOptions, WrapPlan, WrapResult } from "fast-mesh-wasm";
 import {
   batchBooleanTree,
@@ -52,6 +57,7 @@ import {
   localToWorld,
   remapCorners,
 } from "../features/mesh-edit/ux/batch-boolean";
+import { ensureWave6Wasm } from "./wave6-wasm-lazy";
 
 export type MirrorAxis = "x" | "y" | "z";
 export type BooleanOperation = BooleanOp;
@@ -60,6 +66,7 @@ export type CutKeepSide = "+" | "-";
 export type OffsetModeAlgorithm = "auto" | OffsetAlgorithm;
 
 export interface LiveMeshSnapshot {
+  /** Local positions, relative to {@link origin}: see {@link originPositions} to add them as a mesh. */
   positions: Float64Array;
   indices: Uint32Array;
   colors?: Uint8Array;
@@ -213,6 +220,32 @@ function applyPlacementToStore(store: SceneStore, mesh: MeshHandle, placement: P
 }
 
 /**
+ * The snapshot's positions with its origin added, as `addMesh` takes them:
+ * added with that same origin, the new mesh has the local positions and
+ * origin of the one the snapshot is of, so one placement puts both in the
+ * same place.
+ */
+function originPositions(snap: LiveMeshSnapshot): Float64Array {
+  const out = new Float64Array(snap.positions.length);
+  for (let k = 0; k < out.length; k++) {
+    out[k] = snap.positions[k] + snap.origin[k % 3];
+  }
+  return out;
+}
+
+/** The loaded-mesh fields of a snapshot: its geometry around its origin, and its size. */
+function loadedFromSnapshot(snap: LiveMeshSnapshot): Pick<LoadedMesh, "positions" | "indices" | "center" | "radius"> {
+  return { positions: originPositions(snap), indices: snap.indices, center: snap.origin, radius: snap.radius };
+}
+
+/** Adds the mesh a snapshot is of to a scratch scene, where it is in its own (its origin, placement and scale). */
+function addSnapshot(scratch: Scene, snap: LiveMeshSnapshot): MeshHandle {
+  const mesh = scratch.addMesh(originPositions(snap), snap.indices, { origin: snap.origin });
+  scratch.setPlacement(mesh, snap.placement);
+  return mesh;
+}
+
+/**
  * Clones an existing mesh's live geometry, attributes, and placement as
  * `"<name> copy"`, in one undo step (undo removes the copy).
  */
@@ -220,12 +253,9 @@ export function duplicateMesh(store: SceneStore, app: AppState, item: Item): Ite
   const snap = extractLiveMeshData(store.scene, item.mesh);
   const loaded: LoadedMesh = {
     name: `${item.name} copy`,
-    positions: snap.positions,
-    indices: snap.indices,
+    ...loadedFromSnapshot(snap),
     ...(snap.colors ? { colors: snap.colors } : {}),
     ...(snap.uvs ? { uvs: snap.uvs } : {}),
-    center: [0, 0, 0],
-    radius: snap.radius,
     volumeId: item.volumeId,
     preset: item.preset,
   };
@@ -426,12 +456,9 @@ export async function runBooleanCsg(params: {
           store,
           {
             name: `${target.name} ${label} ${source.name}`,
-            positions: snap.positions,
-            indices: snap.indices,
+            ...loadedFromSnapshot(snap),
             ...(snap.colors ? { colors: snap.colors } : {}),
             ...(snap.uvs ? { uvs: snap.uvs } : {}),
-            center: [0, 0, 0],
-            radius: snap.radius,
             volumeId: null,
             preset: null,
           },
@@ -463,21 +490,8 @@ export async function runBooleanCsg(params: {
   const { Scene } = await import("fast-mesh-wasm");
   const tmp = new Scene();
   try {
-    const tmpTarget = tmp.addMesh(targetSnap.positions, targetSnap.indices, { origin: [0, 0, 0] });
-    tmp.setPlacement(tmpTarget, {
-      rotation: [...targetSnap.placement.rotation],
-      translation: [...targetSnap.placement.translation],
-    });
-    const tmpSource =
-      source.mesh === target.mesh
-        ? tmpTarget
-        : tmp.addMesh(sourceSnap.positions, sourceSnap.indices, { origin: [0, 0, 0] });
-    if (tmpSource !== tmpTarget) {
-      tmp.setPlacement(tmpSource, {
-        rotation: [...sourceSnap.placement.rotation],
-        translation: [...sourceSnap.placement.translation],
-      });
-    }
+    const tmpTarget = addSnapshot(tmp, targetSnap);
+    const tmpSource = source.mesh === target.mesh ? tmpTarget : addSnapshot(tmp, sourceSnap);
     const outHandle = tmp.boolean(tmpTarget, tmpSource, op);
     const outSnap = extractLiveMeshData(tmp, outHandle);
 
@@ -487,10 +501,7 @@ export async function runBooleanCsg(params: {
           store,
           {
             name: `${target.name} ${label} ${source.name}`,
-            positions: outSnap.positions,
-            indices: outSnap.indices,
-            center: [0, 0, 0],
-            radius: outSnap.radius,
+            ...loadedFromSnapshot(outSnap),
             volumeId: null,
             preset: null,
           },
@@ -707,11 +718,7 @@ export async function runPlaneCut(params: {
   const { Scene } = await import("fast-mesh-wasm");
   const tmp = new Scene();
   try {
-    const tmpMesh = tmp.addMesh(snap.positions, snap.indices, { origin: [0, 0, 0] });
-    tmp.setPlacement(tmpMesh, {
-      rotation: [...snap.placement.rotation],
-      translation: [...snap.placement.translation],
-    });
+    const tmpMesh = addSnapshot(tmp, snap);
     const report = tmp.boolean.cut(tmpMesh, plane, { cap });
     const outSnap = extractLiveMeshData(tmp, report.kept);
     await replaceMeshGeometryLocal(store, mesh, outSnap.positions, outSnap.indices);
@@ -984,14 +991,47 @@ export async function planWrap(params: {
   return isWorkerScene(scene) ? scene.wrapPlan(meshes, params.options) : asSyncScene(scene).wrapPlan(meshes, params.options);
 }
 
+/** The voxel grid a lattice fill of `mesh` with `options` takes (#265), without running it. */
+export async function planLattice(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: LatticeOptions;
+}): Promise<LatticePlan> {
+  const { scene } = params.store;
+  return (isWorkerScene(scene) ? scene : asSyncScene(scene)).latticePlan(params.mesh, params.options);
+}
+
+/** The walls of that lattice on a coarse grid, in the mesh's local frame; the mesh stays as it is. */
+export async function previewLattice(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: LatticeOptions;
+}): Promise<LatticePreview> {
+  const { scene } = params.store;
+  return (isWorkerScene(scene) ? scene : asSyncScene(scene)).latticePreview(params.mesh, params.options);
+}
+
+/** Fills `mesh` with a lattice (#265): one undo step, on the Worker when the scene runs there. */
+export async function fillLattice(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: LatticeOptions;
+}): Promise<LatticeReport> {
+  const { store, mesh, options } = params;
+  const { scene } = store;
+  const r = await (isWorkerScene(scene) ? scene : asSyncScene(scene)).latticeFill(mesh, options);
+  store.commitFrame();
+  return r;
+}
+
 /** What a wrap action added: its list item, and the wrap's counts and grid. */
 export type WrapRunResult = { item: Item } & Omit<WrapResult, "mesh">;
 
 /**
  * Adds the closed envelope of `sources` (their world shapes) as a new mesh
  * named `name`, lists it and selects it. The sources stay as they are. The
- * engine fills the new mesh as one undo step (undo empties it), on the Worker
- * when the scene runs there, so the page stays live meanwhile.
+ * engine adds the mesh as one undo step (undo removes it), on the Worker when
+ * the scene runs there, so the page stays live meanwhile.
  */
 export async function runWrap(params: {
   store: SceneStore;
@@ -1006,6 +1046,42 @@ export async function runWrap(params: {
   const { mesh, ...counts } = isWorkerScene(scene)
     ? await scene.wrap(meshes, options)
     : asSyncScene(scene).wrap(meshes, options);
+  const item = app.adoptSceneMesh(store, mesh, name);
+  selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, item.mesh, false);
+  store.commitFrame();
+  return { item, ...counts };
+}
+
+/**
+ * The buffers of a relief of `field` (#267), generated where the engine runs:
+ * in the Worker scene's Worker, or on the main thread for the synchronous
+ * `Scene` (`?local`). The scene is not touched.
+ */
+export function generateRelief(scene: SceneLike, field: Heightfield): Promise<PrimitiveMesh> {
+  if (isWorkerScene(scene)) {
+    return scene.generateHeightfield(field);
+  }
+  return ensureWave6Wasm().then((m) => m.generateHeightfield(field));
+}
+
+/**
+ * Adds the relief of `field` (#267) as a new mesh named `name` at `placement`,
+ * lists it and selects it. The engine builds it, on the Worker when the scene
+ * runs there (only the heights cross), and adds it as one undo step: undo
+ * removes it.
+ */
+export async function runAddRelief(params: {
+  store: SceneStore;
+  app: AppState;
+  name: string;
+  field: Heightfield;
+  placement: PlacementInput;
+}): Promise<{ item: Item; vertices: number; triangles: number }> {
+  const { store, app, name, field, placement } = params;
+  const scene = store.scene;
+  const { mesh, ...counts } = isWorkerScene(scene)
+    ? await scene.addHeightfield(field, { placement })
+    : asSyncScene(scene).addHeightfield(field, { placement });
   const item = app.adoptSceneMesh(store, mesh, name);
   selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, item.mesh, false);
   store.commitFrame();
@@ -1345,11 +1421,7 @@ export async function applySurfaceField(params: {
   const { Scene } = await import("fast-mesh-wasm");
   const tmp = new Scene();
   try {
-    const tmpMesh = tmp.addMesh(snap.positions, snap.indices, { origin: [0, 0, 0] });
-    tmp.setPlacement(tmpMesh, {
-      rotation: [...snap.placement.rotation],
-      translation: [...snap.placement.translation],
-    });
+    const tmpMesh = addSnapshot(tmp, snap);
     const field =
       state.mode === "thickness"
         ? tmp.inspect.addThicknessField({ name: "inspect:thickness", on: tmpMesh, maxDistance: maxDist })

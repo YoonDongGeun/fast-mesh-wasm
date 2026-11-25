@@ -14,8 +14,9 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use fast_mesh_query::{ClosestOptions, closest_point};
-use fast_mesh_store::{Transaction, TriangleId, VertexId};
+use fast_mesh_store::{StoreError, Transaction, TriangleId, VertexId};
 
+use crate::curve_surface::{CurvePoint, CurveSurface, Fans, distinct};
 use crate::fields::baked_world_mesh;
 use crate::ops::{CutOptions as OpsCutOptions, cut_by_plane as ops_cut_by_plane};
 use crate::placement::{local_to_world, world_to_local};
@@ -49,13 +50,16 @@ pub struct CutReport {
 /// What polyline to trace and how to trim it in [`Scene::trim_by_curve`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrimCurveOptions {
-    /// World-space points defining the trim polyline. When `closed` is `true`,
-    /// a closing segment connects the last point back to the first.
+    /// World-space points defining the trim polyline, all on one component of
+    /// the mesh. When `closed` is `true`, a closing segment connects the last
+    /// point back to the first.
     pub points: Vec<[f64; 3]>,
-    /// Whether the polyline forms a closed loop whose enclosed side is removed.
+    /// Whether the polyline forms a closed loop, one side of which is removed
+    /// from the component it lies on.
     pub closed: bool,
-    /// When `closed` is `true`, removes the enclosed interior side (`true`) or
-    /// the surrounding exterior side (`false`). Ignored when `closed` is `false`.
+    /// When `closed` is `true`, removes the inside of the loop (`true`) or its
+    /// outside (`false`), as [`Scene::trim_by_curve`] tells them apart. Ignored
+    /// when `closed` is `false`.
     pub delete_inside: bool,
     /// World-space snap tolerance onto nearby mesh vertices (`>= 0.0`).
     pub snap_tolerance: f64,
@@ -73,12 +77,29 @@ impl Default for TrimCurveOptions {
 }
 
 /// Summary of what [`Scene::trim_by_curve`] changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Imprinting the curve replaces the triangles it crosses with smaller ones
+/// on the same surface; removing a side of a loop takes surface away. Either
+/// way the mesh has `triangles_added - triangles_removed` more triangles than
+/// before, so those two do not tell a cut from an imprint. `removed_area` and
+/// `cut_triangles` do: both are zero when the curve only imprinted (an open
+/// curve, or a loop that separates nothing, such as one around a torus's
+/// tube).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrimReport {
-    /// New live triangles remaining after splitting and trimming.
+    /// Triangles of the mesh now that it did not have before: the pieces left
+    /// of the triangles the curve split.
     pub triangles_added: usize,
-    /// Original live triangles that were split or trimmed away.
+    /// Triangles of the mesh before that it no longer has, replaced by the
+    /// imprint or cut away: `imprint_triangles + cut_triangles`.
     pub triangles_removed: usize,
+    /// Of those, the ones the imprint replaced with smaller triangles that all
+    /// stayed: none of their surface is gone.
+    pub imprint_triangles: usize,
+    /// Of those, the ones that lost surface, in whole or in part.
+    pub cut_triangles: usize,
+    /// The area of the surface taken away, in world units squared.
+    pub removed_area: f64,
     /// New live vertices created along the curve and seam splits.
     pub vertices_added: usize,
     /// Distinct undirected mesh edges forming the traced seam.
@@ -178,9 +199,8 @@ impl Scene {
     }
 
     /// Conformatively imprints a world-space polyline (`options.points`) onto
-    /// mesh `id`, optionally closing the loop and trimming away the interior
-    /// (`options.delete_inside == true`) or exterior side in a single undoable
-    /// edit step.
+    /// mesh `id`, and with `options.closed` removes one side of the loop, in a
+    /// single undoable edit step.
     ///
     /// Waypoints project onto the closest points on the mesh surface, subdivide
     /// triangles/shared edges conformally (interpolating vertex attributes via
@@ -188,50 +208,72 @@ impl Scene {
     /// fallback on sharp creases, and flood-fill non-seam edges to delete the
     /// selected side when `options.closed` is `true`.
     ///
+    /// Only the component the curve lies on is imprinted and cut; every other
+    /// one stays as it is. A component is a set of triangles joined through
+    /// shared edges; on a mesh with UVs an edge also joins across a seam (two
+    /// edges at exactly the same positions), so the islands of one surface are
+    /// one component, and the curve and the cut cross from one to the next,
+    /// splitting both sides of the seam. Split vertices on a mesh without UVs
+    /// are a real border between components: weld them first.
+    ///
+    /// All points must lie on one component: a curve with points on several
+    /// is refused. Where components touch or coincide, a point lies on each of
+    /// them (within a few `f32` steps of the mesh's largest coordinate). When
+    /// all points lie on several, the curve is on the one the first point
+    /// projects to, or else on the one with the smallest triangle id there.
+    ///
+    /// The inside of a loop is the side away from the component's open edges.
+    /// On a component with none (a closed one), or when every side reaches
+    /// one, it is the side with the smallest world area. A loop that
+    /// separates nothing, such as one around a torus's tube, removes nothing:
+    /// it is imprinted, and [`TrimReport::removed_area`] is zero.
+    ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] if `id` is stale, [`SceneError::InvalidInput`]
-    /// for non-finite inputs or fewer than 2 points (3 when `closed`), or
-    /// [`SceneError::StaleBvh`] under `UpdateMode::Manual` when stale.
+    /// for non-finite inputs or fewer than 2 points (3 when `closed`), or for a
+    /// curve with points on several components, and [`SceneError::StaleBvh`]
+    /// under `UpdateMode::Manual` when stale. A failed trim changes nothing.
     pub fn trim_by_curve(&mut self, id: MeshId, options: &TrimCurveOptions) -> Result<TrimReport> {
         self.drop_field_unit();
         validate_trim_options(options)?;
         self.entry(id)?;
         self.prepare(Some(&[id]))?;
 
-        let (waypoints_init, placement, origin, local_snap_tol) = {
+        let (points, surface, placement, origin, local_snap_tol) = {
             let entry = self.entry(id)?;
             if entry.mesh.triangle_count() == 0 {
                 return Err(SceneError::InvalidInput("mesh has no triangles to trim"));
             }
-            let uniform = entry.placement.uniform_scale();
-            let hits = if uniform.is_some() {
-                let mut hits = Vec::with_capacity(options.points.len());
-                for &world_pt in &options.points {
-                    let local = world_to_local(&entry.placement, entry.mesh.origin(), world_pt)
-                        .map(|c| c as f32);
-                    let hit =
-                        closest_point(&entry.mesh, &entry.bvh, local, &ClosestOptions::default())?
-                            .ok_or(SceneError::InvalidInput(
-                                "failed to project trim curve onto mesh",
-                            ))?;
-                    hits.push((hit.triangle, local, hit.barycentric));
-                }
-                hits
-            } else {
-                let (baked, baked_bvh) = baked_world_mesh(entry)?;
-                let mut hits = Vec::with_capacity(options.points.len());
-                for &world_pt in &options.points {
-                    let wp = world_pt.map(|c| c as f32);
-                    let hit = closest_point(&baked, &baked_bvh, wp, &ClosestOptions::default())?
-                        .ok_or(SceneError::InvalidInput(
-                            "failed to project trim curve onto mesh",
-                        ))?;
-                    let local = world_to_local(&entry.placement, entry.mesh.origin(), world_pt)
-                        .map(|c| c as f32);
-                    hits.push((hit.triangle, local, hit.barycentric));
-                }
-                hits
+            // The nearest point is the world's: found on the mesh itself under
+            // a uniform scale, else on its world copy.
+            let baked = match entry.placement.uniform_scale() {
+                Some(_) => None,
+                None => Some(baked_world_mesh(entry)?),
             };
+            let query = match &baked {
+                Some((mesh, bvh)) => (mesh, bvh),
+                None => (&entry.mesh, &entry.bvh),
+            };
+            let mut points = Vec::with_capacity(options.points.len());
+            for &world_pt in &options.points {
+                let local = world_to_local(&entry.placement, entry.mesh.origin(), world_pt)
+                    .map(|c| c as f32);
+                let at = match &baked {
+                    Some(_) => world_pt.map(|c| c as f32),
+                    None => local,
+                };
+                let hit = closest_point(query.0, query.1, at, &ClosestOptions::default())?.ok_or(
+                    SceneError::InvalidInput("failed to project trim curve onto mesh"),
+                )?;
+                points.push(CurvePoint {
+                    query: at,
+                    distance: hit.distance,
+                    local,
+                    triangle: hit.triangle,
+                    barycentric: hit.barycentric,
+                });
+            }
+            let surface = CurveSurface::locate(&entry.mesh, query, &mut points)?;
             let min_scale = entry.placement.scale[0]
                 .min(entry.placement.scale[1])
                 .min(entry.placement.scale[2]);
@@ -240,7 +282,8 @@ impl Scene {
             } else {
                 0.0
             };
-            (hits, entry.placement, entry.mesh.origin(), local_snap)
+            let origin = entry.mesh.origin();
+            (points, surface, entry.placement, origin, local_snap)
         };
 
         let closed = options.closed;
@@ -248,7 +291,8 @@ impl Scene {
         self.edit(id, move |tx| {
             run_trim_in_tx(
                 tx,
-                &waypoints_init,
+                &points,
+                surface,
                 closed,
                 delete_inside,
                 local_snap_tol,
@@ -289,15 +333,26 @@ fn edge_key(a: VertexId, b: VertexId) -> (VertexId, VertexId) {
     if a < b { (a, b) } else { (b, a) }
 }
 
+/// The component being trimmed: its triangles and the pieces they are split
+/// into, by logical id. A triangle the mesh had before keeps its own id, and
+/// pieces follow from `slots` on.
+///
+/// The curve is traced over roots: a vertex stands for every one welded to it
+/// (see [`Weld`](crate::curve_surface::Weld)), so an edge of roots has the
+/// triangles on both sides of a UV seam. Triangles keep their own vertices.
 struct TrimMesh<'a, 'b> {
     tx: &'a mut Transaction<'b>,
+    surface: CurveSurface,
+    /// `None` for a triangle that is gone or not part of the component.
     tris: Vec<Option<([VertexId; 3], TriangleId)>>,
-    orig_to_logical: Vec<Option<usize>>,
     children: HashMap<usize, Vec<usize>>,
-    edge_tris: HashMap<(VertexId, VertexId), Vec<usize>>,
-    vert_tris: HashMap<VertexId, Vec<usize>>,
+    /// The triangle of the mesh before that each piece is part of, from
+    /// logical id `slots` on.
+    piece_of: Vec<usize>,
+    /// The pieces at each root, ascending.
+    pieces_at: HashMap<VertexId, Vec<usize>>,
     new_verts: Vec<VertexId>,
-    init_logical_len: usize,
+    slots: usize,
     orig_tri_count: usize,
 }
 
@@ -310,39 +365,30 @@ struct SnapContext<'a> {
 }
 
 impl<'a, 'b> TrimMesh<'a, 'b> {
-    fn new(tx: &'a mut Transaction<'b>) -> Self {
+    fn new(
+        tx: &'a mut Transaction<'b>,
+        surface: CurveSurface,
+    ) -> std::result::Result<Self, SceneError> {
         let slots = tx.mesh().triangle_slots();
-        let mut tris = Vec::with_capacity(slots);
-        let mut orig_to_logical = vec![None; slots];
-        let mut edge_tris: HashMap<(VertexId, VertexId), Vec<usize>> = HashMap::new();
-        let mut vert_tris: HashMap<VertexId, Vec<usize>> = HashMap::new();
-
-        for (s, slot) in orig_to_logical.iter_mut().enumerate() {
-            let tid = s as TriangleId;
-            if let Some(verts) = tx.mesh().triangle(tid) {
-                let lt = tris.len();
-                tris.push(Some((verts, tid)));
-                *slot = Some(lt);
-                for k in 0..3 {
-                    let a = verts[k];
-                    let b = verts[(k + 1) % 3];
-                    edge_tris.entry(edge_key(a, b)).or_default().push(lt);
-                    vert_tris.entry(a).or_default().push(lt);
-                }
-            }
-        }
-        let init_logical_len = tris.len();
-        Self {
+        let mut tris = Vec::new();
+        tris.try_reserve(slots)
+            .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
+        tris.extend((0..slots as TriangleId).map(|t| {
+            let verts = tx.mesh().triangle(t).filter(|_| surface.contains(t))?;
+            Some((verts, t))
+        }));
+        let orig_tri_count = tris.iter().flatten().count();
+        Ok(Self {
             tx,
+            surface,
             tris,
-            orig_to_logical,
             children: HashMap::new(),
-            edge_tris,
-            vert_tris,
+            piece_of: Vec::new(),
+            pieces_at: HashMap::new(),
             new_verts: Vec::new(),
-            init_logical_len,
-            orig_tri_count: init_logical_len,
-        }
+            slots,
+            orig_tri_count,
+        })
     }
 
     #[inline]
@@ -351,29 +397,41 @@ impl<'a, 'b> TrimMesh<'a, 'b> {
     }
 
     #[inline]
-    fn has_edge(&self, a: VertexId, b: VertexId) -> bool {
-        self.edge_tris
-            .get(&edge_key(a, b))
-            .is_some_and(|list| !list.is_empty())
+    fn roots(&self, verts: [VertexId; 3]) -> [VertexId; 3] {
+        verts.map(|v| self.surface.weld.root(v))
     }
 
-    fn detach_logical(&mut self, lt: usize) -> Option<([VertexId; 3], TriangleId)> {
-        let (verts, store_id) = self.tris[lt].take()?;
-        for k in 0..3 {
-            let a = verts[k];
-            let b = verts[(k + 1) % 3];
-            let key = edge_key(a, b);
-            if let Some(list) = self.edge_tris.get_mut(&key) {
-                list.retain(|&id| id != lt);
-                if list.is_empty() {
-                    self.edge_tris.remove(&key);
-                }
-            }
-            if let Some(list) = self.vert_tris.get_mut(&a) {
-                list.retain(|&id| id != lt);
-            }
+    /// The live triangles at root `r`, ascending, with their roots.
+    fn fan(&self, r: VertexId) -> impl Iterator<Item = (usize, [VertexId; 3])> {
+        let originals = self.surface.fans.around(r);
+        let pieces = self.pieces_at.get(&r).into_iter().flatten();
+        originals
+            .iter()
+            .map(|&t| t as usize)
+            .chain(pieces.copied())
+            .filter_map(|lt| {
+                let (verts, _) = self.tris[lt]?;
+                Some((lt, self.roots(verts)))
+            })
+    }
+
+    /// The live triangles using the edge of roots `a`-`b`, ascending.
+    fn edge_tris(&self, a: VertexId, b: VertexId) -> impl Iterator<Item = usize> {
+        self.fan(a)
+            .filter_map(move |(lt, roots)| roots.contains(&b).then_some(lt))
+    }
+
+    #[inline]
+    fn has_edge(&self, a: VertexId, b: VertexId) -> bool {
+        self.edge_tris(a, b).next().is_some()
+    }
+
+    /// The triangle of the mesh before that `lt` is, or is a piece of.
+    fn original(&self, lt: usize) -> usize {
+        match lt.checked_sub(self.slots) {
+            Some(piece) => self.piece_of[piece],
+            None => lt,
         }
-        Some((verts, store_id))
     }
 
     fn push_child(
@@ -384,16 +442,16 @@ impl<'a, 'b> TrimMesh<'a, 'b> {
         let store_id = self.tx.add_triangles(&[verts])?[0];
         let lt = self.tris.len();
         self.tris.push(Some((verts, store_id)));
-        for k in 0..3 {
-            let a = verts[k];
-            let b = verts[(k + 1) % 3];
-            self.edge_tris.entry(edge_key(a, b)).or_default().push(lt);
-            self.vert_tris.entry(a).or_default().push(lt);
+        self.piece_of.push(self.original(parent_lt));
+        for r in distinct(self.roots(verts)) {
+            self.pieces_at.entry(r).or_default().push(lt);
         }
         self.children.entry(parent_lt).or_default().push(lt);
         Ok(lt)
     }
 
+    /// Splits the edge of roots `a`-`b` at `t` from `a`, for every triangle
+    /// using it: one new vertex on each side of a UV seam. Returns their root.
     fn split_edge(
         &mut self,
         a: VertexId,
@@ -413,27 +471,50 @@ impl<'a, 'b> TrimMesh<'a, 'b> {
             return Ok(snap_v);
         }
 
-        let new_v = self.tx.add_vertex_with_parents(
-            p.map(|c| c as f32),
-            &[(a, (1.0 - t) as f32), (b, t as f32)],
-        )?;
-        self.new_verts.push(new_v);
-
-        let incident = self
-            .edge_tris
-            .get(&edge_key(a, b))
-            .cloned()
-            .unwrap_or_default();
-        for lt in incident {
-            let Some((verts, store_id)) = self.detach_logical(lt) else {
-                continue;
+        // The new vertices, each with the edge's own ends it lies between.
+        let mut made: Vec<([VertexId; 2], VertexId)> = Vec::new();
+        let mut incident: Vec<usize> = self.edge_tris(a, b).collect();
+        let mut next = 0;
+        while let Some(&lt) = incident.get(next) {
+            next += 1;
+            let (verts, store_id) = self.tris[lt].ok_or(SceneError::Corrupted)?;
+            let end = |root: VertexId| {
+                verts
+                    .into_iter()
+                    .find(|&v| self.surface.weld.root(v) == root)
             };
+            let (Some(va), Some(vb)) = (end(a), end(b)) else {
+                return Err(SceneError::Corrupted);
+            };
+            let mid = match made.iter().find(|(ends, _)| *ends == [va, vb]) {
+                Some(&(_, mid)) => mid,
+                None => {
+                    let mid = self.tx.add_vertex_with_parents(
+                        p.map(|c| c as f32),
+                        &[(va, (1.0 - t) as f32), (vb, t as f32)],
+                    )?;
+                    self.new_verts.push(mid);
+                    let root = made.first().map_or(mid, |&(_, first)| first);
+                    self.surface.weld.join(mid, root);
+                    made.push(([va, vb], mid));
+                    mid
+                }
+            };
+            self.tris[lt] = None;
             self.tx.remove_triangles(&[store_id])?;
-            let (x, y, z) = orient_edge_in_triangle(verts, a, b);
-            self.push_child(lt, [x, new_v, z])?;
-            self.push_child(lt, [new_v, y, z])?;
+            let (x, y, z) = orient_edge_in_triangle(verts, va, vb);
+            for piece in [[x, mid, z], [mid, y, z]] {
+                let child = self.push_child(lt, piece)?;
+                // A triangle with two corners at one end has the edge twice.
+                let roots = self.roots(piece);
+                if roots.contains(&a) && roots.contains(&b) {
+                    incident.push(child);
+                }
+            }
         }
-        Ok(new_v)
+        made.first()
+            .map(|&(_, root)| root)
+            .ok_or(SceneError::Corrupted)
     }
 
     fn split_triangle_interior(
@@ -442,7 +523,9 @@ impl<'a, 'b> TrimMesh<'a, 'b> {
         bary: [f64; 3],
         snap: SnapContext<'_>,
     ) -> std::result::Result<VertexId, SceneError> {
-        let [v0, v1, v2] = self.tris[lt].ok_or(SceneError::Corrupted)?.0;
+        let (verts, store_id) = self.tris[lt].ok_or(SceneError::Corrupted)?;
+        let [v0, v1, v2] = verts;
+        let [r0, r1, r2] = self.roots(verts);
         let ps = [self.pos(v0), self.pos(v1), self.pos(v2)];
         let sum = (bary[0] + bary[1] + bary[2]).max(1e-30);
         let w = [
@@ -455,20 +538,20 @@ impl<'a, 'b> TrimMesh<'a, 'b> {
             ps[0][1] * w[0] + ps[1][1] * w[1] + ps[2][1] * w[2],
             ps[0][2] * w[0] + ps[1][2] * w[1] + ps[2][2] * w[2],
         ];
-        if let Some(snap_v) = check_vertex_snap(&[v0, v1, v2], &ps, p, &w, 1e-5, snap) {
+        if let Some(snap_v) = check_vertex_snap(&[r0, r1, r2], &ps, p, &w, 1e-5, snap) {
             return Ok(snap_v);
         }
 
         // If the point lies on one of the triangle edges, split the edge conformally.
         let edge_eps = 1e-5;
         if w[2] <= edge_eps && w[0] + w[1] > 1e-12 {
-            return self.split_edge(v0, v1, w[1] / (w[0] + w[1]), snap);
+            return self.split_edge(r0, r1, w[1] / (w[0] + w[1]), snap);
         }
         if w[0] <= edge_eps && w[1] + w[2] > 1e-12 {
-            return self.split_edge(v1, v2, w[2] / (w[1] + w[2]), snap);
+            return self.split_edge(r1, r2, w[2] / (w[1] + w[2]), snap);
         }
         if w[1] <= edge_eps && w[2] + w[0] > 1e-12 {
-            return self.split_edge(v2, v0, w[0] / (w[2] + w[0]), snap);
+            return self.split_edge(r2, r0, w[0] / (w[2] + w[0]), snap);
         }
 
         let new_v = self.tx.add_vertex_with_parents(
@@ -476,7 +559,8 @@ impl<'a, 'b> TrimMesh<'a, 'b> {
             &[(v0, w[0] as f32), (v1, w[1] as f32), (v2, w[2] as f32)],
         )?;
         self.new_verts.push(new_v);
-        let (_, store_id) = self.detach_logical(lt).ok_or(SceneError::Corrupted)?;
+        self.surface.weld.join(new_v, new_v);
+        self.tris[lt] = None;
         self.tx.remove_triangles(&[store_id])?;
         self.push_child(lt, [v0, v1, new_v])?;
         self.push_child(lt, [v1, v2, new_v])?;
@@ -562,8 +646,9 @@ fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-/// Closest barycentric coordinates on triangle `(a, b, c)` to point `p`.
-fn closest_barycentric_on_triangle(
+/// The squared distance from point `p` to triangle `(a, b, c)`, and the
+/// barycentric coordinates of the closest point on it.
+pub(crate) fn closest_barycentric_on_triangle(
     a: [f64; 3],
     b: [f64; 3],
     c: [f64; 3],
@@ -623,7 +708,8 @@ fn closest_barycentric_on_triangle(
 #[allow(clippy::too_many_arguments)]
 fn run_trim_in_tx(
     tx: &mut Transaction<'_>,
-    waypoints_init: &[(TriangleId, [f32; 3], [f32; 3])],
+    points: &[CurvePoint],
+    surface: CurveSurface,
     closed: bool,
     delete_inside: bool,
     local_snap_tol: f64,
@@ -631,24 +717,24 @@ fn run_trim_in_tx(
     origin: [f64; 3],
     world_snap_tol: f64,
 ) -> std::result::Result<TrimReport, SceneError> {
-    let mut tm = TrimMesh::new(tx);
+    let mut tm = TrimMesh::new(tx, surface)?;
     let snap = SnapContext {
         local_tol: local_snap_tol,
         world_tol: world_snap_tol,
         placement,
         origin,
     };
-    let mut curve_verts: Vec<VertexId> = Vec::with_capacity(waypoints_init.len());
+    let mut curve_verts: Vec<VertexId> = Vec::with_capacity(points.len());
 
     // Step 1: insert/snap all waypoints onto the mesh.
-    for &(init_tri, target_local, init_bary) in waypoints_init {
-        let root_lt = tm.orig_to_logical[init_tri as usize].ok_or(SceneError::Corrupted)?;
+    for point in points {
+        let root_lt = point.triangle as usize;
         let (target_lt, bary) = if tm.tris[root_lt].is_some() {
-            (root_lt, init_bary.map(f64::from))
+            (root_lt, point.barycentric.map(f64::from))
         } else {
             let mut cands = Vec::new();
             tm.collect_live_descendants(root_lt, &mut cands);
-            let target_f64 = target_local.map(f64::from);
+            let target_f64 = point.local.map(f64::from);
             let mut best = None;
             let mut best_d2 = f64::INFINITY;
             for lt in cands {
@@ -678,7 +764,8 @@ fn run_trim_in_tx(
         curve_verts.pop();
     }
 
-    // Step 2: trace conformal segments between consecutive curve vertices.
+    // Step 2: trace conformal segments between consecutive curve vertices
+    // (all roots, see `TrimMesh`).
     let mut seam_set: HashSet<(VertexId, VertexId)> = HashSet::new();
     let seg_count = if closed {
         curve_verts.len()
@@ -696,12 +783,15 @@ fn run_trim_in_tx(
     }
 
     // Step 3: when closed, flood-fill non-seam edges and remove the chosen side.
+    let mut removed_area = 0.0;
+    let mut cut = vec![false; tm.slots];
     if closed && !seam_set.is_empty() {
-        remove_closed_region(&mut tm, &seam_set, delete_inside)?;
+        let removed = remove_closed_region(&mut tm, &seam_set, delete_inside, placement.scale)?;
+        removed_area = removed.area;
+        for lt in removed.tris {
+            cut[tm.original(lt)] = true;
+        }
     }
-
-    // Prune vertices newly created/touched that ended up isolated after triangle removal.
-    prune_orphaned_vertices(&mut tm)?;
 
     let mut seam_alive = 0usize;
     for &(a, b) in &seam_set {
@@ -710,12 +800,11 @@ fn run_trim_in_tx(
         }
     }
 
-    let orig_survived = (0..tm.init_logical_len)
-        .filter(|&lt| tm.tris[lt].is_some())
-        .count();
-    let final_live = tm.tris.iter().filter(|t| t.is_some()).count();
+    let orig_survived = tm.tris[..tm.slots].iter().flatten().count();
+    let final_live = tm.tris.iter().flatten().count();
     let triangles_removed = tm.orig_tri_count - orig_survived;
     let triangles_added = final_live - orig_survived;
+    let cut_triangles = cut.into_iter().filter(|&lost| lost).count();
     let vertices_added = tm
         .new_verts
         .iter()
@@ -725,6 +814,9 @@ fn run_trim_in_tx(
     Ok(TrimReport {
         triangles_added,
         triangles_removed,
+        imprint_triangles: triangles_removed - cut_triangles,
+        cut_triangles,
+        removed_area,
         vertices_added,
         seam_edges: seam_alive,
     })
@@ -741,7 +833,9 @@ fn trace_curve_segment(
     let mut prev: Option<VertexId> = None;
     let mut visited = HashSet::new();
     visited.insert(cur);
-    let max_march = tm.tris.len().saturating_mul(2).clamp(64, 8192);
+    let max_march = (tm.orig_tri_count + tm.piece_of.len())
+        .saturating_mul(2)
+        .clamp(64, 8192);
 
     for _ in 0..max_march {
         if cur == v_end {
@@ -799,15 +893,11 @@ fn find_march_step(
     d: [f64; 3],
     cur_dist_sq: f64,
 ) -> Option<MarchStep> {
-    let fan = tm.vert_tris.get(&cur)?;
     let d_len = cur_dist_sq.sqrt();
     let mut best_score = f64::NEG_INFINITY;
     let mut best_step = None;
 
-    for &lt in fan {
-        let Some((verts, _)) = tm.tris[lt] else {
-            continue;
-        };
+    for (_, verts) in tm.fan(cur) {
         let (b, c) = if verts[0] == cur {
             (verts[1], verts[2])
         } else if verts[1] == cur {
@@ -916,13 +1006,7 @@ fn dijkstra_seam_fallback(
             continue;
         }
         let pv = tm.pos(v);
-        let Some(fan) = tm.vert_tris.get(&v) else {
-            continue;
-        };
-        for &lt in fan {
-            let Some((verts, _)) = tm.tris[lt] else {
-                continue;
-            };
+        for (_, verts) in tm.fan(v) {
             for &nb in &verts {
                 if nb == v {
                     continue;
@@ -948,31 +1032,49 @@ fn dijkstra_seam_fallback(
         }
         cur = p;
     }
-    Ok(())
+    // A component is in one piece.
+    Err(SceneError::Corrupted)
 }
 
-struct FillComponent {
+/// One side of a loop: the triangles connected without crossing the seam.
+struct FillRegion {
     tris: Vec<usize>,
     touches_boundary: bool,
+    /// In world units squared.
     area: f64,
 }
 
-fn remove_closed_region(
-    tm: &mut TrimMesh<'_, '_>,
+/// The sides of the loop: the component's regions between the edges of
+/// `seam_set`, on the mesh as it is now, with areas under `scale`.
+fn fill_regions(
+    tm: &TrimMesh<'_, '_>,
     seam_set: &HashSet<(VertexId, VertexId)>,
-    delete_inside: bool,
-) -> std::result::Result<(), SceneError> {
-    let mut seen = vec![false; tm.tris.len()];
-    let mut components: Vec<FillComponent> = Vec::new();
-    let mut queue = VecDeque::new();
+    scale: [f64; 3],
+) -> std::result::Result<Vec<FillRegion>, SceneError> {
+    let vertices = tm.tx.mesh().vertex_slots();
+    let fans = Fans::build(vertices, tm.tris.len(), &tm.surface.weld, |lt| {
+        tm.tris[lt].map(|(verts, _)| verts)
+    })?;
+    let mut on_seam = vec![false; vertices];
+    for &(a, b) in seam_set {
+        on_seam[a as usize] = true;
+        on_seam[b as usize] = true;
+    }
+    let is_seam = |a: VertexId, b: VertexId| {
+        on_seam[a as usize] && on_seam[b as usize] && seam_set.contains(&edge_key(a, b))
+    };
+    let to_world = |e: [f64; 3]| [e[0] * scale[0], e[1] * scale[1], e[2] * scale[2]];
 
+    let mut seen = vec![false; tm.tris.len()];
+    let mut regions: Vec<FillRegion> = Vec::new();
+    let mut queue = VecDeque::new();
     for start in 0..tm.tris.len() {
         if seen[start] || tm.tris[start].is_none() {
             continue;
         }
         seen[start] = true;
         queue.push_back(start);
-        let mut comp_tris = Vec::new();
+        let mut tris = Vec::new();
         let mut touches_boundary = false;
         let mut area = 0.0;
 
@@ -980,114 +1082,100 @@ fn remove_closed_region(
             let Some((verts, _)) = tm.tris[lt] else {
                 continue;
             };
-            comp_tris.push(lt);
+            tris.push(lt);
             let p0 = tm.pos(verts[0]);
-            let p1 = tm.pos(verts[1]);
-            let p2 = tm.pos(verts[2]);
-            let n = cross3(sub3(p1, p0), sub3(p2, p0));
+            let e1 = to_world(sub3(tm.pos(verts[1]), p0));
+            let e2 = to_world(sub3(tm.pos(verts[2]), p0));
+            let n = cross3(e1, e2);
             area += 0.5 * dot(n, n).sqrt();
 
+            let roots = tm.roots(verts);
             for k in 0..3 {
-                let key = edge_key(verts[k], verts[(k + 1) % 3]);
-                if seam_set.contains(&key) {
+                let (a, b) = (roots[k], roots[(k + 1) % 3]);
+                if a == b || is_seam(a, b) {
                     continue;
                 }
-                let Some(adj) = tm.edge_tris.get(&key) else {
-                    continue;
-                };
-                if adj.len() < 2 {
-                    touches_boundary = true;
-                }
-                for &nb in adj {
-                    if !seen[nb] && tm.tris[nb].is_some() {
-                        seen[nb] = true;
-                        queue.push_back(nb);
+                let mut users = 0;
+                for &nb in fans.around(a) {
+                    let nb = nb as usize;
+                    if tm.tris[nb].is_some_and(|(verts, _)| tm.roots(verts).contains(&b)) {
+                        users += 1;
+                        if !seen[nb] {
+                            seen[nb] = true;
+                            queue.push_back(nb);
+                        }
                     }
+                }
+                if users < 2 {
+                    touches_boundary = true;
                 }
             }
         }
 
-        components.push(FillComponent {
-            tris: comp_tris,
+        regions.push(FillRegion {
+            tris,
             touches_boundary,
             area,
         });
     }
-
-    if components.len() < 2 {
-        return Ok(());
-    }
-
-    let has_interior = components.iter().any(|c| !c.touches_boundary);
-    let has_boundary = components.iter().any(|c| c.touches_boundary);
-    let remove_flags: Vec<bool> = if has_interior && has_boundary {
-        components
-            .iter()
-            .map(|c| {
-                if delete_inside {
-                    !c.touches_boundary
-                } else {
-                    c.touches_boundary
-                }
-            })
-            .collect()
-    } else {
-        let smallest = components
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        (0..components.len())
-            .map(|i| {
-                if delete_inside {
-                    i == smallest
-                } else {
-                    i != smallest
-                }
-            })
-            .collect()
-    };
-
-    let mut to_remove = Vec::new();
-    for (i, comp) in components.into_iter().enumerate() {
-        if remove_flags[i] {
-            for lt in comp.tris {
-                if let Some((_, store_id)) = tm.detach_logical(lt) {
-                    to_remove.push(store_id);
-                }
-            }
-        }
-    }
-    if !to_remove.is_empty() {
-        tm.tx.remove_triangles(&to_remove)?;
-    }
-    Ok(())
+    Ok(regions)
 }
 
-fn prune_orphaned_vertices(tm: &mut TrimMesh<'_, '_>) -> std::result::Result<(), SceneError> {
-    let slots = tm.tx.mesh().vertex_slots();
-    let mut referenced = vec![false; slots];
-    for t in 0..tm.tx.mesh().triangle_slots() as u32 {
-        if let Some([a, b, c]) = tm.tx.mesh().triangle(t) {
-            referenced[a as usize] = true;
-            referenced[b as usize] = true;
-            referenced[c as usize] = true;
+/// What [`remove_closed_region`] removed: logical ids, and their world area.
+struct RemovedRegion {
+    tris: Vec<usize>,
+    area: f64,
+}
+
+/// Removes the inside or the outside of the loop, with the vertices nothing
+/// uses any more. Removes nothing when the loop has only one side.
+fn remove_closed_region(
+    tm: &mut TrimMesh<'_, '_>,
+    seam_set: &HashSet<(VertexId, VertexId)>,
+    delete_inside: bool,
+    scale: [f64; 3],
+) -> std::result::Result<RemovedRegion, SceneError> {
+    let mut removed = RemovedRegion {
+        tris: Vec::new(),
+        area: 0.0,
+    };
+    let regions = fill_regions(tm, seam_set, scale)?;
+    if regions.len() < 2 {
+        return Ok(removed);
+    }
+    let has_interior = regions.iter().any(|r| !r.touches_boundary);
+    let has_boundary = regions.iter().any(|r| r.touches_boundary);
+    let smallest = regions
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
+        .map_or(0, |(i, _)| i);
+    for (i, region) in regions.into_iter().enumerate() {
+        let inside = if has_interior && has_boundary {
+            !region.touches_boundary
+        } else {
+            i == smallest
+        };
+        if inside == delete_inside {
+            removed.area += region.area;
+            removed.tris.extend(region.tris);
         }
     }
-    let mut orphan_verts = Vec::new();
-    for v in 0..slots as u32 {
-        if tm.tx.mesh().is_vertex_alive(v)
-            && !referenced[v as usize]
-            && tm.vert_tris.contains_key(&v)
-        {
-            orphan_verts.push(v);
+
+    let mut store_ids = Vec::with_capacity(removed.tris.len());
+    let mut corners = Vec::with_capacity(3 * removed.tris.len());
+    for &lt in &removed.tris {
+        if let Some((verts, store_id)) = tm.tris[lt].take() {
+            store_ids.push(store_id);
+            corners.extend(verts);
         }
     }
-    if !orphan_verts.is_empty() {
-        tm.tx.remove_vertices(&orphan_verts)?;
-    }
-    Ok(())
+    tm.tx.remove_triangles(&store_ids)?;
+    corners.sort_unstable();
+    corners.dedup();
+    corners.retain(|&v| tm.tx.mesh().corner_count(v) == 0);
+    tm.tx.remove_vertices(&corners)?;
+    Ok(removed)
 }
 
 #[cfg(test)]

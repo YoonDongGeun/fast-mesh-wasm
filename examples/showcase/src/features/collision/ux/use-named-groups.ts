@@ -2,7 +2,7 @@
 // its live members (`store.setContactGroup`, one id per group, released when
 // no longer wanted), each group's collision response override applied to
 // every pair of its members, and the group actions (show or hide all its
-// members, ungroup, remove its meshes: each its own undo entry).
+// members, ungroup, remove its meshes: one undo step).
 import type { CollisionMode, MeshHandle } from "fast-mesh-wasm";
 import { useScene } from "fast-mesh-wasm/react";
 import { contactHeatmap } from "fast-mesh-wasm/store";
@@ -30,7 +30,8 @@ export function groupHeat(items: readonly Item[], members: readonly MeshHandle[]
 /**
  * The named groups' scene wiring. `groupRules` holds each group's response
  * override (none: the default rule); `setGroupCollisionMode` sets or clears
- * one, `ungroup` and `removeGroupMeshes` clear it first.
+ * one, and `ungroup` clears it first. A group whose meshes were removed keeps
+ * it for their way back.
  */
 export function useNamedGroups(app: AppState): {
   items: readonly Item[];
@@ -40,7 +41,7 @@ export function useNamedGroups(app: AppState): {
   setGroupCollisionMode: (groupId: number, members: readonly MeshHandle[], mode: CollisionMode | "default") => void;
   setVisible: (members: readonly MeshHandle[], visible: boolean) => void;
   ungroup: (groupId: number, members: readonly MeshHandle[]) => void;
-  removeGroupMeshes: (groupId: number, members: readonly MeshHandle[]) => void;
+  removeGroupMeshes: (members: readonly MeshHandle[]) => void;
 } {
   const store = useScene();
   const items = useApp(app, (s) => s.items);
@@ -66,7 +67,8 @@ export function useNamedGroups(app: AppState): {
       return;
     }
     const rule = buildCollisionRule(collision, { mode });
-    const sig = `${members.join(",")}|${collisionRuleSignature(rule)}`;
+    const ids = members.map((m) => items.find((i) => i.mesh === m)?.id);
+    const sig = `${ids.join(",")}|${collisionRuleSignature(rule)}`;
     if (lastGroupSigRef.current.get(groupId) === sig) {
       return;
     }
@@ -124,6 +126,9 @@ export function useNamedGroups(app: AppState): {
       const live = liveMembers(g.members, items);
       if (live.length >= 2) {
         syncGroupPairRules(g.id, live, mode);
+      } else {
+        // The rules are set again when undo brings a member back.
+        lastGroupSigRef.current.delete(g.id);
       }
     }
   }, [collision, groups, groupRules, items, store]);
@@ -161,7 +166,7 @@ export function useNamedGroups(app: AppState): {
       store.setDisplay(m, { visible });
     }
   };
-  const removeMeshes = (members: readonly MeshHandle[]) => {
+  const removeGroupMeshes = (members: readonly MeshHandle[]) => {
     // One undo step brings them all back.
     store.beginStep();
     try {
@@ -184,9 +189,6 @@ export function useNamedGroups(app: AppState): {
       setGroupCollisionMode(groupId, members, "default");
       app.removeGroup(groupId);
     },
-    removeGroupMeshes: (groupId, members) => {
-      setGroupCollisionMode(groupId, members, "default");
-      removeMeshes(members);
-    },
+    removeGroupMeshes,
   };
 }

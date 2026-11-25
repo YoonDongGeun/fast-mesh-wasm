@@ -58,6 +58,7 @@ export function useRibbon(app: AppState, onSetMode: (mode: GizmoMode) => void) {
   const faceSelectTool = useApp(app, (s) => s.wave6.select.activeTool);
   const deformAlgo = useApp(app, (s) => s.wave6.deform.algorithm);
   const deformTool = useApp(app, (s) => s.wave6.deform.activeTool);
+  const plateShown = useApp(app, (s) => s.buildPlate.visible);
 
   const pickMode = (next: GizmoMode) => {
     if (sculpt !== null) app.setSculpt(null);
@@ -107,6 +108,7 @@ export function useRibbon(app: AppState, onSetMode: (mode: GizmoMode) => void) {
     faceSelectTool,
     deformAlgo,
     deformTool,
+    plateShown,
     pickMode,
     toggleFaceSelectTool,
     chooseDeformAlgorithm,

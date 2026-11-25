@@ -12,9 +12,17 @@ import {
   sectionReadout,
 } from "../src/features/inspect/ux/section-clip";
 
-// Column-major 4x4, like `scene.matrix4`.
+// Placements as column-major 4x4. `scene.matrix4` is the mesh's placement
+// times the translation to its origin, which `item.center` is (#277).
 const translate = (x: number, y: number, z: number) => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1];
-const sceneWith = (m: number[]) => ({ matrix4: () => m }) as unknown as Scene;
+const sceneWith = (placement: number[], bounds?: { center: [number, number, number] }) => {
+  const [x, y, z] = item.center;
+  const m = [...placement];
+  for (let k = 0; k < 3; k++) {
+    m[12 + k] += m[k] * x + m[4 + k] * y + m[8 + k] * z;
+  }
+  return { matrix4: () => m, ...(bounds === undefined ? {} : { bounds: () => bounds }) } as unknown as Scene;
+};
 const removed = { matrix4: () => { throw new Error("gone"); } } as unknown as Scene;
 const item = { mesh: 1 as unknown as MeshHandle, center: [1, 2, 3], radius: 4 } as unknown as Item;
 const sectionAt = (origin: [number, number, number], normal: [number, number, number]) => ({
@@ -25,6 +33,11 @@ const sectionAt = (origin: [number, number, number], normal: [number, number, nu
 describe("sectionCenter", () => {
   it("maps_the_local_center_through_the_placement", () => {
     expect(sectionCenter(sceneWith(translate(10, 0, -1)), null, item)).toEqual([11, 2, 2]);
+  });
+
+  it("follows_geometry_that_is_off_its_origin", () => {
+    const scaled = [2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    expect(sectionCenter(sceneWith(scaled, { center: [5, 0, -1] }), null, item)).toEqual([12, 2, 2]);
   });
 
   it("is_null_without_a_mesh_or_once_removed", () => {

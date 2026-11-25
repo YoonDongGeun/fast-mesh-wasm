@@ -71,9 +71,9 @@
 use fast_mesh_bvh::Bvh;
 use fast_mesh_fields::{
     ColorRule, FieldsError, SignBuild, SignData, SignMode, SignStatus, Target, color_of,
-    curvatures, geodesic_distances as field_geodesic_distances,
-    mesh_deviation as field_mesh_deviation, overhangs as field_overhangs, signed_distances,
-    signed_distances_multi, thicknesses, triangle_quality as field_triangle_quality,
+    curvatures, mesh_deviation as field_mesh_deviation, overhangs as field_overhangs,
+    signed_distances, signed_distances_multi, thicknesses,
+    triangle_quality as field_triangle_quality,
 };
 pub use fast_mesh_fields::{
     DeviationOptions, DeviationStats, GeodesicHeatSolver, GeodesicMethod, GeodesicOptions,
@@ -4198,54 +4198,6 @@ impl Scene {
             sliver_threshold,
             vertex_quality,
         )?)
-    }
-
-    /// Computes geodesic surface distances from `sources` (vertex slot ids on
-    /// `id`) in world length units.
-    ///
-    /// Writes `mesh.vertex_slots()` distances into `out` (with `f32::INFINITY`
-    /// for dead slots, unreachable components, or distances exceeding
-    /// `options.max_distance`). Does not modify the scene or its history.
-    pub fn geodesic_distances(
-        &self,
-        id: MeshId,
-        sources: &[u32],
-        options: &GeodesicOptions,
-        out: &mut Vec<f32>,
-    ) -> Result<()> {
-        let entry = self.entry(id)?;
-        if let Some(s) = entry.placement.uniform_scale() {
-            if s == 1.0 {
-                return Ok(field_geodesic_distances(
-                    &entry.mesh,
-                    sources,
-                    options,
-                    out,
-                )?);
-            }
-            let local_max = match options.max_distance {
-                Some(d) if d.is_finite() && d >= 0.0 => {
-                    let scaled = (f64::from(d) / s) as f32;
-                    if !scaled.is_finite() {
-                        let (baked, _) = baked_world_mesh(entry)?;
-                        return Ok(field_geodesic_distances(&baked, sources, options, out)?);
-                    }
-                    Some(scaled)
-                }
-                other => other,
-            };
-            let local_opts = GeodesicOptions {
-                method: options.method,
-                max_distance: local_max,
-                time_step_scale: options.time_step_scale,
-            };
-            field_geodesic_distances(&entry.mesh, sources, &local_opts, out)?;
-            scale_finite_values(out, s);
-            return Ok(());
-        }
-
-        let (baked, _) = baked_world_mesh(entry)?;
-        Ok(field_geodesic_distances(&baked, sources, options, out)?)
     }
 
     /// Computes vertex-to-surface deviation from `source` to `target` in world

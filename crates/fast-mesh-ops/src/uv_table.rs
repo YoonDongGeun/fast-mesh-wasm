@@ -17,10 +17,10 @@ use crate::subdivide::{SubdivideMethod, SubdivideOptions};
 use crate::test_util::{box_mesh, edit, grid, grid_without, hemisphere, mesh_of, uv_sphere};
 use crate::{
     AppendSource, AutoRepairOptions, BooleanOp, ComponentOptions, CutOptions, DegenerateOptions,
-    DelaunayOptions, DenoiseOptions, FillOptions, OffsetAlgorithm, OffsetOptions, ShellOptions,
-    SkipReason, append_mesh, append_mesh_with_uvs, apply_boolean, auto_repair, boolean_plan,
-    boundary_loops, bridge_loops, cut_by_plane, delaunay_flips, denoise, fill_holes, inflate,
-    offset, orient, remove_degenerate, remove_small_components, shell, weld,
+    DelaunayOptions, DenoiseOptions, FillOptions, LatticeOptions, OffsetAlgorithm, OffsetOptions,
+    ShellOptions, SkipReason, append_mesh, append_mesh_with_uvs, apply_boolean, auto_repair,
+    boolean_plan, boundary_loops, bridge_loops, cut_by_plane, delaunay_flips, denoise, fill_holes,
+    inflate, lattice_fill, offset, orient, remove_degenerate, remove_small_components, shell, weld,
 };
 
 /// A planar UV of a position: linear, so anything interpolated stays on it.
@@ -583,6 +583,21 @@ fn extrude_base_copies_rim_uvs_and_interpolates_the_cap() {
     assert!(r.cap_vertices > 0);
     assert_kept(&m, &before);
     assert_planar(&m, 1e-6);
+}
+
+#[test]
+fn lattice_fill_drops_uvs() {
+    // In a shell, which keeps the surface, and open, which replaces it.
+    for shell in [0.15, 0.0] {
+        let mut m = with_planar(box_mesh([0.0; 3], [1.0; 3]));
+        let options = LatticeOptions::builder()
+            .cell_size(0.5)
+            .wall_thickness(0.1)
+            .shell_thickness(shell)
+            .build();
+        let (r, _) = edit(&mut m, |tx| lattice_fill(tx, &options));
+        assert!(r.uvs_dropped && m.uvs().is_none());
+    }
 }
 
 #[test]

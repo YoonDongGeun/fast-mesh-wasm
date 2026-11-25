@@ -9,7 +9,15 @@ import type { GeodesicMethod, MeshHandle } from "fast-mesh-wasm";
 import { useScene } from "fast-mesh-wasm/react";
 import { useEffect, useRef, useState } from "react";
 import { type AppState, type Item, useApp } from "../../../app/state/app-state";
-import { closeSurfaceLoop, settleChanges, splitAlongPath, type TrimKeep, trimAlongPath } from "./surface-path-actions";
+import { describeKept, keepPath } from "../../polylines/ux/polyline-actions";
+import {
+  cancelSurfaceLeg,
+  closeSurfaceLoop,
+  settleChanges,
+  splitAlongPath,
+  type TrimKeep,
+  trimAlongPath,
+} from "./surface-path-actions";
 import {
   canClose,
   clearedPicks,
@@ -113,11 +121,13 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
   const undoPoint = () => {
     const s = app.getSnapshot().surfacePath;
     if (s.path !== null) {
+      cancelSurfaceLeg(app);
       app.setSurfacePath({ path: undoPathPoint(s.path), error: null });
     }
   };
 
   const clearPath = () => {
+    cancelSurfaceLeg(app);
     app.setSurfacePath({ path: null, error: null });
     setStatus(null);
   };
@@ -184,6 +194,20 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     });
   };
 
+  /** Keeps the path as a polyline object (#268): one undo step. The path stays. */
+  const keep = () => {
+    const s = app.getSnapshot().surfacePath;
+    if (item === null || s.mesh !== item.mesh) {
+      return;
+    }
+    try {
+      setStatus(describeKept(keepPath(app, store, s.path, item.name)));
+      app.setSurfacePath({ error: null });
+    } catch (e) {
+      app.setSurfacePath({ error: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
   const path = onTarget ? tool.path : null;
   const sources = onTarget ? tool.sources : [];
   const locked = item?.locked ?? false;
@@ -197,6 +221,8 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     sources,
     path,
     tracing: tool.tracing > 0,
+    /** Cancels the leg being traced. */
+    cancelTracing: () => cancelSurfaceLeg(app),
     error: onTarget || tool.mesh === null ? tool.error : null,
     busy,
     status,
@@ -212,5 +238,6 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     close,
     trim,
     split,
+    keep,
   };
 }

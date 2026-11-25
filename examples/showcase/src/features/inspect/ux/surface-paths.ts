@@ -91,17 +91,21 @@ export const GEODESIC_METHODS: readonly { method: GeodesicMethod; label: string;
   {
     method: "heatMethod",
     label: "Accurate",
-    title: "The heat method: smooth distances across the faces; much slower on large meshes",
+    title: "The heat method: smooth distances across the faces; slower on large meshes",
   },
 ];
 
-/** From this many triangles on, the accurate method takes tens of seconds a map or leg, and the panel says so. */
-export const SLOW_METHOD_TRIANGLES = 300_000;
+/**
+ * From this many triangles on, the accurate method takes seconds a map or
+ * leg (about one per million triangles, and half of that again for the first
+ * on a mesh), and the panel says so.
+ */
+export const SLOW_METHOD_TRIANGLES = 1_000_000;
 
 /** The note the panel shows for a method that is slow on a mesh of `triangles`, or `null`. */
 export function slowMethodNote(method: GeodesicMethod, triangles: number): string | null {
   return method === "heatMethod" && triangles >= SLOW_METHOD_TRIANGLES
-    ? `Accurate takes a while on ${triangles} triangles: tens of seconds for each map or path leg.`
+    ? `Accurate takes a few seconds on ${triangles} triangles for each map or path leg. Cancel stops it.`
     : null;
 }
 
@@ -255,7 +259,8 @@ export function legFromSurfacePath(
 /**
  * Traces the shortest surface path from `from` to `to` on `mesh` with the
  * SDK (on the Worker for a `WorkerScene`), as a leg. The SDK's path starts
- * on the source vertex and ends on the target.
+ * on the source vertex and ends on the target. Aborting `signal` cancels it
+ * there and rejects with the signal's reason.
  */
 export async function traceLeg(
   scene: PathScene,
@@ -263,12 +268,16 @@ export async function traceLeg(
   from: SurfacePick,
   to: SurfacePick,
   method: GeodesicMethod,
+  signal?: AbortSignal,
 ): Promise<PathLeg> {
   const inspect = scene.inspect;
   if (inspect === undefined) {
     throw new Error("This scene has no surface paths");
   }
-  const points = await inspect.shortestSurfacePath(mesh, from.slot, to.slot, { method });
+  const points = await inspect.shortestSurfacePath(mesh, from.slot, to.slot, {
+    method,
+    ...(signal === undefined ? {} : { signal }),
+  });
   if (points.length < 2) {
     throw new Error("No surface path joins these points.");
   }

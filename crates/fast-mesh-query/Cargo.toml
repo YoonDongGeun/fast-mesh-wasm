@@ -31,3 +31,7 @@ criterion = { version = "0.8.2", default-features = false }
 [[bench]]
 name = "query"
 harness = false
+
+[[bench]]
+name = "ray_grid"
+harness = false

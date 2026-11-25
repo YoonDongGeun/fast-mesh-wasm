@@ -6,7 +6,9 @@ import type { Bounds, Placement, PlacementInput, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
 import type { DelaunayFlipOptions, DenoiseOptions } from "../denoise.js";
 import type { ExtrudeBaseOptions, ExtrudeFacesOptions } from "../extrude.js";
+import type { CheckedHeightfield, CheckedHeightfieldPlacement, HeightMap, HeightMapFrame } from "../height-map.js";
 import type { EncodedPrimitive, PrimitiveMesh } from "../primitives.js";
+import type { LatticeOptions, LatticePlan, LatticePreview } from "../lattice.js";
 import type { WrapOptions, WrapPlan } from "../wrap.js";
 import type {
   NormalizedBooleanOptions,
@@ -340,6 +342,8 @@ export type Request =
   | { kind: "commitCollisionInteraction"; rev: number; id: ClientId; qid: number }
   | { kind: "alignToFittedPrimitive"; rev: number; id: ClientId; primitive: FittedPrimitive; targetAxis: Vec3; targetOrigin: Vec3; qid: number }
   | { kind: "reconstructPointCloud"; rev: number; addedId: ClientId; cloud: Float32Array; options: SurfaceReconstructOptions; qid: number }
+  /** `Scene.addHeightfield` of heights that are transferred; replies with the relief's counts. */
+  | { kind: "addHeightfield"; rev: number; addedId: ClientId; field: CheckedHeightfield; placement: CheckedHeightfieldPlacement; qid: number }
   /** `Scene.convexHull`; replies with the hull's counts. */
   | { kind: "convexHull"; rev: number; addedId: ClientId; meshes: ClientId[]; normals: boolean; qid: number }
   /** `Scene.convexHullOfPoints` on flat world positions; replies with the hull's counts. */
@@ -347,6 +351,8 @@ export type Request =
   /** `Scene.wrap`; replies with the wrap's counts and grid. */
   | { kind: "wrap"; rev: number; addedId: ClientId; meshes: ClientId[]; options: WrapOptions; qid: number }
   | { kind: "hollowMesh"; rev: number; id: ClientId; options: HollowOptions; qid: number }
+  /** `Scene.latticeFill`; replies with its report. */
+  | { kind: "latticeFill"; rev: number; id: ClientId; options: LatticeOptions; qid: number }
   /** `Scene.denoise`; replies with its report. */
   | { kind: "denoise"; rev: number; id: ClientId; options: DenoiseOptions; qid: number }
   /** `Scene.delaunayFlips`; replies with its report. */
@@ -354,6 +360,12 @@ export type Request =
   | { kind: "punchDrainHole"; rev: number; id: ClientId; plugId?: ClientId; options: DrainHoleOptions; qid: number }
   | { kind: "placeMesh"; rev: number; target: ClientId; stamp: ClientId; addedId?: ClientId; options: PlaceMeshOptions; qid: number }
   | { kind: "query"; rev: number; qid: number; name: string; args: unknown }
+  /**
+   * Drops the query `qid` when it has not started, or at its next step when
+   * it runs in steps (`geodesicDistances`, `shortestSurfacePath`): its reply
+   * is then a `CANCELLED` error. Anything else is left alone.
+   */
+  | { kind: "cancel"; rev: number; qid: number }
   | { kind: "fetchFieldValues"; rev: number; qid: number; field: ClientId };
 
 /** The queries of `{ kind: "query" }`: their `args` and reply `value`, by name. */
@@ -397,6 +409,7 @@ export interface QueryMap {
   triangleQuality: { args: { mesh: ClientId; metric: QualityMetric; sliverThreshold: number }; value: QualityReport };
   meshDeviation: { args: { source: ClientId; target: ClientId; options?: DeviationOptions }; value: DeviationStats };
   geodesicDistances: { args: { mesh: ClientId; sources: number[]; options?: GeodesicOptions }; value: Float32Array };
+  releaseGeodesics: { args: Record<string, never>; value: null };
   shortestSurfacePath: {
     args: { mesh: ClientId; sources: number[]; targetVertex: number; options?: SurfacePathOptions };
     value: SurfacePathPoint[];
@@ -418,6 +431,18 @@ export interface QueryMap {
   sliceContours: { args: { mesh: ClientId; origin: Vec3; normal: Vec3 }; value: ContourSlice };
   sliceContourStack: { args: { mesh: ClientId; origin: Vec3; normal: Vec3; spacing: number; count: number }; value: ContourSlice[] };
   wrapPlan: { args: { meshes: ClientId[]; options: WrapOptions }; value: WrapPlan };
+  /** `Scene.heightMapFrame`, with encoded options. */
+  heightMapFrame: { args: { meshes: ClientId[]; options: number[] }; value: HeightMapFrame };
+  /** `Scene.heightMap`, with an encoded frame or the options to fit one; its heights are transferred. */
+  heightMap: {
+    args: { meshes: ClientId[]; frame?: number[]; options?: number[]; rows?: [number, number] };
+    value: HeightMap;
+  };
+  /** A relief, generated in the Worker (no scene state); its buffers are transferred. */
+  generateHeightfield: { args: CheckedHeightfield; value: PrimitiveMesh };
+  latticePlan: { args: { mesh: ClientId; options: LatticeOptions }; value: LatticePlan };
+  /** `Scene.latticePreview`; its buffers are transferred. */
+  latticePreview: { args: { mesh: ClientId; options: LatticeOptions }; value: LatticePreview };
   /** A primitive shape, generated in the Worker (no scene state); its buffers are transferred. */
   generatePrimitive: { args: EncodedPrimitive; value: PrimitiveMesh };
   /** Test-only (an engine run with `debug`): copies of a mesh's buffers. */
@@ -638,6 +663,7 @@ export function keyOf(req: Request): string | undefined {
     case "applyKelvinlet":
     case "applyXpbd":
     case "hollowMesh":
+    case "latticeFill":
     case "denoise":
     case "delaunayFlips":
     case "punchDrainHole":
@@ -648,6 +674,7 @@ export function keyOf(req: Request): string | undefined {
     case "booleanBatch":
     case "extractSelectedFaces":
     case "reconstructPointCloud":
+    case "addHeightfield":
     case "convexHull":
     case "convexHullPoints":
     case "wrap":

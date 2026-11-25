@@ -1,0 +1,35 @@
+/* The Image to Relief dialog (#267): the Create dialog's panel
+   (create-dialog.css), with the image and its small picture. */
+.relief-image {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.relief-thumbnail {
+  flex: none;
+  max-width: 72px;
+  max-height: 72px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.relief-file {
+  flex: 1;
+  min-width: 0;
+  padding: 8px;
+  border: 1px dashed var(--line);
+  border-radius: 4px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.relief-file:focus-within {
+  border-color: var(--accent);
+}
+/* Kept in the tab order, so that the keyboard reaches it. */
+.relief-file input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}

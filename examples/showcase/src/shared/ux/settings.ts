@@ -2,7 +2,7 @@
 // theme, the sidebars (shown, widths), the display prefs (wireframe,
 // boundary softness, repair overlays, collision mode, decimate-on-load,
 // sculpt remesh, the navigation cube's projection, scale indicator and axis
-// basis) and the last-used heatmap sliders (the collision colour
+// basis, the build plate) and the last-used heatmap sliders (the collision colour
 // scale). Meshes and projects stay file-based (see load/project.ts), and
 // volume views keep their suggested-or-Bone preset: this is prefs only,
 // so a fresh profile gets the defaults and the scripted session
@@ -13,6 +13,7 @@
 // so private mode just means "no persistence".
 import type { DyntopoMode, GrabMethod, InflateMethod, SmoothMethod, TwistMethod } from "fast-mesh-wasm";
 import type { CameraProjection, CollisionMode, HeatmapParams, RepairOverlayKind } from "../../app/state/app-state";
+import { type BuildPlate, DEFAULT_BUILD_PLATE, parseBuildPlate } from "../../features/build-plate/ux/plate";
 import type { LengthUnit } from "./units";
 
 export const DYNTOPO_MODES: readonly DyntopoMode[] = [
@@ -113,6 +114,8 @@ export interface ShowcaseSettings {
   cameraProjection: CameraProjection;
   scaleIndicator: ScaleIndicator;
   showAxisBasis: boolean;
+  /** The build plate and how Arrange fills it (#266). */
+  buildPlate: BuildPlate;
 }
 
 /** A fresh defaults document (a new object every call: callers may keep it). */
@@ -155,6 +158,7 @@ export function defaultSettings(): ShowcaseSettings {
     cameraProjection: "perspective",
     scaleIndicator: "ruler",
     showAxisBasis: true,
+    buildPlate: { ...DEFAULT_BUILD_PLATE },
   };
 }
 
@@ -299,6 +303,7 @@ export function parseSettings(doc: unknown): ShowcaseSettings {
     cameraProjection: asLiteral(doc.cameraProjection, ["perspective", "orthographic"], fallback.cameraProjection),
     scaleIndicator: asLiteral(doc.scaleIndicator, SCALE_INDICATORS, fallback.scaleIndicator),
     showAxisBasis: asBoolean(doc.showAxisBasis, fallback.showAxisBasis),
+    buildPlate: parseBuildPlate(doc.buildPlate),
   };
 }
 
@@ -359,6 +364,7 @@ export interface PersistedSnapshot {
   cameraProjection: CameraProjection;
   scaleIndicator: ScaleIndicator;
   showAxisBasis: boolean;
+  buildPlate: BuildPlate;
 }
 
 /** Collects the snapshot's persisted slice into a storable document. */
@@ -391,5 +397,6 @@ export function settingsFromSnapshot(snap: PersistedSnapshot): ShowcaseSettings 
     cameraProjection: snap.cameraProjection,
     scaleIndicator: snap.scaleIndicator,
     showAxisBasis: snap.showAxisBasis,
+    buildPlate: { ...snap.buildPlate },
   };
 }

@@ -34,13 +34,15 @@ Every operation either keeps the UVs aligned with the vertices or drops the chan
 | `shell` | Preserved | The inner surface copies its outer vertices' UVs. Wall triangles repeat the rim's UVs, so they sample a line of the texture. A seam is a rim here: each side gets a wall along it, so a closed mesh with seams comes out with walls inside it rather than as two nested surfaces, and on a curved surface the inner copies of the two sides move apart. To shell it as closed, add it without `uvs` and weld it. |
 | `extrudeFaces` | Preserved | The caps' copies of rim vertices take their UVs. Wall triangles repeat the rim's UVs, so they sample a line of the texture. A seam is a rim here: each side gets a wall along it, and where its two sides are different regions they move apart. To extrude across a seam as one piece, add the mesh without `uvs` and weld it. |
 | `extrudeBase` | Interpolated | A base vertex takes its rim vertex's UVs, so the walls sample a line of the texture, and cap vertices take the weighted mean of their parents. A seam that reaches the border is part of the rim, so weld such a mesh first. |
+| `latticeFill` | Dropped | The walls of the lattice have no coordinates in the texture's space, so the whole mesh loses its channel (undo restores it). The mesh is read, and in a shell kept, with exactly coincident vertices merged, so a UV seam does not open the result. |
 | `cutByPlane` | Interpolated | Both sides keep their UVs. Crossing vertices interpolate along the cut edge, and cap vertices from the rim. The new mesh gets its own channel. Rims close across seams, see [Cuts across seams](#cuts-across-seams). |
+| `trimByCurve` | Interpolated | New vertices take the UV of the edge or triangle they are on. The curve and the cut cross seams: both sides split at the same positions, each with its own island's UVs, so a seam stays shut, and the UV islands of one surface are one component (see `Scene.trimByCurve`). |
 | `join` | Preserved or dropped | With UVs on both meshes they carry over. With UVs on one, the result has none: there is nothing to give the other side's vertices. |
 | `boolean` | Dropped | The result mixes split pieces and the other mesh's surface, which has no coordinates in this mesh's texture space. An open mesh with UVs is read with exactly coincident vertices merged, so seams on a closed surface are accepted, for either mesh; undo brings back the split vertices. A boolean of a mesh with itself keeps them too: union and intersect change nothing, and subtract clears the mesh, as one undo step. |
 | `compact` | Preserved | Remapped with the slots. Afterwards earlier drops cannot be undone, as for all history. |
 | `edit` | Your call | `addVertices` gives new vertices the UV `(0, 0)`, and `setPositions` leaves UVs alone. Set them in the same edit with `{ op: "setUvs", vertices, uvs }`. |
 
-The tests are one per row: `crates/fast-mesh-ops/src/uv_table.rs` and `crates/fast-mesh-scene/src/uv_tests.rs`.
+The tests are one per row: `crates/fast-mesh-ops/src/uv_table.rs`, `crates/fast-mesh-scene/src/uv_tests.rs` and, for `trimByCurve`, `crates/fast-mesh-scene/src/trim_tests.rs`.
 
 ## Seams
 

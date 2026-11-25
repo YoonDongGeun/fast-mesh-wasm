@@ -21,8 +21,13 @@ import { inspectMapProbe } from "../../features/inspect/ux/use-inspect-maps";
 import { objectInfoProbe, qualityReportFile, readQualityReport } from "../../features/inspect/ux/use-object-info";
 import { geodesicMapProbe } from "../../features/inspect/ux/use-geodesic-map";
 import { pathLength } from "../../features/inspect/ux/surface-paths";
+import { readWorldBoxes } from "../../features/build-plate/ux/footprint";
+import { curveLength, pointCount } from "../../features/polylines/ux/polyline";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
+import { latticePreviewOf } from "../../features/mesh-edit/ux/lattice-preview-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
+import { reliefDialogOf } from "../../features/mesh-edit/ux/relief-dialog-state";
+import { DEFAULT_HEIGHT_MAP, exportHeightMap, frameOptions, type HeightMapView, viewAxes } from "../../features/home/ux/height-map-export";
 
 export function installTestHook(
   store: SceneStore,
@@ -65,6 +70,27 @@ export function installTestHook(
     textDialog: () => {
       const d = textDialogOf(app).getSnapshot();
       return { open: d.open, previewTriangles: (d.preview?.mesh.indices.length ?? 0) / 3 };
+    },
+    /** The Image to Relief dialog: whether it is open, and the preview's triangles (0 with none). */
+    reliefDialog: () => {
+      const d = reliefDialogOf(app).getSnapshot();
+      return { open: d.open, previewTriangles: (d.preview?.mesh.indices.length ?? 0) / 3 };
+    },
+    /** Exports a height map of the named mesh, without the downloads: the PNG's bytes, the JSON and the pixels that see a surface. */
+    heightMap: async (name: string, from: HeightMapView = "top", resolution = DEFAULT_HEIGHT_MAP.resolution) => {
+      const axes = viewAxes(from, view.camera);
+      if (axes === null) {
+        throw new Error("no camera");
+      }
+      const options = frameOptions({ ...DEFAULT_HEIGHT_MAP, view: from, resolution }, axes);
+      const out = await exportHeightMap(engine.scene, [find(name)], options);
+      return { png: Array.from(out.png.bytes), json: JSON.parse(out.json.text) as unknown, seen: out.seen };
+    },
+    /** The lattice preview: its triangles (0 with none), and the opacity mesh `name` is drawn with. */
+    latticePreview: (name: string) => {
+      const material = view.bindings.get(find(name).mesh)?.object.material as THREE.Material | undefined;
+      const shown = latticePreviewOf(app).getSnapshot();
+      return { triangles: (shown?.walls.indices.length ?? 0) / 3, opacity: material?.opacity ?? null };
     },
     /** What the mesh's list picture cost, and how many were started and finished. */
     meshPreview: (name: string) => meshPreviewStats(find(name).mesh),
@@ -163,6 +189,12 @@ export function installTestHook(
             : { moving: landmarks.movingPoints.length, fixed: landmarks.fixedPoints.length, picking: landmarks.picking },
         symmetry: symmetry === null ? null : { mesh: nameOf(symmetry.mesh), errorRms: symmetry.errorRms, score: symmetry.score },
       };
+    },
+    /** The build plate as set, and a mesh's world box around its geometry as placed (#266). */
+    buildPlate: () => ({ ...app.getSnapshot().buildPlate }),
+    worldBox: async (name: string) => {
+      const { mesh } = find(name);
+      return (await readWorldBoxes(store.scene, [mesh])).get(mesh) ?? null;
     },
     dragging: () => view.dragging,
     /**
@@ -336,6 +368,19 @@ export function installTestHook(
         map: m === null ? null : { ...m, sources: [...m.sources] },
         mapRuns: geodesicMapProbe.runs,
       };
+    },
+    /** The kept polylines (#268): their names, points, lengths, whether closed and visible, and whether selected. */
+    polylines: () => {
+      const { polylines, polylineSelection } = app.getSnapshot();
+      return polylines.map((p) => ({
+        name: p.name,
+        color: p.color,
+        points: pointCount(p),
+        length: curveLength(p),
+        closed: p.closed,
+        visible: p.visible,
+        selected: polylineSelection.includes(p.id),
+      }));
     },
     /** The volume view: the series shown, its preset, MIP, and whether it rendered. */
     volume: () => ({ ...inspect.volume }),

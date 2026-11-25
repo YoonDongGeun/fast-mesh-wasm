@@ -9,6 +9,13 @@
 // failing the whole file. Mesh geometry rides as base64 little-endian bytes
 // (f64 positions, u32 indices), so a round trip is bit-exact.
 //
+// Origins (issue #276): a mesh's positions are relative to its `f64` origin,
+// as the engine stores them, and `origin` is that point, added back on load.
+// Files from before it was stored have no `origin`, and no way to tell it:
+// they open as they always did, their positions taken as they are (`version`
+// stays 1, the field is additive). With an origin far out, positions near it
+// come back to about `f64` rounding there, 1e-11 at 1e5.
+//
 // Units (issue #145): positions are in the world unit, millimetres, whatever
 // the display unit. `units` names how the project displays them; a mesh's
 // `importScale` records how its file's numbers became millimetres. That
@@ -16,6 +23,9 @@
 // cannot scale a mesh twice. Both are optional: files without them load as
 // before, on the global default unit (`version` stays 1, the fields are
 // additive and older builds ignore them).
+//
+// Kept polylines (#268) ride along the same way: `polylines`, their points
+// as base64 f64 in mm, optional and additive like the units.
 //
 // The pure core (`encodeF64`/`decodeF64`, `encodeU32`/`decodeU32`,
 // `buildProjectDoc`, `parseProjectDoc`) touches no scene and is unit-tested;
@@ -26,7 +36,9 @@ import type { MeshHandle } from "fast-mesh-wasm";
 import type { DistanceColoring } from "fast-mesh-wasm/store";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState } from "../app/state/app-state";
+import { extractLiveMeshData } from "../engine/workbench-ops";
 import { type ImportScale, isImportUnit, type LengthUnit, NO_IMPORT_SCALE } from "../shared/ux/units";
+import { makeCurve, type Polyline } from "../features/polylines/ux/polyline";
 import { bounds } from "./mesh-data";
 
 /** The project format version written by `buildProjectDoc`. */
@@ -70,10 +82,12 @@ export interface ProjectMesh {
   color: number;
   opacity: number;
   visible: boolean;
-  /** Base64 of the local positions as little-endian f64. */
+  /** Base64 of the local positions (relative to `origin`) as little-endian f64. */
   positions: string;
   /** Base64 of the indices as little-endian u32. */
   indices: string;
+  /** The mesh's origin (absent in older files: zero, whatever it was). */
+  origin?: [x: number, y: number, z: number];
   placement: ProjectPlacement;
   coloring: ProjectColoring | null;
   /** How the positions became mm on load (absent: as they were). Already applied: provenance only. */
@@ -87,6 +101,15 @@ export interface ProjectSection {
   fill: boolean;
 }
 
+/** One kept polyline as stored (#268): its points as base64 little-endian f64, in mm. */
+export interface ProjectPolyline {
+  name: string;
+  color: number;
+  visible: boolean;
+  closed: boolean;
+  points: string;
+}
+
 /** A parsed project file. Unknown fields are ignored by the loader. */
 export interface ProjectDoc {
   version: number;
@@ -98,6 +121,8 @@ export interface ProjectDoc {
   edgeSoftness: number;
   /** The project's display unit (absent in older files: the global default). */
   units?: LengthUnit;
+  /** The kept polylines (absent without any). */
+  polylines?: ProjectPolyline[];
 }
 
 // ---- Base64 over raw bytes (Buffer in Node/tests, btoa/atob in browsers) ----
@@ -211,6 +236,7 @@ export interface ProjectMeshInput {
   visible: boolean;
   positions: ArrayLike<number>;
   indices: ArrayLike<number>;
+  origin?: readonly [x: number, y: number, z: number];
   rotation: ArrayLike<number>;
   translation: [x: number, y: number, z: number];
   scale?: [x: number, y: number, z: number];
@@ -233,6 +259,7 @@ export function buildProjectDoc(input: {
   wireframe: boolean;
   edgeSoftness: number;
   units?: LengthUnit;
+  polylines?: readonly Pick<Polyline, "name" | "color" | "visible" | "closed" | "points">[];
 }): ProjectDoc {
   return {
     version: PROJECT_VERSION,
@@ -244,6 +271,7 @@ export function buildProjectDoc(input: {
       visible: m.visible,
       positions: encodeF64(m.positions),
       indices: encodeU32(m.indices),
+      ...(m.origin === undefined ? {} : { origin: [...m.origin] as [number, number, number] }),
       placement: {
         rotation: Array.from(m.rotation),
         translation: [...m.translation] as [number, number, number],
@@ -262,6 +290,17 @@ export function buildProjectDoc(input: {
     wireframe: input.wireframe,
     edgeSoftness: input.edgeSoftness,
     ...(input.units === undefined ? {} : { units: input.units }),
+    ...(input.polylines === undefined || input.polylines.length === 0
+      ? {}
+      : {
+          polylines: input.polylines.map((p) => ({
+            name: p.name,
+            color: p.color,
+            visible: p.visible,
+            closed: p.closed,
+            points: encodeF64(p.points),
+          })),
+        }),
   };
 }
 
@@ -334,6 +373,34 @@ function readImportScale(value: unknown): ImportScale | undefined {
   return { factor: value.factor, units: isImportUnit(value.units) ? value.units : null };
 }
 
+/** The stored polylines that can be read: the others are dropped. */
+function readPolylines(value: unknown): ProjectPolyline[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const out: ProjectPolyline[] = [];
+  for (const raw of value as unknown[]) {
+    if (!isRecord(raw) || typeof raw.points !== "string") {
+      continue;
+    }
+    try {
+      const curve = makeCurve(decodeF64(raw.points, "polyline points"), raw.closed === true);
+      if (curve !== null) {
+        out.push({
+          name: typeof raw.name === "string" && raw.name !== "" ? raw.name : `Polyline ${out.length + 1}`,
+          color: typeof raw.color === "number" && Number.isFinite(raw.color) ? raw.color : 0xffd166,
+          visible: raw.visible !== false,
+          closed: curve.closed,
+          points: encodeF64(curve.points),
+        });
+      }
+    } catch {
+      // Not base64 of whole f64s.
+    }
+  }
+  return out;
+}
+
 /**
  * Parses project JSON into a doc, tolerantly: unknown fields are ignored, a
  * newer `version` still loads what is understood, and invalid entries fall
@@ -389,6 +456,7 @@ export function parseProjectDoc(text: string): ProjectDoc {
     const translation = numTriple(placement.translation) ?? [0, 0, 0];
     const scaleRaw = numTriple(placement.scale);
     const scale = scaleRaw !== null && scaleRaw.every((n) => n > 0) ? (scaleRaw as [number, number, number]) : undefined;
+    const origin = numTriple(raw.origin);
     const importScale = readImportScale(raw.importScale);
     meshes.push({
       name: typeof raw.name === "string" && raw.name !== "" ? raw.name : `Mesh ${meshes.length + 1}`,
@@ -397,6 +465,7 @@ export function parseProjectDoc(text: string): ProjectDoc {
       visible: raw.visible === undefined ? true : raw.visible === true,
       positions: encodeF64(positions),
       indices: encodeU32(indices),
+      ...(origin === null ? {} : { origin }),
       placement: {
         rotation,
         translation,
@@ -406,7 +475,8 @@ export function parseProjectDoc(text: string): ProjectDoc {
       ...(importScale === undefined ? {} : { importScale }),
     });
   }
-  if (meshes.length === 0) {
+  const polylines = readPolylines(root.polylines);
+  if (meshes.length === 0 && polylines.length === 0) {
     throw new Error("this project file has no readable meshes");
   }
   // Targets were validated against the raw count; remap onto the kept meshes.
@@ -449,6 +519,7 @@ export function parseProjectDoc(text: string): ProjectDoc {
     wireframe: root.wireframe === true,
     edgeSoftness: typeof root.edgeSoftness === "number" && Number.isFinite(root.edgeSoftness) && root.edgeSoftness >= 0 ? root.edgeSoftness : 0,
     ...(root.units === "mm" || root.units === "in" ? { units: root.units } : {}),
+    ...(polylines.length === 0 ? {} : { polylines }),
   };
 }
 
@@ -462,7 +533,12 @@ export function collectProject(store: SceneStore, app: AppState): ProjectDoc {
   return buildProjectDoc({
     meshes: items.map((item) => {
       const display = snap.meshes.get(item.mesh)?.desired ?? { coloring: null, opacity: 1, visible: true };
+      // Without the slots an edit left dead: their triangles would come back
+      // as ones on vertex 0. A mesh with nothing else keeps them, to be listed.
+      const live = extractLiveMeshData(store.scene, item.mesh);
       const views = store.scene.views(item.mesh);
+      const [positions, indices] =
+        live.indices.length > 0 ? [live.positions, live.indices] : [views.positions(), views.indices()];
       const placement = store.scene.placement(item.mesh);
       const coloring = display.coloring;
       const targets =
@@ -476,8 +552,9 @@ export function collectProject(store: SceneStore, app: AppState): ProjectDoc {
         color: item.color,
         opacity: display.opacity,
         visible: display.visible,
-        positions: views.positions(),
-        indices: views.indices(),
+        positions,
+        indices,
+        origin: live.origin,
         rotation: placement.rotation,
         translation: [placement.translation[0], placement.translation[1], placement.translation[2]],
         ...(placement.scale === undefined ? {} : { scale: [placement.scale[0], placement.scale[1], placement.scale[2]] as [number, number, number] }),
@@ -511,11 +588,12 @@ export function collectProject(store: SceneStore, app: AppState): ProjectDoc {
     wireframe: app.getSnapshot().wireframe,
     edgeSoftness: app.getSnapshot().edgeSoftness,
     units: app.getSnapshot().units,
+    polylines: app.getSnapshot().polylines,
   });
 }
 
 /**
- * Reopens a project doc: replaces every mesh and section with the doc's.
+ * Reopens a project doc: replaces every mesh, section and kept polyline with the doc's.
  * Source volumes are not stored (tens of megabytes), so reopened meshes keep
  * their isosurface geometry but lose their volume link (`volumeId`).
  */
@@ -534,13 +612,19 @@ export function restoreProject(store: SceneStore, app: AppState, doc: ProjectDoc
   for (const mesh of doc.meshes) {
     const positions = decodeF64(mesh.positions, "positions");
     const indices = decodeU32(mesh.indices, "indices");
+    const { origin } = mesh;
+    if (origin !== undefined) {
+      for (let k = 0; k < positions.length; k++) {
+        positions[k] += origin[k % 3];
+      }
+    }
     const { center, radius } = bounds(positions);
     // The positions as stored, already in mm: `importScale` only rides along.
     const item = app.addMesh(store, {
       name: mesh.name,
       positions,
       indices,
-      center,
+      center: origin ?? center,
       radius,
       volumeId: null,
       preset: null,
@@ -595,6 +679,17 @@ export function restoreProject(store: SceneStore, app: AppState, doc: ProjectDoc
   app.setWireframe(doc.wireframe);
   app.setEdgeSoftness(doc.edgeSoftness);
   app.setProjectUnits(doc.units);
+  app.resetPolylines(
+    store,
+    (doc.polylines ?? []).map((p) => ({
+      id: app.newPolylineId(),
+      name: p.name,
+      color: p.color,
+      visible: p.visible,
+      closed: p.closed,
+      points: decodeF64(p.points, "polyline points"),
+    })),
+  );
 }
 
 // ---- Files: File System Access with a download/input fallback ----

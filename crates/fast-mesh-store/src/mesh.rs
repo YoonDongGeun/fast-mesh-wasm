@@ -289,6 +289,21 @@ impl Mesh {
         self.origin
     }
 
+    /// The same mesh with its positions relative to `origin`: they keep their
+    /// stored values, so it moves in the world by the change of the origin.
+    /// For a mesh built in a frame around a point, so that its positions are
+    /// small: give it that point. Costs nothing, whatever the size.
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidArgument`] when `origin` is not finite.
+    pub fn with_origin(mut self, origin: [f64; 3]) -> Result<Self> {
+        if !origin.iter().all(|x| x.is_finite()) {
+            return Err(StoreError::InvalidArgument("the origin must be finite"));
+        }
+        self.origin = origin;
+        Ok(self)
+    }
+
     /// Number of vertex slots, alive or dead. Render buffers use this length.
     pub fn vertex_slots(&self) -> usize {
         self.positions.len()
@@ -922,6 +937,28 @@ mod tests {
             Mesh::from_buffers_f64_with_origin(&[0., 0.], &[], [0.; 3]),
             Err(StoreError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn with_origin_moves_a_mesh_and_keeps_its_positions() {
+        let o = [1.0e7, -2.0e7, 0.25];
+        let m = Mesh::from_buffers(&[0.1, 0.2, 0.3, 1., 0., 0., 0., 1., 0.], &[0, 1, 2])
+            .unwrap()
+            .with_origin(o)
+            .unwrap();
+        assert_eq!(m.origin(), o);
+        assert_eq!(m.position(0), Some([0.1, 0.2, 0.3]));
+        assert_eq!(
+            m.world_position(0),
+            Some([0, 1, 2].map(|k| o[k] + f64::from([0.1f32, 0.2, 0.3][k])))
+        );
+        assert_eq!(m.triangle(0), Some([0, 1, 2]));
+        for x in [f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                Mesh::new().with_origin([0., x, 0.]),
+                Err(StoreError::InvalidArgument(_))
+            ));
+        }
     }
 
     #[test]

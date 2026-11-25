@@ -33,12 +33,16 @@ import {
   type ShowcaseSettings,
   type ShowcaseTheme,
 } from "../../shared/ux/settings";
+import { meshOrigin } from "../../shared/ux/mesh-center";
 import { type ImportScale, type LengthUnit, NO_IMPORT_SCALE } from "../../shared/ux/units";
 import { createDefaultWave6State, type Wave6State } from "./wave6-state";
 import { DEFAULT_PLACEMENT_TOOL, type PlacementToolState } from "../../features/transform/ux/placement-picks";
 import { type AlignToolState, DEFAULT_ALIGN_TOOL } from "../../features/transform/ux/align-tools";
 import { DEFAULT_OBJECT_INFO, type ObjectInfoState } from "../../features/inspect/ux/object-info-state";
 import { DEFAULT_SURFACE_PATH_TOOL, type SurfacePathToolState } from "../../features/inspect/ux/surface-paths";
+import { type BuildPlate, DEFAULT_BUILD_PLATE } from "../../features/build-plate/ux/plate";
+import type { Polyline, PolylineDisplay } from "../../features/polylines/ux/polyline";
+import { PolylineHistory } from "../../features/polylines/ux/polyline-history";
 
 export interface Item {
   /** A React key. */
@@ -54,7 +58,11 @@ export interface Item {
   color: number;
   /** The triangle count when loaded (repairs change it; see `useTriangleCount`). */
   triangles: number;
-  /** The mesh origin: its bounding box centre when loaded. */
+  /**
+   * The mesh origin: its bounding box centre when loaded. `scene.matrix4`
+   * has it in: see `worldCenter` (shared/ux/mesh-center.ts) for the mesh's
+   * middle in the world.
+   */
   center: Vec3;
   /** Half the bounding box diagonal, for focusing the camera. */
   radius: number;
@@ -404,6 +412,12 @@ export interface AppSnapshot {
   objectInfo: ObjectInfoState;
   /** The geodesic map's sources, the surface path and their armed pick (#252). */
   surfacePath: SurfacePathToolState;
+  /** The build plate and how Arrange fills it (#266; persisted, not undoable). */
+  buildPlate: BuildPlate;
+  /** The polylines kept as objects, in list order (#268). */
+  polylines: readonly Polyline[];
+  /** The selected polylines' ids, in click order: what the polyline tools work on (#268). */
+  polylineSelection: readonly number[];
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -493,6 +507,9 @@ export class AppState {
     alignTool: DEFAULT_ALIGN_TOOL,
     objectInfo: DEFAULT_OBJECT_INFO,
     surfacePath: DEFAULT_SURFACE_PATH_TOOL,
+    buildPlate: DEFAULT_BUILD_PLATE,
+    polylines: [],
+    polylineSelection: [],
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -526,6 +543,7 @@ export class AppState {
       cameraProjection: initial.cameraProjection,
       scaleIndicator: initial.scaleIndicator,
       showAxisBasis: initial.showAxisBasis,
+      buildPlate: { ...initial.buildPlate },
     };
   }
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
@@ -535,9 +553,12 @@ export class AppState {
   readonly #listeners = new Set<() => void>();
   /** Meshes out of the list that undo or redo can bring back (see {@link AppState.follow}). */
   readonly #parked = new Map<MeshHandle, ParkedItem>();
+  /** The polyline list's place in the undo history. */
+  readonly #polylineHistory = new PolylineHistory();
   #nextItem = 0;
   #nextColor = 0;
   #nextGroup = 1;
+  #nextPolyline = 1;
 
   getSnapshot = (): AppSnapshot => this.#snap;
 
@@ -593,6 +614,17 @@ export class AppState {
     if (select !== undefined && store.getSnapshot().selection === null) {
       this.#set({ multi: [select] });
       store.select(select);
+    }
+    const polylines = this.#polylineHistory.follow(store);
+    if (polylines !== null) {
+      // Display settings are not undone: they stay as they are now.
+      const shown = new Map(this.#snap.polylines.map((p) => [p.id, p]));
+      this.#setPolylines(
+        polylines.map((p) => {
+          const now = shown.get(p.id);
+          return now === undefined ? p : { ...p, name: now.name, color: now.color, visible: now.visible };
+        }),
+      );
     }
   }
 
@@ -656,12 +688,11 @@ export class AppState {
       if (z < z0) z0 = z;
       if (z > z1) z1 = z;
     }
-    const center: Vec3 = x0 <= x1 ? [(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2] : [0, 0, 0];
     const radius = x0 <= x1 ? Math.hypot(x1 - x0, y1 - y0, z1 - z0) / 2 : 1;
     return this.#registerItem(mesh, {
       name,
       triangles,
-      center,
+      center: meshOrigin(store.scene, mesh),
       radius,
       volumeId: null,
       preset: null,
@@ -785,16 +816,6 @@ export class AppState {
     }
     const meshGroups = restoreMember(this.#snap.meshGroups, parked.folders, item.mesh);
     this.#set({ items, collision, group, meshGroups });
-  }
-
-  /**
-   * Drops a mesh the engine already removed (a join's source): the same list
-   * cleanup as {@link removeMesh}, without the store call (which would report
-   * the missing mesh as an error).
-   */
-  dropItem(store: SceneStore, item: Item): void {
-    item.material.dispose();
-    this.#dropLists(item, this.#detach(store, item));
   }
 
   /**
@@ -1125,6 +1146,49 @@ export class AppState {
     this.#set({ surfacePath: { ...this.#snap.surfacePath, ...patch } });
   }
 
+  /** Changes the build plate: its size, place, spacing, or whether it shows (#266; not undoable). */
+  setBuildPlate(patch: Partial<BuildPlate>): void {
+    this.#set({ buildPlate: { ...this.#snap.buildPlate, ...patch } });
+  }
+
+  /**
+   * Replaces the polyline list as an undo step, or as part of the open one
+   * (#268). `select` becomes the selection; without it, the selected ones
+   * still listed stay selected.
+   */
+  editPolylines(store: SceneStore, polylines: readonly Polyline[], select?: readonly number[]): void {
+    const before = this.#snap.polylines;
+    this.#polylineHistory.record(store, before, polylines);
+    this.#setPolylines(polylines, select);
+  }
+
+  /** Replaces the polyline list for good, as opening a project does (#268). */
+  resetPolylines(store: SceneStore, polylines: readonly Polyline[]): void {
+    this.#polylineHistory.reset(store);
+    this.#setPolylines(polylines, []);
+  }
+
+  #setPolylines(polylines: readonly Polyline[], select: readonly number[] = this.#snap.polylineSelection): void {
+    const ids = new Set(polylines.map((p) => p.id));
+    this.#set({ polylines, polylineSelection: select.filter((id) => ids.has(id)) });
+  }
+
+  /** An id for a new polyline, never used before (#268). */
+  newPolylineId(): number {
+    return this.#nextPolyline++;
+  }
+
+  /** Selects polylines by id (#268). */
+  selectPolylines(ids: readonly number[]): void {
+    this.#set({ polylineSelection: ids });
+  }
+
+  /** Renames, recolours, shows or hides polylines (#268; display state, not undoable). */
+  setPolylineDisplay(ids: readonly number[], patch: Partial<PolylineDisplay>): void {
+    const on = new Set(ids);
+    this.#set({ polylines: this.#snap.polylines.map((p) => (on.has(p.id) ? { ...p, ...patch } : p)) });
+  }
+
   /** Locks or unlocks a mesh against move/rotate/scale and sculpt/mask edits (#235). */
   setMeshLocked(mesh: MeshHandle, locked: boolean): void {
     let changed = false;
@@ -1339,6 +1403,7 @@ export class AppState {
       cameraProjection: d.cameraProjection,
       scaleIndicator: d.scaleIndicator,
       showAxisBasis: d.showAxisBasis,
+      buildPlate: d.buildPlate,
     });
   }
 

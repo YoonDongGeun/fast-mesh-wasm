@@ -325,6 +325,8 @@ describe("WorkerScene UVs", () => {
     await settle(scene);
     expect(scene.views(a).uvs()?.subarray(0, 8)).toEqual(quad.uvs);
     await expectMirrored(scene, a);
+    // The source is back too, with the handle it had (#271).
+    await expectMirrored(scene, b);
   });
 
   it("auto repair keeps the mirror aligned, seams apart, and undoes", async () => {

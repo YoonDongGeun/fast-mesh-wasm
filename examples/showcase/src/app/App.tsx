@@ -8,10 +8,13 @@ import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { Suspense, lazy, useCallback, useState, type RefObject } from "react";
 import type { Loader } from "../io/loader";
+import { BuildPlatePanel } from "../features/build-plate/ui/BuildPlatePanel";
 import { CollisionPanel } from "../features/collision/ui/CollisionPanel";
 import { CommandPalette } from "../shell/ui/CommandPalette";
 import { CreatePrimitiveDialog } from "../features/home/ui/CreatePrimitiveDialog";
 import { TextDialog } from "../features/mesh-edit/ui/TextDialog";
+import { ReliefDialog } from "../features/mesh-edit/ui/ReliefDialog";
+import { useReliefDrop } from "../features/mesh-edit/ux/use-relief-drop";
 import { DeformPanel } from "../features/sculpt/ui/DeformPanel";
 import { ExportPanel } from "../features/home/ui/ExportPanel";
 import { GroupsBar } from "../features/collision/ui/GroupsBar";
@@ -23,6 +26,7 @@ import { MeshList } from "../features/home/ui/MeshList";
 import { ObjectInfoBox } from "../features/inspect/ui/ObjectInfoBox";
 import { ModelingPanel } from "../features/mesh-edit/ui/ModelingPanel";
 import { PointsPanel } from "../features/points/ui/PointsPanel";
+import { PolylinePanel } from "../features/polylines/ui/PolylinePanel";
 import { ProjectPanel } from "../features/home/ui/ProjectPanel";
 import { RepairPanel } from "../features/mesh-repair/ui/RepairPanel";
 import {
@@ -68,7 +72,8 @@ const VolumePanel = lazy(() => import("../features/ct/ui/VolumePanel").then((m) 
 
 /** A request to point the camera at a mesh; `n` makes a repeated request new. */
 export interface FocusRequest {
-  mesh: MeshHandle;
+  /** `null` with a `box` that is no mesh's. */
+  mesh: MeshHandle | null;
   n: number;
   /** Look from this direction (default: the camera's current one). */
   dir?: readonly [number, number, number];
@@ -137,7 +142,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     tourStep,
     endTour,
   });
-  const dropping = useFileDrop(load);
+  const dropping = useFileDrop(useReliefDrop(app, load));
 
   const activateTabForSlot = (targetTab: WorkbenchTab) => {
     app.setActiveTab(targetTab);
@@ -173,6 +178,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           onLoadSample={loadSample}
           onLoadDemo={loadDemo}
           onFocus={focusOn}
+          onFocusBox={(box) => focusOn(null, undefined, box)}
         />
         <GroupsBar app={app} />
         <ProjectPanel app={app} />
@@ -203,6 +209,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <ViewportNavigationHud app={app} />
         <CreatePrimitiveDialog app={app} />
         <TextDialog app={app} />
+        <ReliefDialog app={app} />
         <p className="hint">
           {viewportHint({
             sculpting: sculpt !== null,
@@ -228,6 +235,13 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           data-inspector-slot="home"
         >
           <HomeOverviewCard app={app} itemCount={items.length} onResetView={requestResetView} />
+        </div>
+        <div
+          className={tabMatchesSlot(activeTab, "buildPlate") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="build-plate"
+          onClickCapture={() => activateTabForSlot("home")}
+        >
+          <BuildPlatePanel app={app} />
         </div>
         <div
           className={tabMatchesSlot(activeTab, "transform") ? "inspector-slot" : "inspector-slot inspector-hidden"}
@@ -298,6 +312,12 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           onClickCapture={() => activateTabForSlot("inspect")}
         >
           <InspectPanel app={app} scene={engine.scene} />
+        </div>
+        <div
+          className={tabMatchesSlot(activeTab, "polylines") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="polylines"
+        >
+          <PolylinePanel app={app} />
         </div>
         <div
           className={tabMatchesSlot(activeTab, "export") ? "inspector-slot" : "inspector-slot inspector-hidden"}

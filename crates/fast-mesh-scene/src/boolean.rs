@@ -18,7 +18,7 @@ use fast_mesh_store::{Mesh, StoreError, TriangleId, UV_CHANNEL, VertexId};
 
 use crate::baked::baked_mesh;
 pub use crate::ops::boolean::{BooleanMethod, BooleanOptions, CsgNode};
-use crate::placement::{is_relative_rigid, relative_affine, relative_rigid};
+use crate::placement::{is_relative_rigid, local_to_world, relative_affine, relative_rigid};
 use crate::{MeshId, MeshOptions, Placement, Result, Scene};
 
 /// Which boolean to compute.
@@ -311,8 +311,10 @@ impl Scene {
         })
     }
 
-    /// Evaluates an N-ary CSG tree over `meshes` in world coordinates and inserts
+    /// Evaluates an N-ary CSG tree over `meshes` as placed in the world and inserts
     /// the combined mesh into the scene at [`Placement::IDENTITY`], returning its [`MeshId`].
+    /// Its origin is the centre of the bounds of the meshes the tree uses, so that its
+    /// positions have the precision of small `f32` coordinates wherever those are.
     ///
     /// Source meshes remain untouched in the scene. The add is one undo step
     /// (an undoable add, see [`MeshOptions::undoable`]): undo removes the
@@ -328,6 +330,7 @@ impl Scene {
             self.entry(id)?;
         }
         self.prepare(Some(meshes))?;
+        let origin = self.batch_origin(meshes, tree)?;
 
         let mut prepared: Vec<(Option<Mesh>, Rigid)> = Vec::new();
         prepared
@@ -340,7 +343,7 @@ impl Scene {
             if !entry.placement.is_scaled() && !has_seams {
                 let xf = relative_rigid(
                     &Placement::IDENTITY,
-                    [0.0; 3],
+                    origin,
                     &entry.placement,
                     entry.mesh.origin(),
                 );
@@ -348,7 +351,7 @@ impl Scene {
             } else {
                 let affine = relative_affine(
                     &Placement::IDENTITY,
-                    [0.0; 3],
+                    origin,
                     &entry.placement,
                     entry.mesh.origin(),
                 );
@@ -383,12 +386,62 @@ impl Scene {
         drop(pairs);
         drop(prepared);
         self.add_mesh(
-            combined,
+            combined.with_origin(origin)?,
             MeshOptions {
                 undoable: true,
                 ..MeshOptions::default()
             },
         )
+    }
+
+    /// The centre of the world bounds of the meshes that `tree` uses (zero
+    /// without any triangle in them). Needs their BVHs to be current.
+    fn batch_origin(&self, meshes: &[MeshId], tree: &CsgNode) -> Result<[f64; 3]> {
+        let mut bounds = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        self.grow_batch_bounds(meshes, tree, &mut bounds)?;
+        let (lo, hi) = bounds;
+        if lo[0] > hi[0] {
+            return Ok([0.0; 3]);
+        }
+        Ok(std::array::from_fn(|k| 0.5 * lo[k] + 0.5 * hi[k]))
+    }
+
+    /// Grows `bounds` by the world boxes of the leaves of `tree`, from their
+    /// local boxes. A leaf without a mesh is the evaluation's to reject.
+    fn grow_batch_bounds(
+        &self,
+        meshes: &[MeshId],
+        tree: &CsgNode,
+        bounds: &mut ([f64; 3], [f64; 3]),
+    ) -> Result<()> {
+        match tree {
+            CsgNode::Leaf(i) => {
+                let Some(&id) = meshes.get(*i) else {
+                    return Ok(());
+                };
+                let entry = self.entry(id)?;
+                let Some(b) = entry.bvh.root_bounds().filter(|b| !b.is_empty()) else {
+                    return Ok(());
+                };
+                let o = entry.mesh.origin();
+                for corner in 0..8 {
+                    let p = std::array::from_fn(|k| {
+                        let end = if corner >> k & 1 == 1 { b.max } else { b.min };
+                        f64::from(end[k])
+                    });
+                    let w = local_to_world(&entry.placement, o, p);
+                    for (k, &c) in w.iter().enumerate() {
+                        bounds.0[k] = bounds.0[k].min(c);
+                        bounds.1[k] = bounds.1[k].max(c);
+                    }
+                }
+                Ok(())
+            }
+            CsgNode::Op { left, right, .. } => {
+                self.grow_batch_bounds(meshes, left, bounds)?;
+                self.grow_batch_bounds(meshes, right, bounds)
+            }
+        }
     }
 }
 

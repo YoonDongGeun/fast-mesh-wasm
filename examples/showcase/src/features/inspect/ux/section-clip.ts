@@ -6,6 +6,7 @@ import type { Scene, SectionHandle } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import type { AppState, Item } from "../../../app/state/app-state";
+import { worldCenter } from "../../../shared/ux/mesh-center";
 
 export type Axis = "x" | "y" | "z";
 export const AXES: Axis[] = ["x", "y", "z"];
@@ -24,8 +25,8 @@ export type PanelSection = {
 type SectionPlaneInput = { origin: [number, number, number]; normal: [number, number, number] };
 
 /**
- * The section's anchor: the selected mesh's world center (its local center
- * through the placement, so the offset slider follows gizmo moves).
+ * The section's anchor: the selected mesh's world center (through the
+ * placement, so the offset slider follows gizmo moves).
  */
 export function sectionCenter(
   scene: Scene | WorkerScene,
@@ -37,12 +38,7 @@ export function sectionCenter(
     return null;
   }
   try {
-    const m = scene.matrix4(item.mesh);
-    return [
-      m[0] * item.center[0] + m[4] * item.center[1] + m[8] * item.center[2] + m[12],
-      m[1] * item.center[0] + m[5] * item.center[1] + m[9] * item.center[2] + m[13],
-      m[2] * item.center[0] + m[6] * item.center[1] + m[10] * item.center[2] + m[14],
-    ];
+    return worldCenter(scene, item.mesh);
   } catch {
     return null; // removed meanwhile
   }
@@ -156,15 +152,13 @@ export function sectionActions(
 type ClipBox = { min: [number, number, number]; max: [number, number, number] };
 
 /**
- * The selected mesh's middle half in world coordinates: its local center
- * through the placement (scale-aware), half the world radius each way.
+ * The selected mesh's middle half in world coordinates: around its world
+ * center, half the world radius (scale-aware) each way.
  */
 export function fitWorldBox(scene: Scene | WorkerScene, item: Item): ClipBox | null {
   try {
     const m = scene.matrix4(item.mesh);
-    const cx = m[0] * item.center[0] + m[4] * item.center[1] + m[8] * item.center[2] + m[12];
-    const cy = m[1] * item.center[0] + m[5] * item.center[1] + m[9] * item.center[2] + m[13];
-    const cz = m[2] * item.center[0] + m[6] * item.center[1] + m[10] * item.center[2] + m[14];
+    const [cx, cy, cz] = worldCenter(scene, item.mesh);
     // The placement's axis scales (columns' lengths): non-uniform scale (#103) stretches the box.
     const sx = Math.sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
     const sy = Math.sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);

@@ -145,10 +145,10 @@ describe("wraps on Scene & WorkerScene", () => {
     expect(measured.volume).toBeLessThan(1.9);
     expect(await s.selfIntersectingTriangles(r.mesh)).toHaveLength(0);
 
-    // One undo step empties it; redo fills it again. The sources are untouched.
+    // One undo step removes it; redo brings it back (#271). The sources are untouched.
     s.undo();
     await settle(s);
-    expect(liveTriangles(s, r.mesh)).toBe(0);
+    expect([s.has(r.mesh), s.isRestorable(r.mesh)]).toEqual([false, true]);
     expect(liveTriangles(s, ma)).toBe(12);
     s.redo();
     await settle(s);

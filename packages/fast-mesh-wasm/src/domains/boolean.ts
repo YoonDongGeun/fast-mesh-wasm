@@ -103,6 +103,11 @@ export interface BooleanDomain<Async extends boolean = false> {
   booleanBatch(tree: CsgNode, options?: BooleanOptions): BooleanReturn<Async, MeshHandle>;
   cut(mesh: MeshHandle, plane: SectionPlane, options?: CutOptions): BooleanReturn<Async, CutReport>;
   cutByPlane(mesh: MeshHandle, plane: SectionPlane, options?: CutOptions): BooleanReturn<Async, CutReport>;
+  /**
+   * Imprints a world-space polyline onto `mesh` and, with `closed: true`,
+   * deletes one side of the loop from the component it lies on: see
+   * `Scene.trimByCurve`.
+   */
   trimByCurve(mesh: MeshHandle, options: TrimCurveOptions): BooleanReturn<Async, TrimReport>;
   trimByCurve(
     mesh: MeshHandle,

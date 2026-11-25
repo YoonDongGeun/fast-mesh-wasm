@@ -50,7 +50,28 @@ export type {
   ExtrudeFacesOptions,
   ExtrudeFacesResult,
 } from "./extrude.js";
+export {
+  type AddHeightfieldOptions,
+  type Heightfield,
+  type HeightfieldResult,
+  type HeightMap,
+  type HeightMapFrame,
+  type HeightMapOptions,
+  heightMapPlacement,
+  MAX_HEIGHT_MAP_PIXELS,
+} from "./height-map.js";
+export { generateHeightfield } from "./height-map-wasm.js";
 export type { ConvexHullOptions, ConvexHullPoints, ConvexHullResult } from "./hull.js";
+export {
+  DEFAULT_LATTICE_MAX_VOXELS,
+  DEFAULT_LATTICE_PREVIEW_VOXELS,
+  type LatticeKind,
+  type LatticeOptions,
+  type LatticePlan,
+  type LatticePreview,
+  type LatticeRegion,
+  type LatticeReport,
+} from "./lattice.js";
 export {
   DEFAULT_WRAP_DETAIL,
   DEFAULT_WRAP_MAX_VOXELS,

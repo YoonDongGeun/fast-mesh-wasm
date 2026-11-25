@@ -79,6 +79,7 @@ export interface InspectBackend<Async extends boolean = false> {
     targetVertex: number,
     options?: SurfacePathOptions,
   ): InspectReturn<Async, SurfacePathPoint[]>;
+  releaseGeodesics?: () => InspectReturn<Async, void>;
   addDistanceField(desc: DistanceFieldDesc): FieldHandle;
   addThicknessField?: (desc: ThicknessFieldDesc) => FieldHandle;
   addCurvatureField?: (desc: CurvatureFieldDesc) => FieldHandle;
@@ -148,11 +149,27 @@ export interface InspectDomain<Async extends boolean = false> {
     sliverThreshold?: number,
   ): InspectReturn<Async, QualityReport>;
   meshDeviation(source: MeshHandle, target: MeshHandle, options?: DeviationOptions): InspectReturn<Async, DeviationStats>;
+  /**
+   * The distance along the surface from the nearest of the vertices
+   * `sources` to every vertex slot, in world units: `Infinity` where no
+   * source reaches, on unused slots and past `maxDistance`.
+   *
+   * `"heatMethod"` first prepares operators of the mesh, about half the time
+   * of a query. They are kept (about 130 bytes a triangle) for later queries
+   * of the same mesh, until it changes, another mesh is queried, or
+   * {@link InspectDomain.releaseGeodesics}. On a `WorkerScene` a query runs
+   * in steps and can be cancelled (`options.signal`).
+   */
   geodesicDistances(
     mesh: MeshHandle,
     sources: number | readonly number[],
     options?: GeodesicOptions,
   ): InspectReturn<Async, Float32Array>;
+  /**
+   * Frees what `"heatMethod"` queries keep for the next one (see
+   * {@link InspectDomain.geodesicDistances}).
+   */
+  releaseGeodesics(): InspectReturn<Async, void>;
   shortestSurfacePath(
     mesh: MeshHandle,
     sources: number | readonly number[],
@@ -242,6 +259,7 @@ export function createInspectDomain<Async extends boolean>(backend: InspectBacke
       backend.meshDeviation(source, target, options),
     geodesicDistances: (mesh: MeshHandle, sources: number | readonly number[], options?: GeodesicOptions) =>
       backend.geodesicDistances(mesh, sources, options),
+    releaseGeodesics: () => backend.releaseGeodesics?.() as InspectReturn<Async, void>,
     shortestSurfacePath,
     findSurfacePath: shortestSurfacePath,
     addDistanceField: (desc: DistanceFieldDesc) => backend.addDistanceField(desc),

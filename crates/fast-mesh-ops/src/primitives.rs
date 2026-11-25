@@ -333,7 +333,7 @@ const MAX_LENGTH: f64 = 1e30;
 const TOO_LARGE: &str = "the primitive has more vertices or triangles than u32 ids can name";
 
 /// A length in `[MIN_LENGTH, MAX_LENGTH]`.
-fn length(v: f64, what: &'static str) -> Result<f64> {
+pub(crate) fn length(v: f64, what: &'static str) -> Result<f64> {
     if v.is_finite() && (MIN_LENGTH..=MAX_LENGTH).contains(&v) {
         Ok(v)
     } else {
@@ -352,7 +352,7 @@ fn count(v: u32, min: u32, what: &'static str) -> Result<u32> {
 
 /// `n` as a `u32` id count, or the "too large" error. Counts are computed
 /// in `u128`, where no product of two `u32` parameters overflows.
-fn ids(n: u128) -> Result<u32> {
+pub(crate) fn ids(n: u128) -> Result<u32> {
     u32::try_from(n).map_err(|_| OpsError::InvalidInput(TOO_LARGE))
 }
 

@@ -1079,13 +1079,15 @@ describe("analyze and repair", () => {
     expect(r).toEqual({ verticesAdded: 4, trianglesAdded: 2, bridgeTrianglesAdded: 8 });
     expect(s.triangleCount(a)).toBe(2 + 2 + 8);
     expect(codeOf(() => s.triangleCount(b))).toBe("UNKNOWN_MESH");
-    // One undo step restores the target; the source stays removed.
+    // One undo step restores the target and brings the source back (#271).
+    expect([s.has(b), s.isRestorable(b)]).toEqual([false, true]);
     expect(s.undo()).toBe(true);
     expect(s.canUndo()).toBe(false);
     expect(s.triangleCount(a)).toBe(2);
-    expect(codeOf(() => s.triangleCount(b))).toBe("UNKNOWN_MESH");
+    expect(s.triangleCount(b)).toBe(2);
     expect(s.redo()).toBe(true);
     expect(s.triangleCount(a)).toBe(2 + 2 + 8);
+    expect(codeOf(() => s.triangleCount(b))).toBe("UNKNOWN_MESH");
   });
 
   it("join_rejects_bad_selection", () => {

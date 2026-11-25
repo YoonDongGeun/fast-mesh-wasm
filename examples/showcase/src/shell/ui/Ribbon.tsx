@@ -7,7 +7,9 @@
  */
 import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
 import type { AppState, WorkbenchTab } from "../../app/state/app-state";
+import { ARRANGE_SCOPE, CLONE_COPIES, toggleBuildPlate } from "../../features/build-plate/ux/build-plate-commands";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
+import { reliefDialogOf } from "../../features/mesh-edit/ux/relief-dialog-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
 import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
 import { DYNTOPO_MODE_OPTIONS } from "../../features/sculpt/ux/sculpt";
@@ -68,6 +70,7 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
     faceSelectTool,
     deformAlgo,
     deformTool,
+    plateShown,
     pickMode,
     toggleFaceSelectTool,
     chooseDeformAlgorithm,
@@ -235,6 +238,14 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               >
                 Create Text…
               </button>
+              <button
+                type="button"
+                data-ribbon-focus="height-map"
+                title="Export an orthographic depth image as a 16-bit PNG"
+                onClick={() => focusElement('[data-action="export-height-map"]')}
+              >
+                Height Map…
+              </button>
               <button type="button" onClick={onResetView}>
                 Reset View
               </button>
@@ -243,6 +254,23 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" onClick={() => app.setCommandPaletteOpen(true)}>
                 Command Search (Ctrl+K)
+              </button>
+            </div>
+            <div className="group" aria-label="Build plate">
+              <button
+                type="button"
+                data-action="build-plate"
+                aria-pressed={plateShown}
+                title="Show or hide the build plate"
+                onClick={() => toggleBuildPlate(app)}
+              >
+                Build Plate
+              </button>
+              <button type="button" data-ribbon-focus="arrange" onClick={() => focusElement(ARRANGE_SCOPE)}>
+                Arrange…
+              </button>
+              <button type="button" data-ribbon-focus="multi-clone" onClick={() => focusElement(CLONE_COPIES)}>
+                Multi-Clone…
               </button>
             </div>
             <div className="group ribbon-shading-strip" aria-label="Shading">
@@ -445,11 +473,17 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button type="button" data-ribbon-focus="hollow" onClick={() => focusElement("[data-modeling-hollow-section]")}>
                 Hollow
               </button>
+              <button type="button" data-ribbon-focus="lattice" onClick={() => focusElement("[data-lattice-cell]")}>
+                Lattice
+              </button>
               <button type="button" data-ribbon-focus="drain" onClick={() => focusElement("[data-modeling-drain-section]")}>
                 Drain Hole
               </button>
               <button type="button" data-ribbon-focus="place" onClick={() => focusElement("[data-modeling-place-section]")}>
                 Surface Stamp
+              </button>
+              <button type="button" data-ribbon-focus="polylines" onClick={() => focusElement("[data-panel='polylines']")}>
+                Polylines
               </button>
               <button
                 type="button"
@@ -458,6 +492,14 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
                 onClick={() => textDialogOf(app).open()}
               >
                 Text…
+              </button>
+              <button
+                type="button"
+                data-action="image-to-relief"
+                title="Turn an image into a closed relief"
+                onClick={() => reliefDialogOf(app).open()}
+              >
+                Image to Relief…
               </button>
               <button
                 type="button"
@@ -565,6 +607,9 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" data-ribbon-focus="geodesic" onClick={() => focusElement("[data-inspect-geodesic]")}>
                 Geodesic
+              </button>
+              <button type="button" data-ribbon-focus="polylines" onClick={() => focusElement("[data-panel='polylines']")}>
+                Polylines
               </button>
               <button
                 type="button"

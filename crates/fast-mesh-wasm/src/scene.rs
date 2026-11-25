@@ -25,12 +25,11 @@ use fast_mesh_query::Cull;
 use fast_mesh_scene::{
     BooleanMethod, BooleanOp, BooleanOptions, CoarseAlignMethod, ColorRule, Coloring, Colormap,
     ContactFilter, CsgNode, CurvatureField, CutOptions, Dab, DeviationOptions, DistanceField,
-    FieldBudget, FieldId, GeodesicMethod, GeodesicOptions, IcpObjective, JoinOptions, LandmarkPair,
-    MeshBuild, MeshId, MeshOptions, NotApplied, OutOfRange, OverhangOptions, Placement, Plane,
-    QualityMetric, RegisterOptions, RegistrationOptions, Scene, SceneClosestOptions, SceneError,
-    SceneOptions, SceneRayOptions, SceneRepairOps as _, SectionDesc, SectionId, SectionStatus,
-    SignMode, StepState, ThicknessField, TrimCurveOptions, UpdateMode,
-    ops::BooleanOp as OpsBooleanOp,
+    FieldBudget, FieldId, GeodesicJob, IcpObjective, JoinOptions, LandmarkPair, MeshBuild, MeshId,
+    MeshOptions, NotApplied, OutOfRange, OverhangOptions, Placement, Plane, QualityMetric,
+    RegisterOptions, RegistrationOptions, Scene, SceneClosestOptions, SceneError, SceneOptions,
+    SceneRayOptions, SceneRepairOps as _, SectionDesc, SectionId, SectionStatus, SignMode,
+    StepState, ThicknessField, TrimCurveOptions, UpdateMode, ops::BooleanOp as OpsBooleanOp,
 };
 use fast_mesh_store::{Mesh, MeshBuilder};
 use wasm_bindgen::prelude::*;
@@ -44,7 +43,10 @@ use crate::render::{Dirty, Record, RenderState, encode, uvs_reported};
 
 mod denoise;
 mod extrude;
+mod geodesic;
+mod height_map;
 mod hull;
+mod lattice;
 mod wrap;
 
 /// A scene of editable meshes with render buffers and change records.
@@ -57,6 +59,10 @@ pub struct WasmScene {
     adds: BTreeMap<u32, PendingAdd>,
     /// The id the next `begin_add_mesh_upload` hands out.
     next_add: u32,
+    /// Geodesic queries running in steps, by query id.
+    geodesics: BTreeMap<u32, GeodesicJob>,
+    /// The id the next `begin_geodesic_distances` hands out.
+    next_geodesic: u32,
 }
 
 /// A mesh being added in steps: its inputs still uploading into wasm
@@ -306,6 +312,8 @@ impl WasmScene {
             render: BTreeMap::new(),
             adds: BTreeMap::new(),
             next_add: 0,
+            geodesics: BTreeMap::new(),
+            next_geodesic: 0,
         }
     }
 
@@ -1148,7 +1156,8 @@ impl WasmScene {
     }
 
     /// Joins mesh B into mesh A: copies B's geometry into A, bridges the two
-    /// loops and removes B; see [`Scene::join`]. `loops` holds the two loop
+    /// loops and removes B, as one undo step (undo restores A and brings B
+    /// back); see [`Scene::join`]. `loops` holds the two loop
     /// ids (`min_vertex, len, hash low, hash high` each, A's first) and
     /// `max_edges` is NaN for the default. Returns `[vertices_added,
     /// triangles_added, bridge_triangles_added]`.
@@ -1172,8 +1181,9 @@ impl WasmScene {
             loop_b: loop_id(pair[1]),
             max_edges: count_opt(max_edges, "maxEdges")?,
         };
+        // B's render state goes with its removal record, as for
+        // `remove_mesh_undoable`.
         let r = self.scene.join(a, b, &options)?;
-        self.render.remove(&b);
         Ok(vec![
             r.vertices_added as f64,
             r.triangles_added as f64,
@@ -1366,8 +1376,9 @@ impl WasmScene {
 
     /// Evaluates an N-ary CSG boolean tree over `meshes` (`[idx0, gen0, ...]`)
     /// using prefix-encoded `tree` (`[0, leafIdx]` for Leaf, `[1, op, ...left, ...right]`
-    /// for Op) and inserts the resulting mesh at identity placement, as one
-    /// undo step (undo removes it). Returns `[added_index, added_generation]`.
+    /// for Op) and inserts the resulting mesh at identity placement, its
+    /// origin the centre of the bounds of the meshes used, as one undo step
+    /// (undo removes it). Returns `[added_index, added_generation]`.
     #[allow(clippy::too_many_arguments)]
     pub fn boolean_batch(
         &mut self,
@@ -1400,8 +1411,9 @@ impl WasmScene {
 
     /// Conformatively imprints a world-space polyline (`points`: flat `[x, y, z, ...]`)
     /// onto mesh `(index, generation)` and optionally trims the enclosed interior
-    /// (`closed && delete_inside`) or exterior side.
-    /// Returns `[index, generation, triangles_added, triangles_removed, vertices_added, seam_edges]`.
+    /// (`closed && delete_inside`) or exterior side of the component it lies on.
+    /// Returns `[index, generation, triangles_added, triangles_removed, imprint_triangles,
+    /// cut_triangles, removed_area, vertices_added, seam_edges]`.
     pub fn trim_by_curve(
         &mut self,
         index: u32,
@@ -1410,7 +1422,7 @@ impl WasmScene {
         closed: bool,
         delete_inside: bool,
         snap_tolerance: f64,
-    ) -> Result<Vec<u32>, Error> {
+    ) -> Result<Vec<f64>, Error> {
         let id = self.id(index, generation)?;
         if !points.len().is_multiple_of(3) {
             return Err(Error::invalid("points length must be a multiple of 3"));
@@ -1431,12 +1443,15 @@ impl WasmScene {
             },
         )?;
         Ok(vec![
-            index,
-            generation,
-            len(r.triangles_added),
-            len(r.triangles_removed),
-            len(r.vertices_added),
-            len(r.seam_edges),
+            f64::from(index),
+            f64::from(generation),
+            r.triangles_added as f64,
+            r.triangles_removed as f64,
+            r.imprint_triangles as f64,
+            r.cut_triangles as f64,
+            r.removed_area,
+            r.vertices_added as f64,
+            r.seam_edges as f64,
         ])
     }
 
@@ -1685,49 +1700,6 @@ impl WasmScene {
         out.push(f64::from(stats.p95));
         out.push(count(stats.sample_count));
         out.extend(values.into_iter().map(f64::from));
-        Ok(out)
-    }
-
-    /// Geodesic distances from `sources` (vertex slot indices) in world units.
-    /// `method`: 0 dijkstra, 1 heatMethod. `max_distance`: `NaN` or `Infinity` -> unbounded.
-    pub fn geodesic_distances(
-        &self,
-        index: u32,
-        generation: u32,
-        sources: &[u32],
-        method: u8,
-        max_distance: f64,
-        time_step_scale: f64,
-    ) -> Result<Vec<f32>, Error> {
-        let id = self.id(index, generation)?;
-        let method = match method {
-            0 => GeodesicMethod::Dijkstra,
-            1 => GeodesicMethod::HeatMethod,
-            _ => {
-                return Err(Error::invalid(
-                    "method must be 0 (dijkstra) or 1 (heatMethod)",
-                ));
-            }
-        };
-        let max_distance = if max_distance.is_nan() || max_distance == f64::INFINITY {
-            None
-        } else {
-            Some(max_distance as f32)
-        };
-        let defaults = GeodesicOptions::default();
-        let time_step_scale = if time_step_scale.is_nan() {
-            defaults.time_step_scale
-        } else {
-            time_step_scale
-        };
-        let opts = GeodesicOptions {
-            method,
-            max_distance,
-            time_step_scale,
-        };
-        let mut out = Vec::new();
-        self.scene
-            .geodesic_distances(id, sources, &opts, &mut out)?;
         Ok(out)
     }
 
@@ -2718,6 +2690,8 @@ impl WasmScene {
         Ok(crate::wave6::encode_face_edit_report(&report))
     }
 
+    /// Copies `selected_tris` into a new mesh, one undo step (undo removes
+    /// it). Returns `[index, generation]`.
     pub fn extract_selected_faces(
         &mut self,
         index: u32,
@@ -2730,6 +2704,9 @@ impl WasmScene {
         self.added(new_id, normals)
     }
 
+    /// Moves `selected_tris` into a new mesh, one undo step (undo restores the
+    /// mesh and removes the new one). Returns `[index, generation,
+    /// removedTriangles, removedVertices]`.
     pub fn split_selected_faces(
         &mut self,
         index: u32,
@@ -3124,6 +3101,8 @@ impl WasmScene {
         crate::wave6::encode_contour_slices(&slices)
     }
 
+    /// Reconstructs a surface from a packed cloud as a new mesh, one undo step
+    /// (undo removes it). Returns `[index, generation]`.
     pub fn reconstruct_point_cloud(
         &mut self,
         packed_cloud: &[f32],
@@ -3173,6 +3152,9 @@ impl WasmScene {
         Ok(crate::wave6::encode_hollow_report(&rep))
     }
 
+    /// Punches a drain hole, adding its plug as a new mesh when asked to; the
+    /// hole and the plug are one undo step (undo fills the hole and removes
+    /// the plug).
     #[allow(clippy::too_many_arguments)]
     pub fn punch_drain_hole(
         &mut self,
@@ -3192,7 +3174,7 @@ impl WasmScene {
         plug_normals: bool,
     ) -> Result<Vec<f64>, Error> {
         let id = self.id(index, generation)?;
-        let (spec, opts) = crate::wave6::parse_drain_hole(
+        let (point, spec, opts) = crate::wave6::parse_drain_hole(
             surface_point3,
             surface_normal3,
             diameter,
@@ -3205,7 +3187,7 @@ impl WasmScene {
             generate_plug,
             plug_clearance,
         )?;
-        let (rep, plugs) = self.scene.punch_drain_hole_world(id, &spec, &opts)?;
+        let (rep, plugs) = self.scene.punch_drain_hole_at(id, point, &spec, &opts)?;
         let mut plug_ids = Vec::with_capacity(plugs.len() * 2);
         for plug_id in plugs {
             let pair = self.added(plug_id, plug_normals)?;
@@ -3214,6 +3196,8 @@ impl WasmScene {
         crate::wave6::encode_drain_report(&rep, &plug_ids)
     }
 
+    /// Places a stamp on the target, one undo step: kept separate, it is added
+    /// as a new mesh, which undo removes.
     #[allow(clippy::too_many_arguments)]
     pub fn place_mesh(
         &mut self,
@@ -4849,8 +4833,28 @@ mod tests {
         );
         assert_eq!(s.triangle_count(ai, ag).unwrap(), 2 + 2 + 8);
         assert_eq!(code(s.triangle_count(bi, bg)), codes::UNKNOWN_MESH);
+        // The join is one step: undo brings B back, reported like an add (#271).
+        assert!(s.is_restorable(bi, bg));
+        s.take_changes();
         assert!(s.undo().unwrap());
+        assert!(!s.can_undo());
         assert_eq!(s.triangle_count(ai, ag).unwrap(), 2);
+        assert_eq!(s.triangle_count(bi, bg).unwrap(), 2);
+        let added = FLAG_ADDED | FLAG_POSITIONS_ALL | FLAG_INDICES_ALL;
+        let back = s.take_changes();
+        assert_eq!(back[0], 2);
+        let b_at = (1..back.len())
+            .find(|&k| back[k..k + 2] == [bi, bg])
+            .unwrap();
+        assert_eq!(back[b_at + 2] & added, added);
+        // Redo takes it out again, and says that undo can bring it back.
+        assert!(s.redo().unwrap());
+        assert_eq!(code(s.triangle_count(bi, bg)), codes::UNKNOWN_MESH);
+        let gone = s.take_changes();
+        let b_at = (1..gone.len())
+            .find(|&k| gone[k..k + 2] == [bi, bg])
+            .unwrap();
+        assert_eq!(gone[b_at + 2], FLAG_REMOVED | FLAG_RESTORABLE);
     }
 
     #[test]
@@ -5050,8 +5054,11 @@ mod tests {
                 0.,
             )
             .unwrap();
-        assert_eq!(tr.len(), 6);
-        assert!(tr[3] > 0);
+        assert_eq!(tr.len(), 9);
+        assert_eq!(tr[..2], [f64::from(sheet[0]), f64::from(sheet[1])]);
+        // Both triangles lost surface; the loop encloses half a unit.
+        assert_eq!(tr[3..6], [2., 0., 2.]);
+        assert!((tr[6] - 0.5).abs() < 1e-6);
     }
 
     #[test]

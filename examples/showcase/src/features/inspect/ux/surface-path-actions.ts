@@ -4,30 +4,27 @@
 //
 // Taps and Close loop run one at a time, in order (a leg on a large mesh
 // takes a while, on the Worker in the default engine mode), so quick clicks
-// queue instead of racing; a leg that lands after its path was undone or
-// cleared is dropped.
+// queue instead of racing. Undoing or clearing the path cancels the leg
+// being traced, and so does Cancel.
 //
 // Trim deletes one side of the loop (`boolean.trimByCurve`) as one undo
-// step. Split keeps both sides: inside one history step it fills a new mesh
-// (added empty first: adding a mesh is not an undo step) with a copy of the
-// part the loop is on, then trims the mesh to the outside and the copy to
-// the inside. Undo puts the mesh back whole and empties the copy.
+// step. Split keeps both sides: inside one history step it adds a copy of the
+// mesh, trims the mesh to the outside and the copy to the inside, and takes
+// the parts the loop is not on out of the copy. The copy has the mesh's own
+// coordinates, UVs and placement, so both cuts see the same loop, the same
+// part and the same inside. Undo puts the mesh back whole and removes the
+// copy.
 //
-// A cut is about the part the loop is on. The engine's trim looks at every
-// part of a mesh (the side it calls inside may be another part altogether),
-// so the parts the loop is not on are lifted off inside the same step, and
-// put back by their own vertex ids after it: they stay exactly as they were.
-//
-// A loop need not cut anything away (once around a ring, say). The engine
-// then still imprints it, replacing the triangles it crosses, so triangle
-// counts do not tell a cut from an imprint; the surface does, which an
-// imprint keeps and a cut does not. Such a loop is undone and reported, and
-// the picks stay.
-import type { MeshHandle, RayHit, SceneLike, TrimReport, Vec3 } from "fast-mesh-wasm";
+// The engine cuts the part the loop is on and leaves the others alone. A loop
+// need not cut anything away (once around a ring, say): the engine still
+// imprints it, and reports no removed area. Such a loop is undone and
+// reported, and the picks stay.
+import type { EditOp, MeshHandle, RayHit, SceneLike, TrimReport, Vec3 } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../../../app/state/app-state";
-import { remapCorners } from "../../mesh-edit/ux/batch-boolean";
-import { worldFromMatrix } from "./inspect-tools";
+import { extractLiveMeshData } from "../../../engine/workbench-ops";
+import { liveTriangleIds } from "../../mesh-edit/ux/batch-boolean";
+import { countLiveTriangles } from "../../select/ux/face-sets";
 import {
   addSource,
   closePath,
@@ -61,6 +58,14 @@ export function surfacePathIdle(app: AppState): Promise<void> {
   return queues.get(app) ?? Promise.resolve();
 }
 
+/** The leg being traced per app, if any. */
+const tracing = new WeakMap<AppState, AbortController>();
+
+/** Cancels the leg being traced: the path stays as it is. Queued taps still land. */
+export function cancelSurfaceLeg(app: AppState): void {
+  tracing.get(app)?.abort();
+}
+
 /** Traces the leg `from` → `to` and lands `next(leg)` unless the path or its mesh changed meanwhile. */
 async function traceAndLand(
   app: AppState,
@@ -75,19 +80,24 @@ async function traceAndLand(
   if (before === null) {
     return;
   }
+  const run = new AbortController();
+  tracing.set(app, run);
   app.setSurfacePath({ tracing: start.tracing + 1 });
   try {
-    const leg = await traceLeg(scene, mesh, from, to, start.method);
+    const leg = await traceLeg(scene, mesh, from, to, start.method, run.signal);
     const now = app.getSnapshot().surfacePath;
-    if (now.mesh === mesh && now.path === before) {
+    if (!run.signal.aborted && now.mesh === mesh && now.path === before) {
       app.setSurfacePath({ path: next(before, leg), error: null });
     }
   } catch (e) {
     const now = app.getSnapshot().surfacePath;
-    if (now.mesh === mesh && now.path === before) {
+    if (!run.signal.aborted && now.mesh === mesh && now.path === before) {
       app.setSurfacePath({ error: legErrorMessage(e) });
     }
   } finally {
+    if (tracing.get(app) === run) {
+      tracing.delete(app);
+    }
     const now = app.getSnapshot().surfacePath;
     app.setSurfacePath({ tracing: Math.max(0, now.tracing - 1) });
   }
@@ -181,14 +191,22 @@ type TrimCall = (
   options: { closed: boolean; deleteInside: boolean },
 ) => TrimReport | Promise<TrimReport>;
 
-/** The scene's `boolean.trimByCurve`, on a local `Scene` or a `WorkerScene`. */
-function trimCall(scene: SceneLike): TrimCall {
+/** Deletes one side of the loop `curve` from a mesh; throws when that cuts nothing away. */
+type CutAway = (mesh: MeshHandle, curve: readonly Vec3[], side: TrimKeep) => Promise<void>;
+
+/** The scene's `boolean.trimByCurve`, on a local `Scene` or a `WorkerScene`, as a {@link CutAway}. */
+function cutAwayCall(scene: SceneLike): CutAway {
   const domain = scene.boolean as { trimByCurve?: TrimCall } | undefined;
   const trim = domain?.trimByCurve;
   if (trim === undefined) {
     throw new Error("This scene cannot trim along a curve.");
   }
-  return (mesh, curve, options) => trim(mesh, curve, options);
+  return async (mesh, curve, side) => {
+    const report = await trim(mesh, curve, { closed: true, deleteInside: side === "inside" });
+    if (report.removedArea === 0) {
+      throw new Error(NO_CUT_MESSAGE);
+    }
+  };
 }
 
 /** The loop as the trim curve, checked: a closed path with at least three distinct points. */
@@ -201,200 +219,6 @@ function loopCurve(path: SurfacePath | null): Vec3[] {
     throw new Error("The loop is too short to cut along.");
   }
   return curve;
-}
-
-/** A mesh's live triangles, told apart by whether they are connected to one vertex. */
-export interface PartsOf {
-  /** Corner vertices of the triangles on the vertex's part. */
-  own: Uint32Array;
-  /** The other triangles' slots and, in the same order, their corner vertices. */
-  otherTriangles: Uint32Array;
-  otherCorners: Uint32Array;
-}
-
-/**
- * Splits a mesh's live triangles by whether they are connected to `seed`
- * (through shared vertices, as a surface path is), from its index buffer and
- * vertex count.
- */
-export function partsOf(indices: ArrayLike<number>, vertexCount: number, seed: number): PartsOf {
-  const parent = new Int32Array(vertexCount);
-  for (let v = 0; v < vertexCount; v++) {
-    parent[v] = v;
-  }
-  const find = (v: number): number => {
-    let x = v;
-    while (parent[x] !== x) {
-      parent[x] = parent[parent[x]];
-      x = parent[x];
-    }
-    return x;
-  };
-  let live = 0;
-  for (let k = 0; k + 2 < indices.length; k += 3) {
-    const i0 = indices[k];
-    const i1 = indices[k + 1];
-    const i2 = indices[k + 2];
-    if (i0 === 0 && i1 === 0 && i2 === 0) {
-      continue;
-    }
-    live++;
-    const a = find(i0);
-    const b = find(i1);
-    const c = find(i2);
-    parent[b] = a;
-    parent[c] = a;
-  }
-  const root = find(seed);
-  const own = new Uint32Array(3 * live);
-  const otherTriangles = new Uint32Array(live);
-  const otherCorners = new Uint32Array(3 * live);
-  let nOwn = 0;
-  let nOther = 0;
-  for (let k = 0; k + 2 < indices.length; k += 3) {
-    const i0 = indices[k];
-    const i1 = indices[k + 1];
-    const i2 = indices[k + 2];
-    if (i0 === 0 && i1 === 0 && i2 === 0) {
-      continue;
-    }
-    const at = find(i0) === root ? own : otherCorners;
-    const n = at === own ? nOwn++ : nOther++;
-    at[3 * n] = i0;
-    at[3 * n + 1] = i1;
-    at[3 * n + 2] = i2;
-    if (at === otherCorners) {
-      otherTriangles[n] = k / 3;
-    }
-  }
-  return {
-    own: own.subarray(0, 3 * nOwn),
-    otherTriangles: otherTriangles.subarray(0, nOther),
-    otherCorners: otherCorners.subarray(0, 3 * nOther),
-  };
-}
-
-/**
- * The world positions and compact triangles of a part: `corners` are vertex
- * slots of local `positions`, which `matrix` (column-major) takes to the world.
- */
-export function compactPart(
-  positions: ArrayLike<number>,
-  corners: ArrayLike<number>,
-  matrix: ArrayLike<number>,
-): { positions: Float64Array; indices: Uint32Array } {
-  const ids = new Int32Array(Math.floor(positions.length / 3)).fill(-1);
-  const slots: number[] = [];
-  const indices = new Uint32Array(corners.length);
-  for (let k = 0; k < corners.length; k++) {
-    const slot = corners[k];
-    if (ids[slot] === -1) {
-      ids[slot] = slots.length;
-      slots.push(slot);
-    }
-    indices[k] = ids[slot];
-  }
-  const world = new Float64Array(3 * slots.length);
-  slots.forEach((slot, id) => {
-    const p = worldFromMatrix(matrix, [positions[3 * slot], positions[3 * slot + 1], positions[3 * slot + 2]]);
-    world.set(p, 3 * id);
-  });
-  return { positions: world, indices };
-}
-
-/** What {@link surfaceCut} compares of a mesh before and after a trim. */
-export interface SurfaceStats {
-  /** Live triangles. */
-  triangles: number;
-  /** Their area, in local units. */
-  area: number;
-  /** The largest local coordinate over the extent: how coarsely `f32` places a vertex for the mesh's size. */
-  reach: number;
-}
-
-/** A mesh's {@link SurfaceStats}, in one pass over its render buffers. */
-export function surfaceStats(positions: ArrayLike<number>, indices: ArrayLike<number>): SurfaceStats {
-  let triangles = 0;
-  let area = 0;
-  let x0 = Infinity;
-  let y0 = Infinity;
-  let z0 = Infinity;
-  let x1 = -Infinity;
-  let y1 = -Infinity;
-  let z1 = -Infinity;
-  for (let k = 0; k + 2 < indices.length; k += 3) {
-    const i0 = indices[k];
-    const i1 = indices[k + 1];
-    const i2 = indices[k + 2];
-    if (i0 === 0 && i1 === 0 && i2 === 0) {
-      continue;
-    }
-    triangles++;
-    const ax = positions[3 * i0];
-    const ay = positions[3 * i0 + 1];
-    const az = positions[3 * i0 + 2];
-    const ux = positions[3 * i1] - ax;
-    const uy = positions[3 * i1 + 1] - ay;
-    const uz = positions[3 * i1 + 2] - az;
-    const wx = positions[3 * i2] - ax;
-    const wy = positions[3 * i2 + 1] - ay;
-    const wz = positions[3 * i2 + 2] - az;
-    const nx = uy * wz - uz * wy;
-    const ny = uz * wx - ux * wz;
-    const nz = ux * wy - uy * wx;
-    area += 0.5 * Math.sqrt(nx * nx + ny * ny + nz * nz);
-    // The bounds over every triangle's first corner, and its other two from their offsets.
-    if (ax < x0) x0 = ax;
-    if (ax > x1) x1 = ax;
-    if (ay < y0) y0 = ay;
-    if (ay > y1) y1 = ay;
-    if (az < z0) z0 = az;
-    if (az > z1) z1 = az;
-    if (ax + ux < x0) x0 = ax + ux;
-    if (ax + ux > x1) x1 = ax + ux;
-    if (ay + uy < y0) y0 = ay + uy;
-    if (ay + uy > y1) y1 = ay + uy;
-    if (az + uz < z0) z0 = az + uz;
-    if (az + uz > z1) z1 = az + uz;
-    if (ax + wx < x0) x0 = ax + wx;
-    if (ax + wx > x1) x1 = ax + wx;
-    if (ay + wy < y0) y0 = ay + wy;
-    if (ay + wy > y1) y1 = ay + wy;
-    if (az + wz < z0) z0 = az + wz;
-    if (az + wz > z1) z1 = az + wz;
-  }
-  if (triangles === 0) {
-    return { triangles, area, reach: 0 };
-  }
-  const extent = Math.max(x1 - x0, y1 - y0, z1 - z0);
-  const far = Math.max(-x0, x1, -y0, y1, -z0, z1);
-  return { triangles, area, reach: extent > 0 ? far / extent : 0 };
-}
-
-/** An area change below this share of the area is an imprint's rounding, not a cut. */
-const AREA_NOISE = 1e-6;
-/** The share grows with the coordinates' reach, as `f32` places vertices more coarsely. */
-const AREA_NOISE_PER_REACH = 1e-7;
-
-/**
- * Whether a trim took part of the surface away. An imprint alone never loses
- * triangles, and keeps the area up to `f32` rounding: about 1e-10 of it on
- * a mesh centred on its origin, up to about 1e-6 with coordinates hundreds of
- * extents from it. So a cut shows as fewer triangles, or as area lost beyond
- * that. (A region smaller than both the noise and what the imprint added is
- * not told from none.)
- */
-export function surfaceCut(before: SurfaceStats, after: SurfaceStats): boolean {
-  if (after.triangles < before.triangles) {
-    return true;
-  }
-  return after.area < before.area * (1 - Math.max(AREA_NOISE, AREA_NOISE_PER_REACH * before.reach));
-}
-
-/** The mesh's current {@link SurfaceStats}. */
-function statsOf(scene: SceneLike, mesh: MeshHandle): SurfaceStats {
-  const views = scene.views(mesh);
-  return surfaceStats(views.positions(), views.indices());
 }
 
 /**
@@ -411,43 +235,19 @@ export async function settleChanges(store: SceneStore, mesh: MeshHandle): Promis
   store.commitFrame();
 }
 
-/** The vertex the loop's part is known by: its first point's. */
-function seedOf(path: SurfacePath | null): number {
-  return path?.points[0]?.slot ?? 0;
-}
-
-/** The mesh's parts as they are now, told apart by the vertex `seed`. */
-function partsOn(scene: SceneLike, mesh: MeshHandle, seed: number): PartsOf {
-  const views = scene.views(mesh);
-  return partsOf(views.indices(), Math.floor(views.positions().length / 3), seed);
-}
-
-/** Takes the triangles of the parts the loop is not on out of the mesh (their vertices stay, so {@link putBack} fits). */
-async function liftOff(store: SceneStore, mesh: MeshHandle, others: PartsOf): Promise<void> {
-  if (others.otherTriangles.length > 0) {
-    await store.edit(mesh, [{ op: "removeTriangles", triangles: others.otherTriangles }]);
-  }
-}
-
-/** Puts the triangles {@link liftOff} took out back, on the same vertices. */
-async function putBack(store: SceneStore, mesh: MeshHandle, others: PartsOf): Promise<void> {
-  if (others.otherTriangles.length > 0) {
-    await store.edit(mesh, [{ op: "addTriangles", triangles: others.otherCorners }]);
-  }
-}
-
 /** What a trim did. */
 export interface PathTrimResult {
   keep: TrimKeep;
-  /** Triangles the mesh has now, the other parts included. */
+  /** Triangles the mesh has now, the parts the loop is not on included. */
   triangles: number;
 }
 
 /**
- * Trims `mesh` along the closed `path`, keeping `keep`: one undo step. Of
- * the part the loop is on, the inside is the side away from its open edges,
- * or on a closed part the side with the smaller area. Other parts stay. A loop that cuts nothing away is undone
- * (see {@link settleChanges}) and throws {@link NO_CUT_MESSAGE}.
+ * Trims `mesh` along the closed `path`, keeping `keep`: one undo step. Of the
+ * part the loop is on, the inside is the side away from its open edges, or on
+ * a closed part the side with the smaller area. Other parts stay. A loop that
+ * cuts nothing away is undone (see {@link settleChanges}) and throws
+ * {@link NO_CUT_MESSAGE}.
  */
 export async function trimAlongPath(
   store: SceneStore,
@@ -456,25 +256,77 @@ export async function trimAlongPath(
   keep: TrimKeep,
 ): Promise<PathTrimResult> {
   const curve = loopCurve(path);
-  const trim = trimCall(store.scene);
-  const others = partsOn(store.scene, mesh, seedOf(path));
-  let after: SurfaceStats;
+  const cutAway = cutAwayCall(store.scene);
   store.beginStep();
   try {
-    await liftOff(store, mesh, others);
-    const before = statsOf(store.scene, mesh);
-    await trim(mesh, curve, { closed: true, deleteInside: keep === "outside" });
-    after = statsOf(store.scene, mesh);
-    if (!surfaceCut(before, after)) {
-      throw new Error(NO_CUT_MESSAGE);
-    }
-    await putBack(store, mesh, others);
+    await cutAway(mesh, curve, keep === "outside" ? "inside" : "outside");
   } catch (err) {
     store.cancelStep();
     throw err;
   }
   store.endStep();
-  return { keep, triangles: after.triangles + others.otherTriangles.length };
+  return { keep, triangles: countLiveTriangles(store.scene.views(mesh).indices()) };
+}
+
+/** A mesh's index buffer before and after a cut. */
+export interface CutIndices {
+  before: ArrayLike<number>;
+  after: ArrayLike<number>;
+}
+
+/**
+ * The triangles of a mesh's copy that are on the parts the loop is not on:
+ * those that neither the cut of the mesh nor the cut of the copy to the other
+ * side changed (every triangle of the loop's part is on one side of it, or
+ * across it). `slots[k]` is the slot the copy's triangle `k` has in the mesh.
+ */
+export function uncutTriangles(slots: ArrayLike<number>, mesh: CutIndices, copy: CutIndices): Uint32Array {
+  const same = ({ before, after }: CutIndices, t: number) =>
+    before[3 * t] === after[3 * t] && before[3 * t + 1] === after[3 * t + 1] && before[3 * t + 2] === after[3 * t + 2];
+  const out: number[] = [];
+  for (let k = 0; k < slots.length; k++) {
+    if (same(copy, k) && same(mesh, slots[k])) {
+      out.push(k);
+    }
+  }
+  return Uint32Array.from(out);
+}
+
+/** The edit ops that take `triangles` out of a mesh, with the vertices only they use. */
+export function removalOps(
+  indices: ArrayLike<number>,
+  vertexCount: number,
+  triangles: ArrayLike<number>,
+): EditOp[] {
+  if (triangles.length === 0) {
+    return [];
+  }
+  const gone = new Uint8Array(Math.floor(indices.length / 3));
+  const free = new Uint8Array(vertexCount);
+  for (let i = 0; i < triangles.length; i++) {
+    const t = triangles[i];
+    gone[t] = 1;
+    for (let c = 3 * t; c < 3 * t + 3; c++) {
+      free[indices[c]] = 1;
+    }
+  }
+  for (const t of liveTriangleIds(indices)) {
+    if (gone[t] === 0) {
+      for (let c = 3 * t; c < 3 * t + 3; c++) {
+        free[indices[c]] = 0;
+      }
+    }
+  }
+  const vertices: number[] = [];
+  for (let v = 0; v < vertexCount; v++) {
+    if (free[v] === 1) {
+      vertices.push(v);
+    }
+  }
+  return [
+    { op: "removeTriangles", triangles: Uint32Array.from(triangles) },
+    ...(vertices.length > 0 ? [{ op: "removeVertices" as const, vertices: Uint32Array.from(vertices) }] : []),
+  ];
 }
 
 /** What a split did: the new mesh holding the inside, and both parts' triangles. */
@@ -484,30 +336,14 @@ export interface PathSplitResult {
   insideTriangles: number;
 }
 
-/** The centre of world positions' bounding box (the origin of `[]`). */
-function boxCentre(world: ArrayLike<number>): Vec3 {
-  if (world.length < 3) {
-    return [0, 0, 0];
-  }
-  const lo = [Infinity, Infinity, Infinity];
-  const hi = [-Infinity, -Infinity, -Infinity];
-  for (let i = 0; i + 2 < world.length; i += 3) {
-    for (let a = 0; a < 3; a++) {
-      const v = world[i + a];
-      if (v < lo[a]) lo[a] = v;
-      if (v > hi[a]) hi[a] = v;
-    }
-  }
-  return [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
-}
-
 /**
  * Splits `item` along the closed `path` into two meshes, one undo step:
  * `item` keeps the outside (and every part the loop is not on), a new mesh
- * named `<name> inside` (listed once the split lands) holds the inside. Undo makes `item` whole again and
- * empties the new mesh, which stays listed (adding a mesh is not an undo
- * step). A loop that cuts nothing away changes nothing: the new mesh is
- * removed again and it throws {@link NO_CUT_MESSAGE}.
+ * named `<name> inside` (listed once the split lands) holds the inside, with
+ * the origin, placement and UVs it had there. Undo makes `item` whole again
+ * and removes the new mesh. A loop that cuts nothing away changes nothing:
+ * the step is cancelled, the new mesh with it, and it throws
+ * {@link NO_CUT_MESSAGE}.
  */
 export async function splitAlongPath(
   store: SceneStore,
@@ -516,50 +352,49 @@ export async function splitAlongPath(
   path: SurfacePath | null,
 ): Promise<PathSplitResult> {
   const curve = loopCurve(path);
-  const trim = trimCall(store.scene);
+  const cutAway = cutAwayCall(store.scene);
   const scene = store.scene;
-  const others = partsOn(scene, item.mesh, seedOf(path));
-  if (others.own.length === 0) {
+  const indices = (mesh: MeshHandle) => scene.views(mesh).indices();
+  const before = Uint32Array.from(indices(item.mesh));
+  const whole = extractLiveMeshData(scene, item.mesh);
+  if (whole.indices.length === 0) {
     throw new Error("The mesh has no triangles to split.");
   }
-  const part = compactPart(scene.views(item.mesh).positions(), others.own, scene.matrix4(item.mesh));
-  const copy = store.addMesh(new Float64Array(0), new Uint32Array(0), { origin: boxCentre(part.positions) });
-  let outer: SurfaceStats;
-  let inner: SurfaceStats;
+  const copied = whole.indices.slice(); // a Worker scene takes the added arrays away
+  const { origin } = whole;
+  let copy: MeshHandle;
   store.beginStep();
   try {
-    // An edit takes world positions; the copy's triangles follow the ids its new vertices got.
-    const added = await store.edit(copy, [{ op: "addVertices", positions: part.positions }]);
-    const ids = added.added[0];
-    if (ids === undefined || ids.length !== part.positions.length / 3) {
-      throw new Error("The edit did not report the added vertices.");
+    copy = store.addMesh(
+      whole.positions.map((x, i) => x + origin[i % 3]),
+      whole.indices,
+      { origin, undoable: true, ...(whole.uvs ? { uvs: whole.uvs } : {}) },
+    );
+    store.setPlacement(copy, whole.placement);
+    await cutAway(item.mesh, curve, "inside");
+    await cutAway(copy, curve, "outside");
+    const others = uncutTriangles(
+      liveTriangleIds(before),
+      { before, after: indices(item.mesh) },
+      { before: copied, after: indices(copy) },
+    );
+    const drop = removalOps(indices(copy), Math.floor(scene.views(copy).positions().length / 3), others);
+    if (drop.length > 0) {
+      await store.edit(copy, drop);
     }
-    await store.edit(copy, [{ op: "addTriangles", triangles: remapCorners(part.indices, ids) }]);
-    await liftOff(store, item.mesh, others);
-    // Each side against itself: the copy is in world units, the mesh in its own.
-    const before = statsOf(scene, item.mesh);
-    const copyBefore = statsOf(scene, copy);
-    await trim(item.mesh, curve, { closed: true, deleteInside: true });
-    outer = statsOf(scene, item.mesh);
-    if (!surfaceCut(before, outer)) {
-      throw new Error(NO_CUT_MESSAGE);
-    }
-    await trim(copy, curve, { closed: true, deleteInside: false });
-    inner = statsOf(scene, copy);
-    if (!surfaceCut(copyBefore, inner)) {
-      throw new Error(NO_CUT_MESSAGE);
-    }
-    await putBack(store, item.mesh, others);
-    store.endStep();
   } catch (err) {
+    // Takes the copy out again.
     store.cancelStep();
-    store.removeMesh(copy);
     throw err;
   }
-  const inside = app.adoptSceneMesh(store, copy, `${item.name} inside`);
-  return {
-    inside,
-    outsideTriangles: outer.triangles + others.otherTriangles.length,
-    insideTriangles: inner.triangles,
-  };
+  store.endStep();
+  const cut = extractLiveMeshData(scene, copy);
+  const insideTriangles = cut.indices.length / 3;
+  const inside = app.listMesh(copy, {
+    name: `${item.name} inside`,
+    triangles: insideTriangles,
+    center: origin,
+    radius: cut.radius,
+  });
+  return { inside, outsideTriangles: countLiveTriangles(indices(item.mesh)), insideTriangles };
 }

@@ -1,0 +1,39 @@
+/* The Build Plate panel (#266). */
+.build-plate-panel {
+  margin-top: 12px;
+}
+.build-plate-fields {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.build-plate-panel .field {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.build-plate-panel > .check {
+  display: flex;
+}
+.build-plate-panel .op-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-top: 6px;
+}
+.build-plate-panel .op-row select {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+.build-plate-panel .report p {
+  margin: 4px 0 0;
+}
+.build-plate-panel h3 {
+  margin: 12px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}

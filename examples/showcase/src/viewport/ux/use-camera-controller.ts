@@ -34,6 +34,7 @@ import {
   widenClipRange,
 } from "../../features/view/ux/camera-tween";
 import { orbitStep, rollStep, snapFrame, type ViewFrame } from "../../features/view/ux/view-steps";
+import { worldCenter } from "../../shared/ux/mesh-center";
 import { watchFingers } from "./touch";
 import { view } from "./view";
 
@@ -386,9 +387,9 @@ export function useCameraRequests(params: {
     orbit.update();
   }, [orbit, healerFocusRequest, store, camera, size.width, size.height]);
 
-  // Focus: the orbit target to the mesh's centre (its origin, where the
-  // gizmo sits), the camera back along the requested (or current)
-  // direction. A focus box frames that world box instead of the mesh.
+  // Focus: the orbit target to the mesh's centre, the camera back along the
+  // requested (or current) direction. A focus box frames that world box
+  // instead of the mesh.
   useEffect(() => {
     if (orbit === null || focus === null || focus === lastFocusRef.current) {
       return;
@@ -400,14 +401,14 @@ export function useCameraRequests(params: {
     if (focus.box !== undefined) {
       center = new THREE.Vector3(focus.box.center[0], focus.box.center[1], focus.box.center[2]);
       radius = Math.max(focus.box.radius, 1e-3);
+    } else if (focus.mesh === null) {
+      return;
     } else {
-      let m: Float64Array;
       try {
-        m = store.scene.matrix4(focus.mesh);
+        center = new THREE.Vector3(...worldCenter(store.scene, focus.mesh));
       } catch {
         return; // removed meanwhile
       }
-      center = new THREE.Vector3(m[12], m[13], m[14]);
       radius = Math.max(radiusRef.current(focus.mesh), 1e-3);
     }
     const dir =

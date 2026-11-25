@@ -362,7 +362,7 @@ export interface CreatePlacement {
  * Settles once the scene has `mesh` (a Worker scene adds it later): resolves
  * also when it is gone again by then (undone), rejects when its add failed.
  */
-function landed(store: SceneStore, mesh: MeshHandle): Promise<void> {
+export function landed(store: SceneStore, mesh: MeshHandle): Promise<void> {
   return new Promise((resolve, reject) => {
     let off: (() => void) | undefined;
     const check = (): boolean => {

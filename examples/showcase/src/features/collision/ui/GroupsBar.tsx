@@ -1,7 +1,7 @@
 // Named mesh groups: group the meshes ticked in the list, then colour each
 // group by its contacts (`store.setContactGroup`, one id per group), show or
 // hide all its members, remove the group (its meshes stay) or remove its
-// meshes (each its own undo entry). A colouring needs two live members.
+// meshes (one undo step). A colouring needs two live members.
 import type { CollisionMode } from "fast-mesh-wasm";
 import { useState } from "react";
 import { type AppState, useApp } from "../../../app/state/app-state";
@@ -108,8 +108,8 @@ export function GroupsBar(props: { app: AppState }) {
                   <button
                     type="button"
                     className="danger"
-                    onClick={() => removeGroupMeshes(g.id, live)}
-                    title="Remove every member (each its own undo entry)"
+                    onClick={() => removeGroupMeshes(live)}
+                    title="Remove every member (one undo step)"
                   >
                     Remove meshes
                   </button>

@@ -621,6 +621,7 @@ Meshes must be added through the store (`store.addMesh`). A mesh added straight 
 | `computeVertexNormals(positions, indices)` | `Float32Array` | Smooth, area-weighted per-vertex normals. Same length as `positions`. |
 | `computeBounds(positions)` | `Bounds` | Plain object `{ min, max, center, size }`, each a `[x, y, z]` array. |
 | `generatePrimitive(shape)` | `PrimitiveMesh` | A box, cylinder, cone, UV sphere, icosphere, torus, arrow, n-gon prism or plane as `{ positions, indices }` (`Float32Array`, `Uint32Array`): centred on the origin, welded, closed (except the plane) and wound outward. `shape` is `{ kind, ...options }`; every option has a default (see `PrimitiveShape`). |
+| `generateHeightfield(field)` | `PrimitiveMesh` | The relief of a grid of heights as `{ positions, indices }`: closed, outward-wound, a vertex per sample at exactly its height and a flat base. `field` is `{ heights, width, height, pixelSize, base }`, heights row by row from the top left. |
 
 `generatePrimitive` is a pure function, not a scene operation: it stores nothing and records no history, so it runs wherever the module is initialised (the main thread, or any Worker of yours). A `WorkerScene` has `scene.generatePrimitive(shape)`, which runs the same generator in the scene's Worker and transfers the buffers back, so a page on the Worker scene needs no wasm of its own. Add the result with `addMesh(positions, indices)`.
 

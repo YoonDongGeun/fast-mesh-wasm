@@ -23,8 +23,8 @@
 //!   [`SceneError`], so repair operations from [`ops`] (the re-exported
 //!   `fast-mesh-ops`) run directly:
 //!   `scene.edit(id, |tx| ops::fill_holes(tx, &options))`.
-//! - Joining: [`Scene::join`] appends one mesh's geometry into another and
-//!   bridges a loop on each, as one undo step, then removes the source mesh.
+//! - Joining: [`Scene::join`] appends one mesh's geometry into another,
+//!   bridges a loop on each and removes the source mesh, as one undo step.
 //! - Cutting: [`Scene::cut_by_plane`] splits a mesh with a world plane,
 //!   capping both openings flat by default, and adds the removed side as a
 //!   new mesh with the same placement, as one undo step.
@@ -42,8 +42,12 @@
 //!   without moving a vertex; on a whole mesh or a face region, each one undo
 //!   step.
 //! - Wraps: [`Scene::wrap`] adds a closed, manifold envelope around meshes,
-//!   gaps and holes below a size closed, as a new mesh filled as one undo
-//!   step; [`Scene::wrap_plan`] reports its voxel grid first.
+//!   gaps and holes below a size closed, as a new mesh, as one undo step;
+//!   [`Scene::wrap_plan`] reports its voxel grid first.
+//! - Lattice infill: [`Scene::lattice_fill`] fills a closed mesh, or the
+//!   cavity of a hollowed one, with a gyroid, Schwarz P or diamond lattice, as
+//!   one undo step, measured in the world; [`Scene::lattice_plan`] reports its
+//!   voxel grid first, and [`Scene::lattice_preview`] builds it coarsely.
 //! - Registration: [`Scene::register`] rigidly aligns one mesh to another by
 //!   trimmed point-to-plane ICP from their current placements, and sets the
 //!   moving mesh's placement as one undo step when the result is good.
@@ -77,6 +81,10 @@
 //!   `f32` and results filtered against the exact bound. Queries over all
 //!   meshes update every Lazy BVH and fail with [`SceneError::StaleBvh`] on
 //!   a stale Manual one; queries naming meshes touch only those.
+//! - Height maps: [`Scene::height_map_frame`] fits an orthographic image
+//!   ([`HeightMapFrame`]) to meshes along a direction, [`Scene::height_map`]
+//!   samples the heights of its pixels, and [`Scene::add_heightfield`] adds a
+//!   grid of heights as a closed relief mesh.
 //! - Contacts: [`Scene::find_contacts`] finds the mesh pairs within a margin
 //!   (broadphase over world boxes, then Phase 3b per pair), optionally
 //!   restricted by a [`ContactFilter`].
@@ -109,16 +117,20 @@
 mod baked;
 mod boolean;
 mod contacts;
+mod curve_surface;
 mod cut;
 mod denoise;
 mod domains;
 mod error;
 mod extrude;
 mod fields;
+mod geodesic;
+mod height_map;
 mod history;
 mod hull;
 mod id;
 mod join;
+mod lattice;
 mod normals;
 mod placement;
 mod presence;
@@ -130,6 +142,8 @@ mod report;
 mod scene;
 mod sculpt;
 mod sections;
+#[cfg(test)]
+mod trim_tests;
 #[cfg(test)]
 mod uv_tests;
 mod wave6_ops;
@@ -149,7 +163,7 @@ pub use domains::{
 pub use error::{Result, SceneError};
 pub use extrude::{BasePlane, ExtrudeBaseOptions, ExtrudeBaseReport, ExtrudeFacesOptions};
 pub use fast_mesh_fields::{
-    ColorRule, Colormap, FieldsError, OutOfRange, SignMode, SignStatus, color_of,
+    ColorRule, Colormap, FieldsError, GeodesicPhase, OutOfRange, SignMode, SignStatus, color_of,
 };
 pub use fast_mesh_ops as ops;
 pub use fast_mesh_query::{Fill, Plane};
@@ -158,6 +172,8 @@ pub use fields::{
     FieldStatus, GeodesicHeatSolver, GeodesicMethod, GeodesicOptions, OverhangOptions,
     OverhangReport, QualityMetric, QualityReport, StepState, ThicknessField,
 };
+pub use geodesic::GeodesicJob;
+pub use height_map::{HeightMapFrame, HeightMapOptions, HeightfieldReport, MAX_HEIGHT_MAP_PIXELS};
 pub use hull::ConvexHullReport;
 pub use id::MeshId;
 pub use join::{JoinOptions, JoinReport};

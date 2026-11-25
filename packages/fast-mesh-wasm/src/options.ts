@@ -331,7 +331,26 @@ export function normalizeGeodesicOptions(options: GeodesicOptions = {}): {
     maxDistance = checkOptionalPositive(maxDistance, "maxDistance", true);
   }
   const timeStepScale = checkOptionalPositive(options.timeStepScale, "timeStepScale", false);
+  checkSignal(options.signal);
   return { method, maxDistance, timeStepScale };
+}
+
+/** Checks an `AbortSignal` option (by what is used of it, so another realm's passes too). */
+function checkSignal(signal: unknown): void {
+  if (signal === undefined) {
+    return;
+  }
+  const s = signal as Partial<AbortSignal> | null;
+  if (typeof s !== "object" || s === null || typeof s.aborted !== "boolean" || typeof s.addEventListener !== "function") {
+    throw invalid("signal must be an AbortSignal");
+  }
+}
+
+/** Throws the reason of an aborted `signal`. */
+export function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw signal.reason;
+  }
 }
 
 export function normalizeSourceVertices(sources: number | readonly number[]): Uint32Array {

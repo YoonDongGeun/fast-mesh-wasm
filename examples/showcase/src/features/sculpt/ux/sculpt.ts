@@ -8,11 +8,13 @@ import type {
   InflateMethod,
   MeshHandle,
   RepairOp,
+  SceneLike,
   SmoothMethod,
   SurfaceFilter,
   Symmetry,
   TwistMethod,
 } from "fast-mesh-wasm";
+import { localCenter } from "../../../shared/ux/mesh-center";
 import type {
   SculptFilterKind,
   SculptFilterSettings,
@@ -136,9 +138,9 @@ export function dyntopoCursorRatio(
   return (opts.detailSize ?? 0.25) / Math.max(brushRadius, 1e-6);
 }
 
-/** Runs localized one-click Dyntopo subdivision/cleanup around the brush pick or item center (#212). */
+/** Runs localized one-click Dyntopo subdivision/cleanup around the brush pick or the mesh's middle (#212), both local points. */
 export function applyDyntopoRoi(params: {
-  scene: {
+  scene: Pick<SceneLike, "bounds"> & {
     applyDyntopo?: (
       mesh: MeshHandle,
       center: readonly [number, number, number],
@@ -152,7 +154,7 @@ export function applyDyntopoRoi(params: {
     endStep(): void;
     cancelStep(): void;
   };
-  target: { mesh: MeshHandle; center: readonly [number, number, number]; radius: number };
+  target: { mesh: MeshHandle; radius: number };
   brushPick: { mesh: MeshHandle; point: readonly [number, number, number] | null } | null;
   mask: SculptMask | null;
   mode: DyntopoMode;
@@ -166,7 +168,7 @@ export function applyDyntopoRoi(params: {
   const center =
     brushPick !== null && brushPick.mesh === target.mesh && brushPick.point !== null
       ? brushPick.point
-      : target.center;
+      : localCenter(scene, target.mesh);
   const roiRadius = Math.max(brushRadius, target.radius * 0.5);
   const opts = buildDyntopoOptions(mode, detail, target.radius);
   const pinned = mask !== null && mask.mesh === target.mesh ? mask.vertices : [];

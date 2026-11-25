@@ -85,7 +85,7 @@ export function SurfacePathControls(props: {
           >
             Clear
           </button>
-          {sources.length > 0 && report === null && !map.busy ? (
+          {sources.length > 0 && (report === null || map.stale) && !map.busy ? (
             <button type="button" data-action="geodesic-show" title="Colour the mesh by this map again" onClick={map.show}>
               Show map
             </button>
@@ -118,7 +118,19 @@ export function SurfacePathControls(props: {
           <p className="muted small">Click the selected mesh to add a source · drag to turn the view · Esc stops.</p>
         ) : null}
         {target === null && sources.length === 0 ? <p className="muted small">Select a mesh to measure on.</p> : null}
-        {map.busy ? <p className="muted busy">Computing surface distances...</p> : null}
+        {map.busy ? (
+          <div className="op-row">
+            <p className="muted busy">Computing surface distances...</p>
+            <button
+              type="button"
+              data-action="geodesic-cancel"
+              title="Stop computing this map; the sources stay"
+              onClick={map.cancel}
+            >
+              Cancel
+            </button>
+          </div>
+        ) : null}
         {report !== null && legend !== null ? (
           <>
             <FieldLegend map={legend.map} lo={legend.lo} hi={legend.hi} band={legend.band} />
@@ -184,7 +196,19 @@ export function SurfacePathControls(props: {
             {readout}
           </p>
         ) : null}
-        {tracing ? <p className="muted busy">Tracing the path...</p> : null}
+        {tracing ? (
+          <div className="op-row">
+            <p className="muted busy">Tracing the path...</p>
+            <button
+              type="button"
+              data-action="path-cancel"
+              title="Stop tracing this leg; the path stays"
+              onClick={paths.cancelTracing}
+            >
+              Cancel
+            </button>
+          </div>
+        ) : null}
 
         <div className="op-row">
           <button
@@ -213,6 +237,15 @@ export function SurfacePathControls(props: {
             onClick={() => void paths.split()}
           >
             Split
+          </button>
+          <button
+            type="button"
+            data-action="path-keep"
+            disabled={path === null || path.legs.length === 0}
+            title="Keep the path, open or closed, as a polyline object of the scene"
+            onClick={paths.keep}
+          >
+            Keep as object
           </button>
         </div>
         {closed ? (

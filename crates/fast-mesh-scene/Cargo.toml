@@ -35,3 +35,11 @@ harness = false
 [[bench]]
 name = "sculpt"
 harness = false
+
+[[bench]]
+name = "height_map"
+harness = false
+
+[[bench]]
+name = "geodesic"
+harness = false

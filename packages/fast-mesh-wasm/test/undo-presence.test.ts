@@ -1,10 +1,12 @@
 // Undoable adds and removals (#269): `Scene` and `WorkerScene` (against the
 // Worker engine in the Node `worker_threads` harness) bring a mesh back with
 // the same handle, data and display state, their change records say so, a
-// Worker's mirrors follow, and the store's snapshot follows the records.
+// Worker's mirrors follow, and the store's snapshot follows the records. The
+// ops that add a mesh, and the one that removes one (join), do so undoably
+// too (#271).
 import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it } from "vitest";
-import { type FieldHandle, type MeshChange, type MeshHandle, Scene } from "../src/node.js";
+import { type FieldHandle, type MeshChange, type MeshHandle, packPointCloud, Scene } from "../src/node.js";
 import { createSceneStore, meshState, type SceneStore } from "../src/store/index.js";
 import { debugDump } from "../src/worker/client.js";
 import { createWorkerScene, type WorkerLike, type WorkerScene } from "../src/worker/index.js";
@@ -129,6 +131,12 @@ async function mirrored(s: AnyScene, mesh: MeshHandle): Promise<void> {
   expect(v.indices()).toEqual(dump.indices);
   expect([...s.matrix4(mesh)]).toEqual(dump.matrix4);
 }
+
+/** Two unit quads facing away across the z = 0..1 gap, for joins. */
+const FACING = [
+  { positions: Float64Array.from([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]), indices: Uint32Array.from([0, 2, 1, 0, 3, 2]) },
+  { positions: Float64Array.from([0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]), indices: Uint32Array.from([0, 1, 2, 0, 2, 3]) },
+] as const;
 
 function code(fn: () => unknown): string {
   try {
@@ -378,6 +386,170 @@ for (const [name, make] of [
       }
     });
 
+    it("wraps, face copies and splits, plugs, placed stamps and reconstructions undo as one step", async () => {
+      const s: AnyScene = await make();
+      const [a, b] = [cube(), cube(5)];
+      const ma = s.addMesh(a.positions, a.indices);
+      const stamp = s.addMesh(b.positions, b.indices);
+      await settle(s);
+      const before = triangles(s, ma);
+      const n = 200;
+      const positions = new Float32Array(3 * n);
+      for (let i = 0; i < n; i++) {
+        const z = 1 - (2 * i + 1) / n;
+        const r = Math.sqrt(1 - z * z);
+        const t = i * Math.PI * (3 - Math.sqrt(5));
+        positions.set([r * Math.cos(t), r * Math.sin(t), z], 3 * i);
+      }
+      // The unit sphere's normals are its points.
+      const cloud = packPointCloud(positions, positions);
+      const hole = {
+        surfacePoint: [0.5, 0.5, 1] as [number, number, number],
+        surfaceNormal: [0, 0, 1] as [number, number, number],
+        diameter: 0.4,
+        depth: 0.5,
+        generatePlug: true,
+        plugClearance: 0.02,
+      };
+      const place = {
+        hitPoint: [0.5, 0.5, 1] as [number, number, number],
+        hitNormal: [0, 0, 1] as [number, number, number],
+        mode: "keepSeparate" as const,
+      };
+      const reconstruct = { method: "implicitMlsMarchingCubes" as const, voxelSize: 0.3, kNeighbors: 12 };
+      const ops: [string, () => Promise<MeshHandle>][] = [
+        ["wrap", async () => (await frame(s, s.wrap(ma, { gap: 0.2, detail: 16, project: false }))).mesh],
+        ["extract", async () => frame(s, s.repair.extractSelectedFaces(ma, [0, 1]))],
+        ["split", async () => (await frame(s, s.repair.splitSelectedFaces(ma, [0, 1]))).detached],
+        ["plug", async () => (await frame(s, s.boolean.punchDrainHole(ma, hole))).plugs[0]],
+        ["stamp", async () => (await frame(s, s.boolean.placeMesh(ma, stamp, place))).added as MeshHandle],
+        ["reconstruct", async () => frame(s, s.inspect.reconstructPointCloud(cloud, reconstruct))],
+      ];
+      for (const [op, run] of ops) {
+        const made = await run();
+        await settle(s);
+        const shown = drawn(s, made);
+        const changed = triangles(s, ma);
+        expect(shown.indices.length, op).toBeGreaterThan(0);
+        expect(changed.length !== before.length, op).toBe(op === "split" || op === "plug");
+        for (let k = 0; k < 2; k++) {
+          s.undo();
+          expect(about(await settle(s), made), op).toEqual(["parked"]);
+          expect([s.has(made), s.isRestorable(made)], op).toEqual([false, true]);
+          expect(triangles(s, ma), op).toEqual(before);
+          expect(canUndo(s), op).toBe(false);
+          s.redo();
+          expect(about(await settle(s), made), op).toEqual(["added"]);
+          expect(drawn(s, made), op).toEqual(shown);
+          expect(triangles(s, ma), op).toEqual(changed);
+          await mirrored(s, made);
+          await mirrored(s, ma);
+        }
+        // The next op's step drops this one's redo: its mesh is gone for good.
+        s.undo();
+        await settle(s);
+      }
+    });
+
+    it("a join takes its source in one step, and undo brings it back as it was", async () => {
+      const s: AnyScene = await make();
+      const c = cube(3);
+      const [a, b] = FACING.map((q) => s.addMesh(q.positions, q.indices)) as [MeshHandle, MeshHandle];
+      const other = s.addMesh(c.positions, c.indices);
+      const own = s.addDistanceField({ name: "own", on: b, to: other, maxDistance: 10 });
+      const toB = s.addDistanceField({ name: "toB", on: other, to: b, maxDistance: 10 });
+      s.setColoring(b, { field: own, map: "turbo", range: [0, 4] });
+      s.setCollisionRule(a, b, { mode: "rigid", contactMargin: 0.5 });
+      await settle(s);
+      const was = drawn(s, b);
+      const quad = triangles(s, a);
+      const loops = {
+        loopA: (await frame(s, s.analyze(a))).loops[0].id,
+        loopB: (await frame(s, s.analyze(b))).loops[0].id,
+      };
+      const report = await frame(s, s.join(a, b, loops));
+      expect(report).toEqual({ verticesAdded: 4, trianglesAdded: 2, bridgeTrianglesAdded: 8 });
+      expect([s.has(b), s.isRestorable(b)]).toEqual([false, true]);
+      await settle(s);
+      const joined = triangles(s, a);
+      expect(joined.length).toBe(12);
+      for (let k = 0; k < 2; k++) {
+        expect(code(() => s.views(b))).toBe("UNKNOWN_MESH");
+        expect(code(() => s.setColoring(b, null))).toBe("UNKNOWN_MESH");
+        s.undo();
+        expect(about(await settle(s), b)).toEqual(["added"]);
+        expect(drawn(s, b)).toEqual(was);
+        expect(triangles(s, a)).toEqual(quad);
+        await mirrored(s, b);
+        await mirrored(s, a);
+        expect(canUndo(s)).toBe(false);
+        // Its own field and its collision rule are back; what another mesh measured to it is not.
+        expect(s.coloring(b)?.field).toBe(own);
+        expect(s.collisionRule(a, b)).toMatchObject({ mode: "rigid", contactMargin: 0.5 });
+        expect(code(() => s.removeField(toB))).toBe("UNKNOWN_FIELD");
+        s.redo();
+        expect(about(await settle(s), b)).toEqual(["parked"]);
+        expect(triangles(s, a)).toEqual(joined);
+      }
+      // Back, it joins like any other mesh.
+      s.undo();
+      await settle(s);
+      const again = s.join(a, b, loops);
+      await settle(s);
+      expect(await again).toEqual(report);
+      expect(triangles(s, a)).toEqual(joined);
+      expect([s.has(b), s.isRestorable(b)]).toEqual([false, true]);
+    });
+
+    it("collision rules come back once both their meshes have", async () => {
+      const s: AnyScene = await make();
+      const [a, b, c] = [0, 2, 4].map((x) => s.addMesh(cube(x).positions, cube(x).indices)) as [
+        MeshHandle,
+        MeshHandle,
+        MeshHandle,
+      ];
+      s.setCollisionRule(a, b, { mode: "rigid", contactMargin: 0.25 });
+      s.setCollisionRule(b, c, { mode: "cut", contactMargin: 0.5 });
+      await settle(s);
+      const rule = (x: MeshHandle, y: MeshHandle) => {
+        const r = s.collisionRule(x, y);
+        return [r.mode, r.contactMargin];
+      };
+      s.removeMesh(b, { undoable: true });
+      expect(code(() => s.collisionRule(a, b))).toBe("UNKNOWN_MESH");
+      expect(s.hasActiveCollisionResponse(a)).toBe(false);
+      await settle(s);
+      s.removeMesh(a, { undoable: true });
+      await settle(s);
+      expect(s.hasActiveCollisionResponse(c)).toBe(false);
+      s.undo();
+      await settle(s);
+      expect([s.has(a), s.has(b)]).toEqual([true, false]);
+      expect(s.hasActiveCollisionResponse(a)).toBe(false);
+      s.undo();
+      await settle(s);
+      expect([rule(a, b), rule(c, b)]).toEqual([
+        ["rigid", 0.25],
+        ["cut", 0.5],
+      ]);
+      expect([a, b, c].map((m) => s.hasActiveCollisionResponse(m))).toEqual([true, true, true]);
+      // Cleared while both are there, it stays cleared; with a mesh gone for good, its rules go.
+      expect(s.clearCollisionRule(a, b)).toBe(true);
+      s.redo();
+      await settle(s);
+      s.undo();
+      await settle(s);
+      expect(rule(a, b)[0]).toBe("passThrough");
+      expect(rule(b, c)).toEqual(["cut", 0.5]);
+      s.redo();
+      await settle(s);
+      s.removeMesh(c);
+      s.undo();
+      await settle(s);
+      expect(s.has(b)).toBe(true);
+      expect(s.hasActiveCollisionResponse(b)).toBe(false);
+    });
+
     it("cuts the links other meshes own, and keeps fields between meshes removed together", async () => {
       const s: AnyScene = await make();
       const [a, b, c] = [cube(), cube(2), cube(4)];
@@ -462,6 +634,43 @@ describe("WorkerScene", () => {
     expect(code(() => s.idOf(mesh))).toBe("UNKNOWN_MESH");
     expect(s.status(`mesh:${id}`).status).toBe("idle");
     expect(s.has(mesh)).toBe(false);
+  });
+
+  it("a join and its undo in one batch, and a removal while a join is in flight", async () => {
+    const s = await makeWorker();
+    const [a, b] = FACING.map((q) => s.addMesh(q.positions, q.indices)) as [MeshHandle, MeshHandle];
+    await settle(s);
+    const loops = {
+      loopA: (await frame(s, s.analyze(a))).loops[0].id,
+      loopB: (await frame(s, s.analyze(b))).loops[0].id,
+    };
+    const was = drawn(s, b);
+    const joined = s.join(a, b, loops);
+    s.undo();
+    await settle(s);
+    expect((await joined).bridgeTrianglesAdded).toBe(8);
+    expect([s.has(b), s.isRestorable(b)]).toEqual([true, false]);
+    expect(drawn(s, b)).toEqual(was);
+    expect(triangles(s, a).length).toBe(2);
+    await mirrored(s, a);
+    await mirrored(s, b);
+    // It takes calls, and the redo joins.
+    s.redo();
+    await settle(s);
+    expect([s.has(b), s.isRestorable(b)]).toEqual([false, true]);
+    s.undo();
+    await settle(s);
+
+    const second = s.join(a, b, loops);
+    s.removeMesh(b);
+    await settle(s);
+    await second;
+    expect([s.has(b), s.isRestorable(b)]).toEqual([false, false]);
+    expect(triangles(s, a).length).toBe(12);
+    s.undo();
+    await settle(s);
+    expect(s.has(b)).toBe(false);
+    await mirrored(s, a);
   });
 
   it("requests made before the undo's result fail on the mesh it removed", async () => {
@@ -746,6 +955,41 @@ for (const [name, make] of [
       expect([ma, mb].map((m) => meshState(store.getSnapshot(), m).display.coloring?.distanceTo)).toEqual([mb, ma]);
     });
 
+    it("follows a join out and back", async () => {
+      const { store, s, sync } = await open();
+      const c = cube(3);
+      const [a, b] = FACING.map((q) => store.addMesh(q.positions, q.indices)) as [MeshHandle, MeshHandle];
+      const other = store.addMesh(c.positions, c.indices);
+      store.setDisplay(b, { opacity: 0.5 });
+      store.setDisplay(other, { coloring: { distanceTo: b, maxDistance: 10, range: [0, 4], map: "turbo" } });
+      store.select(b);
+      await sync();
+      await sync();
+      const loop = async (m: MeshHandle) => {
+        const p = Promise.resolve(s.analyze(m));
+        await sync();
+        return (await p).loops[0].id;
+      };
+      const loops = { loopA: await loop(a), loopB: await loop(b) };
+      const joined = s.join(a, b, loops);
+      await sync();
+      await joined;
+      for (let k = 0; k < 2; k++) {
+        expect([has(store, a), has(store, b), store.isRestorable(b)]).toEqual([true, false, true]);
+        expect(store.getSnapshot().selection).toBeNull();
+        store.undo();
+        for (let n = 0; n < 3; n++) {
+          await sync();
+        }
+        expect([has(store, b), store.isRestorable(b)]).toEqual([true, false]);
+        expect(meshState(store.getSnapshot(), b).display.opacity).toBe(0.5);
+        expect(meshState(store.getSnapshot(), other).display.coloring?.distanceTo).toBe(b);
+        expect(meshState(store.getSnapshot(), other).status).toBe("ready");
+        store.redo();
+        await sync();
+      }
+    });
+
     it("forgets what the history drops, and adopts meshes that ops add", async () => {
       const { store, s, sync } = await open();
       const c = cube();
@@ -824,7 +1068,7 @@ describe("random sequences", () => {
     let depth = 0;
     const history: string[] = [];
     for (let n = 0; n < 60; n++) {
-      const op = pick(["add", "add", "remove", "remove", "move", "edit", "color", "section", "begin", "end", "cancel", "undo", "undo", "undo", "redo", "redo", "sync", "sync"]);
+      const op = pick(["add", "add", "remove", "remove", "move", "edit", "color", "section", "rule", "begin", "end", "cancel", "undo", "undo", "undo", "redo", "redo", "sync", "sync"]);
       history.push(op);
       const live = both();
       const mesh = live.length > 0 ? pick(live) : undefined;
@@ -851,6 +1095,18 @@ describe("random sequences", () => {
           store.setDisplay(mesh[k], {
             coloring: on ? { distanceTo: to.map((m) => m[k]), maxDistance: 20, range: [0, 4], map: "turbo" } : null,
           }),
+        );
+      } else if (op === "rule" && mesh !== undefined) {
+        const others = live.filter((m) => m !== mesh);
+        if (others.length === 0) {
+          continue;
+        }
+        const other = pick(others);
+        const contactMargin = rnd() < 0.25 ? null : 1 + Math.floor(rnd() * 8) / 8;
+        each((_, scene, k) =>
+          contactMargin === null
+            ? scene.clearCollisionRule(mesh[k], other[k])
+            : scene.setCollisionRule(mesh[k], other[k], { mode: "rigid", contactMargin }),
         );
       } else if (op === "section") {
         const cut = live.filter(() => rnd() < 0.7);
@@ -888,6 +1144,11 @@ describe("random sequences", () => {
         const [x, y] = scenes.map((s, k) => s.section(sections[k], meshes[i][k]).contours.map((c) => [...c.points]));
         expect(y, at).toEqual(x);
       }
+      const rules = scenes.map((s, k) => {
+        const there = both().map((m) => m[k]);
+        return there.flatMap((x, i) => there.slice(i + 1).map((y) => s.collisionRule(x, y)));
+      });
+      expect(rules[1], at).toEqual(rules[0]);
       for (const [a, b] of meshes) {
         expect(worker.has(b), at).toBe(local.has(a));
         expect(worker.isRestorable(b), at).toBe(local.isRestorable(a));

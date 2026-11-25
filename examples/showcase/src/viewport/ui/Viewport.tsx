@@ -23,9 +23,11 @@ import type { Loader } from "../../io/loader";
 import { inspect } from "../../app/state/readouts";
 import { type AppState, type Item, useApp } from "../../app/state/app-state";
 import { evaluateOverlayColor } from "../../engine/workbench-ops";
+import { BuildPlateLayer } from "../../features/build-plate/ui/BuildPlateLayer";
 import { InspectLayers } from "../../features/inspect/ui/InspectLayers";
 import { CreatePreviewLayer } from "../../features/home/ui/CreatePreviewLayer";
 import { TextPreviewLayer } from "../../features/mesh-edit/ui/TextPreviewLayer";
+import { ReliefPreviewLayer } from "../../features/mesh-edit/ui/ReliefPreviewLayer";
 import { SceneSlices } from "../../features/ct/ui/SceneSlices";
 import { SceneVolume } from "../../features/ct/ui/SceneVolume";
 import { matchVolume } from "../../features/ct/ux/volume-box";
@@ -45,8 +47,10 @@ import { buildHealerOverlayGroup, disposeHealerOverlayGroup } from "../../featur
 import { DeformHandlesLayer } from "../../features/sculpt/ui/DeformHandlesLayer";
 import { FaceSelectionLayer } from "../../features/select/ui/FaceSelectionLayer";
 import { HollowPlaceToolsLayer } from "../../features/mesh-edit/ui/HollowPlaceToolsLayer";
+import { LatticePreviewLayer, LatticeSeeThrough } from "../../features/mesh-edit/ui/LatticePreviewLayer";
 import { MetrologyOverlaysLayer } from "../../features/points/ui/MetrologyOverlaysLayer";
 import { PlacementPicksLayer } from "../../features/transform/ui/PlacementPicksLayer";
+import { PolylineLayer } from "../../features/polylines/ui/PolylineLayer";
 import { AlignToolsLayer } from "../../features/transform/ui/AlignToolsLayer";
 import { SurfacePathLayer } from "../../features/inspect/ui/SurfacePathLayer";
 import { useCameraRequests, useOrbitCamera } from "../ux/use-camera-controller";
@@ -225,11 +229,15 @@ export function Viewport(props: {
       <DeformHandlesLayer app={app} store={store} />
       <MetrologyOverlaysLayer app={app} store={store} />
       <HollowPlaceToolsLayer app={app} store={store} />
+      <LatticePreviewLayer app={app} store={store} />
       <PlacementPicksLayer app={app} store={store} />
       <AlignToolsLayer app={app} store={store} />
       <SurfacePathLayer app={app} store={store} />
+      <PolylineLayer app={app} />
       <CreatePreviewLayer app={app} />
       <TextPreviewLayer app={app} />
+      <BuildPlateLayer app={app} />
+      <ReliefPreviewLayer app={app} />
     </Canvas>
   );
 }
@@ -362,6 +370,7 @@ function MeshView(props: {
       />
       <RepairOverlays app={app} scene={scene} item={item} bound={bound} />
       <SculptMaskOverlay app={app} item={item} bound={bound} />
+      <LatticeSeeThrough app={app} mesh={item.mesh} bound={bound} />
       <SurfaceFieldOverlay app={app} item={item} bound={bound} />
     </>
   );

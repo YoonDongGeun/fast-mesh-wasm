@@ -24,6 +24,20 @@ import {
   extrudeFacesArgs,
 } from "../extrude.js";
 import {
+  type AddHeightfieldOptions,
+  checkHeightfield,
+  checkHeightfieldPlacement,
+  encodeHeightMapFrame,
+  encodeHeightMapOptions,
+  type Heightfield,
+  type HeightfieldResult,
+  type HeightMap,
+  type HeightMapFrame,
+  type HeightMapOptions,
+  heightMapMeshList,
+  isHeightMapFrame,
+} from "../height-map.js";
+import {
   type ConvexHullOptions,
   type ConvexHullPoints,
   type ConvexHullResult,
@@ -32,6 +46,15 @@ import {
   hullPointsBuffer,
 } from "../hull.js";
 import { checkRegisterOptions } from "../register.js";
+import {
+  checkLatticeOptions,
+  DEFAULT_LATTICE_MAX_VOXELS,
+  DEFAULT_LATTICE_PREVIEW_VOXELS,
+  type LatticeOptions,
+  type LatticePlan,
+  type LatticePreview,
+  type LatticeReport,
+} from "../lattice.js";
 import {
   checkWrapOptions,
   type WrapGridOptions,
@@ -61,6 +84,7 @@ import {
   normalizeTrimCurveArgs,
   normalizeU32List,
   normalizeVec3,
+  throwIfAborted,
 } from "../options.js";
 import type { Bounds, Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
@@ -397,6 +421,8 @@ function transferOf(batch: Request[]): Transferable[] {
       if (req.uvs !== undefined) {
         transfer.push(req.uvs);
       }
+    } else if (req.kind === "addHeightfield") {
+      transfer.push(req.field.heights.buffer);
     }
   }
   return transfer;
@@ -860,8 +886,11 @@ export class WorkerScene implements SceneLike {
   #crashWatch: BroadcastChannel | undefined;
   /** Default collision response rule persisted across Worker restarts. */
   #defaultCollisionRule: CollisionRule = { ...DEFAULT_COLLISION_RULE };
-  /** Explicit per-pair collision rules keyed canonically by sorted ClientId pair. */
-  readonly #collisionRules = new Map<string, { a: MeshState; b: MeshState; rule: CollisionRule }>();
+  /**
+   * Explicit per-pair collision rules keyed canonically by sorted ClientId
+   * pair; those of a parked mesh wait here for its way back.
+   */
+  readonly #collisionRules = new Map<string, { a: MeshState; b: MeshState; rule: CollisionRule; rev: number }>();
 
   /**
    * Callable async repair domain (`worker.repair(mesh, op)` and `worker.repair.<method>(...)`).
@@ -961,6 +990,7 @@ export class WorkerScene implements SceneLike {
       this.triangleQuality(mesh, metricOrOptions, sliverThreshold),
     meshDeviation: (source, target, options) => this.meshDeviation(source, target, options),
     geodesicDistances: (mesh, sources, options) => this.geodesicDistances(mesh, sources, options),
+    releaseGeodesics: () => this.releaseGeodesics(),
     shortestSurfacePath: (mesh, sources, targetVertex, options) =>
       this.shortestSurfacePath(mesh, sources, targetVertex, options),
     addDistanceField: (desc) => this.addDistanceField(desc),
@@ -1204,25 +1234,60 @@ export class WorkerScene implements SceneLike {
     return req.rev;
   }
 
-  /** Queues a request with a reply and sends soon; resolves with `map(value)`. */
-  #ask<T>(make: (rev: number, qid: number) => Request, map: (value: unknown) => T): Promise<T> {
+  /**
+   * Queues a request with a reply and sends soon; resolves with `map(value)`.
+   * With a `signal`, an abort rejects at once with its reason and cancels
+   * the query (see {@link WorkerScene.#cancel}).
+   */
+  #ask<T>(
+    make: (rev: number, qid: number) => Request,
+    map: (value: unknown) => T,
+    signal?: AbortSignal,
+  ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       this.#alive();
       const qid = ++this.#qid;
       const req = make(++this.#rev, qid);
+      throwIfAborted(signal);
+      const abort = () => this.#cancel(qid, signal?.reason);
+      signal?.addEventListener("abort", abort, { once: true });
       this.#replies.set(qid, {
         resolve: (v) => {
+          signal?.removeEventListener("abort", abort);
           try {
             resolve(map(v));
           } catch (e) {
             reject(e);
           }
         },
-        reject,
+        reject: (e) => {
+          signal?.removeEventListener("abort", abort);
+          reject(e);
+        },
       });
       this.#push(req);
       this.#scheduleFlush();
     });
+  }
+
+  /**
+   * Cancels a query: rejects its promise with `reason`, and takes it out of
+   * the requests not sent yet, or else tells the Worker to drop it.
+   */
+  #cancel(qid: number, reason: unknown): void {
+    const pending = this.#replies.get(qid);
+    if (pending === undefined) {
+      return;
+    }
+    this.#replies.delete(qid);
+    const at = this.#queue.findIndex((req) => (req as { qid?: number }).qid === qid);
+    if (at >= 0) {
+      this.#queue.splice(at, 1);
+    } else if (!this.#terminated && this.#poison === undefined) {
+      this.#push({ kind: "cancel", rev: ++this.#rev, qid });
+      this.#scheduleFlush();
+    }
+    pending.reject(reason);
   }
 
   /**
@@ -1252,10 +1317,12 @@ export class WorkerScene implements SceneLike {
     name: N,
     args: () => QueryMap[N]["args"],
     map: (value: QueryMap[N]["value"]) => T,
+    signal?: AbortSignal,
   ): Promise<T> {
     return this.#ask(
       (rev, qid) => ({ kind: "query", rev, qid, name, args: args() }),
       (v) => map(v as QueryMap[N]["value"]),
+      signal,
     );
   }
 
@@ -1280,6 +1347,8 @@ export class WorkerScene implements SceneLike {
     for (const req of batch) {
       if (req.kind === "addMesh") {
         transfer.push(req.positions, req.indices);
+      } else if (req.kind === "addHeightfield") {
+        transfer.push(req.field.heights.buffer);
       }
     }
     try {
@@ -1648,6 +1717,8 @@ export class WorkerScene implements SceneLike {
     }
     for (const st of left) {
       this.#dropLinks(st);
+      // Rules requested since the result's batch found it gone.
+      this.#dropCollisionRules(st, r.rev);
     }
     // What went with them depends on the order of the steps, which only the
     // engine knows (a mesh may have left and come back).
@@ -1678,6 +1749,7 @@ export class WorkerScene implements SceneLike {
 
   /** Keeps only a tombstone of a mesh removed for good, once its removal is delivered. */
   #forgetMesh(st: MeshState): void {
+    this.#dropCollisionRules(st);
     this.#meshes.delete(st.id);
     this.#byMesh.delete(st.handle);
     this.#tombstones.add(st.handle);
@@ -2003,7 +2075,8 @@ export class WorkerScene implements SceneLike {
   /**
    * Joins `source` into `target`; see `Scene.join`. The source stays usable
    * until the join lands: only a successful result removes it (a failed join
-   * changes nothing, engine-side or here).
+   * changes nothing, engine-side or here), as part of the join's undo step.
+   * {@link WorkerScene.undo} brings it back.
    *
    * @deprecated Use `workerScene.repair.join()` instead.
    */
@@ -2014,19 +2087,11 @@ export class WorkerScene implements SceneLike {
       this.#drag.end();
     }
     const payload = copyInput(options, "options");
-    // `#ask` runs `make` synchronously, so `rev` is set before `then` runs.
-    let rev = 0;
-    const done = this.#ask(
-      (r, qid) => {
-        rev = r;
-        return { kind: "join", rev: r, target: ta.id, source: st.id, payload, qid };
-      },
+    // The result says where the source is now (`#applyPresence`).
+    return this.#ask(
+      (rev, qid) => ({ kind: "join", rev, target: ta.id, source: st.id, payload, qid }),
       (v) => v as JoinReport,
     );
-    return done.then((report) => {
-      this.#noteRemoved(st, rev);
-      return report;
-    });
   }
 
   /**
@@ -2062,15 +2127,25 @@ export class WorkerScene implements SceneLike {
     }
   }
 
-  /** A removed mesh's section entries and collision rules go, as they do in the engine. */
+  /**
+   * A removed mesh's section entries go, as they do in the engine, and its
+   * collision rules, unless it is parked: they come back with it.
+   */
   #dropLinks(st: MeshState): void {
     for (const s of this.#sections.values()) {
       if (!s.removed) {
         s.meshes = s.meshes.filter((m) => m !== st);
       }
     }
+    if (!st.parked) {
+      this.#dropCollisionRules(st);
+    }
+  }
+
+  /** Drops the collision rules of a mesh's pairs: those requested after `rev` only, if given. */
+  #dropCollisionRules(st: MeshState, rev = 0): void {
     for (const [key, entry] of [...this.#collisionRules.entries()]) {
-      if (entry.a === st || entry.b === st) {
+      if ((entry.a === st || entry.b === st) && entry.rev > rev) {
         this.#collisionRules.delete(key);
       }
     }
@@ -2248,7 +2323,11 @@ export class WorkerScene implements SceneLike {
     });
   }
 
-  /** Conformatively imprints a world-space polyline onto `mesh` and optionally trims inside/outside. */
+  /**
+   * Conformatively imprints a world-space polyline onto `mesh` and optionally
+   * deletes one side of the loop from the component it lies on: see
+   * `Scene.trimByCurve`.
+   */
   trimByCurve(mesh: MeshHandle, options: TrimCurveOptions): Promise<TrimReport>;
   trimByCurve(
     mesh: MeshHandle,
@@ -2695,7 +2774,11 @@ export class WorkerScene implements SceneLike {
     );
   }
 
-  /** Computes geodesic surface distances from `sources` on `mesh` (`"dijkstra"` or `"heatMethod"`). */
+  /**
+   * Computes geodesic surface distances from `sources` on `mesh` (`"dijkstra"`
+   * or `"heatMethod"`), in steps on the Worker: `options.signal` cancels the
+   * query. Other requests wait for it.
+   */
   geodesicDistances(
     mesh: MeshHandle,
     sources: number | readonly number[],
@@ -2709,10 +2792,24 @@ export class WorkerScene implements SceneLike {
         options: normalizeGeodesicOptions(options),
       }),
       (v) => v,
+      options.signal,
     );
   }
 
-  /** Traces an intrinsic shortest path along the surface of `mesh` to `targetVertex`. */
+  /** Frees what `"heatMethod"` queries keep in the Worker for the next one of the same mesh. */
+  releaseGeodesics(): Promise<void> {
+    return this.#query(
+      "releaseGeodesics",
+      () => ({}),
+      () => undefined,
+    );
+  }
+
+  /**
+   * Traces an intrinsic shortest path along the surface of `mesh` to
+   * `targetVertex`. Without `options.distances` it computes them first, like
+   * {@link WorkerScene.geodesicDistances}: `options.signal` cancels that.
+   */
   shortestSurfacePath(
     mesh: MeshHandle,
     sources: number | readonly number[],
@@ -2737,6 +2834,7 @@ export class WorkerScene implements SceneLike {
         };
       },
       (v) => v,
+      options.signal,
     );
   }
 
@@ -3078,8 +3176,9 @@ export class WorkerScene implements SceneLike {
       throw invalid("collision rule requires two distinct meshes");
     }
     const normalized = normalizeCollisionRule(rule);
-    this.#collisionRules.set(collisionPairKey(sa.id, sb.id), { a: sa, b: sb, rule: normalized });
-    this.#push({ kind: "setCollisionRule", rev: ++this.#rev, a: sa.id, b: sb.id, rule: { ...normalized } });
+    const rev = ++this.#rev;
+    this.#collisionRules.set(collisionPairKey(sa.id, sb.id), { a: sa, b: sb, rule: normalized, rev });
+    this.#push({ kind: "setCollisionRule", rev, a: sa.id, b: sb.id, rule: { ...normalized } });
   }
 
   clearCollisionRule(a: MeshHandle, b: MeshHandle): boolean {
@@ -3267,6 +3366,64 @@ export class WorkerScene implements SceneLike {
     });
   }
 
+  /** Fits a height map's frame to `meshes` (one mesh or several) in the Worker (see `Scene.heightMapFrame`). */
+  heightMapFrame(meshes: MeshHandle | readonly MeshHandle[], options?: HeightMapOptions): Promise<HeightMapFrame> {
+    return this.#query(
+      "heightMapFrame",
+      () => ({
+        meshes: heightMapMeshList(meshes).map((m) => this.#live(m).id),
+        options: encodeHeightMapOptions(options),
+      }),
+      (v) => v,
+    );
+  }
+
+  /**
+   * An orthographic depth image of `meshes` (one mesh or several), sampled in
+   * the Worker and transferred (see `Scene.heightMap`). Asking for bands of
+   * `rows` lets other requests run in between them.
+   */
+  heightMap(
+    meshes: MeshHandle | readonly MeshHandle[],
+    frame?: HeightMapFrame | HeightMapOptions,
+    rows?: readonly [number, number],
+  ): Promise<HeightMap> {
+    return this.#query(
+      "heightMap",
+      () => ({
+        meshes: heightMapMeshList(meshes).map((m) => this.#live(m).id),
+        ...(isHeightMapFrame(frame)
+          ? { frame: encodeHeightMapFrame(frame) }
+          : { options: encodeHeightMapOptions(frame) }),
+        ...(rows === undefined ? {} : { rows: [rows[0], rows[1]] as [number, number] }),
+      }),
+      (v) => v,
+    );
+  }
+
+  /**
+   * Adds the relief of a grid of heights in the Worker as a new mesh, one undo
+   * step (see `Scene.addHeightfield`). The heights are copied here and
+   * transferred; the mesh itself comes back only as the mirror's buffers.
+   */
+  addHeightfield(field: Heightfield, options?: AddHeightfieldOptions): Promise<HeightfieldResult> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        this.#alive();
+        const checked = checkHeightfield(field);
+        const placement = checkHeightfieldPlacement(options);
+        added = this.#allocMeshState([0, 0, 0], placement.normals);
+        const copy = { ...checked, heights: checked.heights.slice() };
+        return { kind: "addHeightfield", rev, addedId: added.id, field: copy, placement, qid };
+      },
+      (v) => ({ mesh: (added as MeshState).handle, ...(v as Omit<HeightfieldResult, "mesh">) }),
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
   /** Smooths noise out of `mesh` in the Worker, one undo step (see `Scene.denoise`). */
   denoise(mesh: MeshHandle, options?: DenoiseOptions): Promise<DenoiseReport> {
     return this.#ask(
@@ -3367,6 +3524,47 @@ export class WorkerScene implements SceneLike {
         return { kind: "hollowMesh", rev, id: st.id, options: cloned, qid };
       },
       (v) => v as HollowReport,
+    );
+  }
+
+  /**
+   * Plans the voxel grid of {@link WorkerScene.latticeFill} for the same mesh
+   * and options without running it (see `Scene.latticePlan`).
+   */
+  latticePlan(mesh: MeshHandle, options: LatticeOptions): Promise<LatticePlan> {
+    return this.#query(
+      "latticePlan",
+      () => ({ mesh: this.#live(mesh).id, options: checkLatticeOptions(options, DEFAULT_LATTICE_MAX_VOXELS) }),
+      (v) => v,
+    );
+  }
+
+  /**
+   * Fills the inside of a closed mesh, or the cavity of a hollowed one, with a
+   * lattice in the Worker, one undo step (see `Scene.latticeFill`). The page
+   * stays live while it runs.
+   */
+  latticeFill(mesh: MeshHandle, options: LatticeOptions): Promise<LatticeReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const checked = checkLatticeOptions(options, DEFAULT_LATTICE_MAX_VOXELS);
+        this.#endDragOn(st);
+        return { kind: "latticeFill", rev, id: st.id, options: checked, qid };
+      },
+      (v) => v as LatticeReport,
+    );
+  }
+
+  /**
+   * The walls of a lattice on a small grid, built in the Worker without
+   * changing the mesh (see `Scene.latticePreview`).
+   */
+  latticePreview(mesh: MeshHandle, options: LatticeOptions): Promise<LatticePreview> {
+    return this.#query(
+      "latticePreview",
+      () => ({ mesh: this.#live(mesh).id, options: checkLatticeOptions(options, DEFAULT_LATTICE_PREVIEW_VOXELS) }),
+      (v) => v,
     );
   }
 
@@ -3577,6 +3775,18 @@ export class WorkerScene implements SceneLike {
    */
   generatePrimitive(shape: PrimitiveShape): Promise<PrimitiveMesh> {
     return this.#query("generatePrimitive", () => encodePrimitive(shape), (v) => v);
+  }
+
+  /**
+   * Generates the relief of a grid of heights in the Worker, as the standalone
+   * `generateHeightfield` does on a thread with the module initialised; the
+   * buffers are transferred back, and the scene is not touched.
+   *
+   * @throws (rejects) `INVALID_ARGUMENT` for a grid out of range;
+   * `OUT_OF_MEMORY` when the buffers cannot be allocated.
+   */
+  generateHeightfield(field: Heightfield): Promise<PrimitiveMesh> {
+    return this.#query("generateHeightfield", () => checkHeightfield(field), (v) => v);
   }
 
   // ---- Fields and colours ----

@@ -23,6 +23,23 @@ import {
   extrudeFacesArgs,
 } from "./extrude.js";
 import {
+  type AddHeightfieldOptions,
+  checkHeightfield,
+  checkHeightfieldPlacement,
+  checkHeightMapRows,
+  decodeHeightMapFrame,
+  encodeHeightfield,
+  encodeHeightMapFrame,
+  encodeHeightMapOptions,
+  type Heightfield,
+  type HeightfieldResult,
+  type HeightMap,
+  type HeightMapFrame,
+  type HeightMapOptions,
+  heightMapMeshList,
+  isHeightMapFrame,
+} from "./height-map.js";
+import {
   type ConvexHullOptions,
   type ConvexHullPoints,
   type ConvexHullResult,
@@ -31,6 +48,19 @@ import {
   hullNormals,
   hullPointsBuffer,
 } from "./hull.js";
+import {
+  checkLatticeOptions,
+  decodeLatticePlan,
+  decodeLatticePreview,
+  decodeLatticeReport,
+  DEFAULT_LATTICE_MAX_VOXELS,
+  DEFAULT_LATTICE_PREVIEW_VOXELS,
+  encodeLatticeOptions,
+  type LatticeOptions,
+  type LatticePlan,
+  type LatticePreview,
+  type LatticeReport,
+} from "./lattice.js";
 import { checkRegisterOptions } from "./register.js";
 import {
   checkWrapOptions,
@@ -73,6 +103,7 @@ import {
   normalizeSurfacePathTarget,
   normalizeTrimCurveArgs,
   normalizeU32List,
+  throwIfAborted,
 } from "./options.js";
 import type { Bounds, Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
 import { decodeChanges, type Range } from "./changes.js";
@@ -1781,23 +1812,48 @@ export type CsgNode =
 
 /** Options for conforming polyline imprinting and closed-curve trimming via {@link Scene.trimByCurve}. */
 export interface TrimCurveOptions {
-  /** World-space polyline vertices to imprint onto the mesh surface. */
+  /** World-space polyline vertices to imprint onto the mesh surface, all on one component of it. */
   points: readonly Readonly<Vec3>[];
-  /** Treat the curve as a closed loop and split interior/exterior components (default `false`). */
+  /** Treat the curve as a closed loop and delete one side of it from its component (default `false`). */
   closed?: boolean;
-  /** When `closed` is `true`, delete the enclosed interior (`true`, default) or exterior (`false`). */
+  /**
+   * When `closed` is `true`, delete the inside of the loop (`true`, default) or
+   * its outside (`false`), as {@link Scene.trimByCurve} tells them apart.
+   */
   deleteInside?: boolean;
   /** Snap tolerance in world units (`0` / omitted chooses automatically). */
   snapTolerance?: number;
 }
 
-/** Statistics returned by {@link Scene.trimByCurve}. */
+/**
+ * What {@link Scene.trimByCurve} changed.
+ *
+ * Imprinting the curve replaces the triangles it crosses with smaller ones on
+ * the same surface; deleting a side of a loop takes surface away. Either way
+ * the mesh has `trianglesAdded - trianglesRemoved` more triangles than before,
+ * so those two do not tell a cut from an imprint. `removedArea` and
+ * `cutTriangles` do: both are `0` when nothing was cut away (an open curve, or
+ * a loop that separates nothing, such as one around a torus's tube).
+ */
 export interface TrimReport {
   /** Handle of the trimmed mesh (`kept`). */
   kept: MeshHandle;
+  /** Triangles the mesh did not have before: the pieces left of the triangles the curve split. */
   trianglesAdded: number;
+  /**
+   * Triangles the mesh no longer has, replaced by the imprint or cut away:
+   * `imprintTriangles + cutTriangles`.
+   */
   trianglesRemoved: number;
+  /** Of those, the ones replaced with smaller triangles that all stayed: none of their surface is gone. */
+  imprintTriangles: number;
+  /** Of those, the ones that lost surface, in whole or in part. */
+  cutTriangles: number;
+  /** The area of the surface taken away, in world units squared. */
+  removedArea: number;
+  /** New vertices along the curve. */
   verticesAdded: number;
+  /** Distinct mesh edges along the curve. */
   seamEdges: number;
 }
 
@@ -1870,6 +1926,13 @@ export interface GeodesicOptions {
   maxDistance?: number;
   /** Dimensionless time-step scale `m` (`t = m * h^2`) for `"heatMethod"`. */
   timeStepScale?: number;
+  /**
+   * Cancels the query: its promise rejects with the signal's reason at once,
+   * and a `WorkerScene`'s Worker stops computing at the query's next step. A
+   * `Scene` computes in one call, so there the signal only counts when it is
+   * aborted already: the call then throws its reason.
+   */
+  signal?: AbortSignal;
 }
 
 /** Sample point along an intrinsic surface shortest path. */
@@ -3255,6 +3318,35 @@ export function meshAdds(scene: Scene): MeshAdds {
 }
 
 /**
+ * Geodesic queries in steps (the scene crate's `GeodesicJob`), for the
+ * Worker engine only: not part of the public API.
+ *
+ * - `begin(mesh, sources, options)`: starts `geodesicDistances` with the
+ *   same arguments (the signal aside), computing nothing yet; returns the
+ *   query's token.
+ * - `step(token, work)`: computes over about `work` more elements of the
+ *   mesh, at least one pass over it or one iteration of a solve; `true` once
+ *   the distances are ready. A query that fails throws and is dropped, as
+ *   when its mesh changed meanwhile.
+ * - `finish(token)`: the distances, as `geodesicDistances` gives them.
+ * - `drop(token)`: forgets a query.
+ */
+interface GeodesicSteps {
+  begin(mesh: MeshHandle, sources: number | readonly number[], options?: GeodesicOptions): number;
+  step(token: number, work: number): boolean;
+  finish(token: number): Float32Array;
+  drop(token: number): void;
+}
+
+/** Set by `Scene`'s static block. */
+let geodesicStepsOf: (scene: Scene) => GeodesicSteps;
+
+/** @internal The stepped geodesic queries of `scene` (see {@link GeodesicSteps}); for the Worker engine. */
+export function geodesicSteps(scene: Scene): GeodesicSteps {
+  return geodesicStepsOf(scene);
+}
+
+/**
  * A scene of editable meshes. Create it after `await init()`; release it with
  * {@link Scene.free} or a `using` declaration (otherwise it is freed when
  * garbage collected).
@@ -3388,6 +3480,7 @@ export class Scene implements SceneLike {
       this.triangleQuality(mesh, metricOrOptions, sliverThreshold),
     meshDeviation: (source, target, options) => this.meshDeviation(source, target, options),
     geodesicDistances: (mesh, sources, options) => this.geodesicDistances(mesh, sources, options),
+    releaseGeodesics: () => this.releaseGeodesics(),
     shortestSurfacePath: (mesh, sources, targetVertex, options) =>
       this.shortestSurfacePath(mesh, sources, targetVertex, options),
     addDistanceField: (desc) => this.addDistanceField(desc),
@@ -3587,12 +3680,13 @@ export class Scene implements SceneLike {
    *
    * With `undoable` the removal is an undo step (or part of the open one)
    * and the history stays: {@link Scene.undo} brings the mesh back with the
-   * same handle, its data, placement, display (normals, colouring) and the
-   * fields on it. Nothing is copied, whatever the mesh's size. What belongs
-   * to other meshes is cut as by any removal and does not come back: fields
-   * on other meshes measured to it, its section entries and its collision
-   * rules. The kept mesh counts against the history's memory budget, and is
-   * freed once the history drops the step (see {@link Scene.isRestorable}).
+   * same handle, its data, placement, display (normals, colouring), the
+   * fields on it and its collision rules (a rule once both its meshes are
+   * back). Nothing is copied, whatever the mesh's size. What belongs to other
+   * meshes is cut as by any removal and does not come back: fields on other
+   * meshes measured to it, and its section entries. The kept mesh counts
+   * against the history's memory budget, and is freed once the history drops
+   * the step (see {@link Scene.isRestorable}).
    */
   removeMesh(mesh: MeshHandle, options: RemoveMeshOptions = {}): void {
     const { index, generation } = this.#id(mesh);
@@ -3632,9 +3726,12 @@ export class Scene implements SceneLike {
   /**
    * Joins `source` into `target`: copies the source's geometry into the
    * target (keeping its world shape), bridges `options.loopA` to the copied
-   * `options.loopB`, and removes the source. The copy and the bridge undo as
-   * one step; the removal is permanent. A drag of the source ends first,
-   * recording its moves as one step, so they survive a failed join.
+   * `options.loopB`, and removes the source. All of it is one undo step:
+   * {@link Scene.undo} restores the target and brings the source back with
+   * the same handle, as for {@link Scene.removeMesh} with `undoable` (what
+   * comes back with it, and the memory it takes, are described there). A drag
+   * of the source ends first, recording its moves as one step, so they
+   * survive a failed join.
    *
    * @deprecated Use `scene.repair.join()` instead.
    * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` for one
@@ -3655,9 +3752,8 @@ export class Scene implements SceneLike {
     const r = call(() =>
       this.#scene().join(ta.index, ta.generation, sb.index, sb.generation, Uint32Array.from(loops), maxEdges),
     );
-    const key = `${sb.index}:${sb.generation}`;
-    this.#meshes.delete(key);
-    this.#removed.set(key, source);
+    // Its handle stays known, for the way back.
+    this.#prune = true;
     return { verticesAdded: r[0], trianglesAdded: r[1], bridgeTrianglesAdded: r[2] };
   }
 
@@ -3738,7 +3834,9 @@ export class Scene implements SceneLike {
 
   /**
    * Evaluates an N-ary CSG tree over `meshes` (or handle-leaf nodes) and inserts
-   * the resulting mesh into the scene at identity placement (one undo step).
+   * the resulting mesh into the scene at identity placement (one undo step). Its
+   * {@link Scene.origin} is the centre of the bounds of the meshes used, so that it
+   * is as precise far from the world origin as near it.
    */
   booleanBatch(meshes: readonly MeshHandle[], tree: CsgNode, options?: BooleanOptions): MeshHandle;
   booleanBatch(tree: CsgNode, options?: BooleanOptions): MeshHandle;
@@ -3808,6 +3906,93 @@ export class Scene implements SceneLike {
     const normals = hullNormals(options);
     const r = call(() => this.#scene().convex_hull_points(buf, normals));
     return { mesh: this.#meshHandle(r[0], r[1]), ...decodeHullCounts(r) };
+  }
+
+  /**
+   * Fits a height map's frame to `meshes` (one mesh or several): an
+   * orthographic image of square pixels looking along `options.direction`,
+   * centred on the meshes, with their height range. `heightMap` samples it.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty list, meshes
+   *   without a triangle or without an extent across the direction, an option
+   *   out of range, or an image over {@link MAX_HEIGHT_MAP_PIXELS};
+   *   `UNKNOWN_MESH` for a removed mesh.
+   */
+  heightMapFrame(meshes: MeshHandle | readonly MeshHandle[], options?: HeightMapOptions): HeightMapFrame {
+    const ids = this.#flatIds(heightMapMeshList(meshes));
+    const values = Float64Array.from(encodeHeightMapOptions(options));
+    return decodeHeightMapFrame(call(() => this.#scene().height_map_frame(ids, values)));
+  }
+
+  /**
+   * An orthographic depth image of `meshes` (one mesh or several, in their
+   * placements): the height of each pixel above the frame's zero plane, NaN
+   * where no surface is seen. A pixel's ray runs through its centre and takes
+   * the first surface within the frame's range (either side of a triangle);
+   * a ray exactly through an edge or vertex takes the nearest of the triangles
+   * meeting there, so a watertight mesh has no cracks.
+   *
+   * `frame` is a frame (from {@link Scene.heightMapFrame}, say), or the options
+   * to fit one with. `rows` samples a band of the image's rows, `[first, end)`:
+   * the bands of an image hold exactly what sampling it whole would, so a large
+   * image can be taken in steps.
+   *
+   * `addHeightfield` with the heights, the frame's pixel size and
+   * `heightMapPlacement(frame)` makes a relief that lies on the surface seen.
+   *
+   * @example
+   * ```ts
+   * const { frame, heights } = scene.heightMap(mesh, { direction: [0, 0, -1], resolution: 1024 });
+   * ```
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty list, an invalid
+   *   frame, rows outside it, or as for {@link Scene.heightMapFrame};
+   *   `UNKNOWN_MESH` for a removed mesh, `STALE_BVH` for a stale manual mesh.
+   */
+  heightMap(
+    meshes: MeshHandle | readonly MeshHandle[],
+    frame?: HeightMapFrame | HeightMapOptions,
+    rows?: readonly [number, number],
+  ): HeightMap {
+    const ids = this.#flatIds(heightMapMeshList(meshes));
+    let raw: Float64Array;
+    if (isHeightMapFrame(frame)) {
+      raw = Float64Array.from(encodeHeightMapFrame(frame));
+    } else {
+      const options = Float64Array.from(encodeHeightMapOptions(frame));
+      raw = call(() => this.#scene().height_map_frame(ids, options));
+    }
+    const fitted = decodeHeightMapFrame(raw);
+    const [first, end] = checkHeightMapRows(rows, fitted.height);
+    const heights = call(() => this.#scene().height_map(ids, raw, first, end));
+    return { frame: fitted, rows: [first, end], heights };
+  }
+
+  /**
+   * Adds the relief of a grid of heights as a new mesh and returns it with its
+   * counts: a closed, outward-wound solid from a flat base up to the heights,
+   * with a vertex per sample at exactly its height (see `generateHeightfield`
+   * for its frame). The buffers never leave the engine, so large reliefs cost
+   * no copy on this side.
+   *
+   * The new mesh is added as one undo step: {@link Scene.undo} removes it and
+   * {@link Scene.redo} brings it back with the same handle.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for fewer than 2 samples on a
+   *   side, a wrong number of heights, a height that is infinite or not above
+   *   `-base`, or an invalid placement; `OUT_OF_MEMORY` when the relief does
+   *   not fit.
+   */
+  addHeightfield(field: Heightfield, options?: AddHeightfieldOptions): HeightfieldResult {
+    const f = checkHeightfield(field);
+    const p = checkHeightfieldPlacement(options);
+    const values = encodeHeightfield(f);
+    const rotation = Float64Array.from(p.rotation);
+    const translation = Float64Array.from(p.translation);
+    const scale = p.scale === undefined ? undefined : Float64Array.from(p.scale);
+    const r = call(() =>
+      this.#scene().add_heightfield(f.heights, f.width, f.height, values, rotation, translation, scale, p.normals),
+    );
+    return { mesh: this.#meshHandle(r[0], r[1]), vertices: r[2], triangles: r[3] };
   }
 
   /**
@@ -3902,9 +4087,8 @@ export class Scene implements SceneLike {
    * it is built in world space at the identity placement. Lengths are world
    * units either way.
    *
-   * The new mesh is added empty and the wrap lands in it as one undo step:
-   * {@link Scene.undo} empties the new mesh (it stays in the scene) and
-   * {@link Scene.redo} fills it again.
+   * The new mesh is added as one undo step: {@link Scene.undo} removes it and
+   * {@link Scene.redo} brings it back with the same handle.
    *
    * At a million triangles this takes from about half a second to many
    * seconds, by detail and threads: use `WorkerScene.wrap` to keep the page
@@ -3924,8 +4108,32 @@ export class Scene implements SceneLike {
   }
 
   /**
-   * Conformatively imprints a world-space polyline onto `mesh` and optionally
-   * deletes the enclosed interior (or exterior) when `closed: true` (one undo step).
+   * Conformatively imprints a world-space polyline onto `mesh`, and with
+   * `closed: true` deletes the inside of the loop (or its outside, with
+   * `deleteInside: false`), as one undo step.
+   *
+   * Only the component the curve lies on is imprinted and cut; every other one
+   * stays as it is. A component is a set of triangles joined through shared
+   * edges. On a mesh with UVs an edge also joins across a seam (two edges at
+   * exactly the same positions), so the UV islands of one surface are one
+   * component, and the curve and the cut cross from one to the next. Split
+   * vertices on a mesh without UVs are a real border between components: weld
+   * them first.
+   *
+   * All points must lie on one component: a curve with points on several
+   * throws. Where components touch or coincide, a point lies on each of them.
+   * When all points lie on several, the curve is on the one the first point
+   * projects to, or else on the one with the smallest triangle id there.
+   *
+   * The inside of a loop is the side away from the component's open edges. On
+   * a component with none (a closed one), or when every side reaches one, it
+   * is the side with the smallest world area. A loop that separates nothing,
+   * such as one around a torus's tube, deletes nothing: it is imprinted, and
+   * {@link TrimReport.removedArea} is `0`.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for too few or non-finite
+   *   points, or points on several components (nothing changes);
+   *   `UNKNOWN_MESH` for a removed mesh.
    */
   trimByCurve(mesh: MeshHandle, options: TrimCurveOptions): TrimReport;
   trimByCurve(
@@ -3955,8 +4163,11 @@ export class Scene implements SceneLike {
       kept: this.#meshHandle(r[0], r[1]),
       trianglesAdded: r[2],
       trianglesRemoved: r[3],
-      verticesAdded: r[4],
-      seamEdges: r[5],
+      imprintTriangles: r[4],
+      cutTriangles: r[5],
+      removedArea: r[6],
+      verticesAdded: r[7],
+      seamEdges: r[8],
     };
   }
 
@@ -5132,7 +5343,10 @@ export class Scene implements SceneLike {
     };
   }
 
-  /** Computes per-vertex surface geodesic distances from `sources` in world units. */
+  /**
+   * Computes per-vertex surface geodesic distances from `sources` in world
+   * units; `inspect.geodesicDistances` says what `"heatMethod"` keeps.
+   */
   geodesicDistances(
     mesh: MeshHandle,
     sources: number | readonly number[],
@@ -5141,6 +5355,7 @@ export class Scene implements SceneLike {
     const { index, generation } = this.#id(mesh);
     const src = normalizeSourceVertices(sources);
     const norm = normalizeGeodesicOptions(options);
+    throwIfAborted(options.signal);
     return call(() =>
       this.#scene().geodesic_distances(
         index,
@@ -5151,6 +5366,11 @@ export class Scene implements SceneLike {
         optional(norm.timeStepScale, "timeStepScale"),
       ),
     );
+  }
+
+  /** Frees what `"heatMethod"` queries keep for the next one of the same mesh. */
+  releaseGeodesics(): void {
+    call(() => this.#peek().release_geodesics());
   }
 
   /** Traces the intrinsic shortest surface path from `sources` to `targetVertex` in world coordinates. */
@@ -5164,6 +5384,7 @@ export class Scene implements SceneLike {
     const src = normalizeSourceVertices(sources);
     const target = normalizeSurfacePathTarget(targetVertex);
     const { distances, geodesic } = checkSurfacePathOptions(options);
+    throwIfAborted(options.signal);
     const dists =
       distances ??
       call(() =>
@@ -5566,6 +5787,33 @@ export class Scene implements SceneLike {
     });
   }
 
+  // ---- Stepped geodesic queries (internal: see geodesicSteps) ----
+
+  static {
+    geodesicStepsOf = (scene) => ({
+      begin: (mesh, sources, options = {}) => {
+        const { index, generation } = scene.#id(mesh);
+        const src = normalizeSourceVertices(sources);
+        const norm = normalizeGeodesicOptions(options);
+        return call(() =>
+          scene
+            .#peek()
+            .begin_geodesic_distances(
+              index,
+              generation,
+              src,
+              GEODESIC_METHOD_CODES[norm.method],
+              optional(norm.maxDistance, "maxDistance"),
+              optional(norm.timeStepScale, "timeStepScale"),
+            ),
+        );
+      },
+      step: (token, work) => call(() => scene.#peek().step_geodesic_distances(token, work)),
+      finish: (token) => call(() => scene.#peek().finish_geodesic_distances(token)),
+      drop: (token) => call(() => scene.#peek().drop_geodesic_distances(token)),
+    });
+  }
+
   // ---- Stepped field updates (internal: see fieldSteps) ----
 
   static {
@@ -5914,7 +6162,11 @@ export class Scene implements SceneLike {
     );
   }
 
-  /** Extracts `selectedTris` into a new standalone mesh preserving exact world coordinates. */
+  /**
+   * Extracts `selectedTris` into a new standalone mesh preserving exact world
+   * coordinates, as one undo step: {@link Scene.undo} removes the new mesh and
+   * {@link Scene.redo} brings it back with the same handle.
+   */
   extractSelectedFaces(mesh: MeshHandle, selectedTris: Indices, options: { normals?: boolean } = {}): MeshHandle {
     const { index, generation } = this.#id(mesh);
     const normals = checkBooleanArg(options.normals, this.#hasNormals(index, generation), "normals");
@@ -5924,7 +6176,12 @@ export class Scene implements SceneLike {
     return this.#meshHandle(id[0], id[1]);
   }
 
-  /** Splits `selectedTris` off into a new detached mesh and removes them from `mesh` in one undo step. */
+  /**
+   * Splits `selectedTris` off into a new detached mesh and removes them from
+   * `mesh`, as one undo step: {@link Scene.undo} makes `mesh` whole again and
+   * removes the new mesh, which {@link Scene.redo} brings back with the same
+   * handle.
+   */
   splitSelectedFaces(mesh: MeshHandle, selectedTris: Indices, options: { normals?: boolean } = {}): SplitFacesReport {
     const { index, generation } = this.#id(mesh);
     const normals = checkBooleanArg(options.normals, this.#hasNormals(index, generation), "normals");
@@ -6192,7 +6449,11 @@ export class Scene implements SceneLike {
     );
   }
 
-  /** Reconstructs a triangle mesh from a packed point cloud and adds it to the scene. */
+  /**
+   * Reconstructs a triangle mesh from a packed point cloud and adds it to the
+   * scene, as one undo step: {@link Scene.undo} removes it and
+   * {@link Scene.redo} brings it back with the same handle.
+   */
   reconstructPointCloud(
     cloud: PackedPointCloud | Float32Array,
     options: SurfaceReconstructOptions = {},
@@ -6229,7 +6490,91 @@ export class Scene implements SceneLike {
     );
   }
 
-  /** Punches a tapered/chamfered drain hole in `mesh` (with optional plug generation) in one undo step. */
+  /**
+   * Plans the voxel grid of {@link Scene.latticeFill} for the same mesh and
+   * options without running it: its dimensions, voxel size, voxel count,
+   * estimated triangles and memory, the share of space the walls fill, and
+   * whether the grid is within `maxVoxels`. Costs a few passes over the mesh
+   * (tens of milliseconds at a million triangles), so it can follow a
+   * settings form.
+   *
+   * @throws {FastMeshError} as {@link Scene.latticeFill}, except that the mesh
+   *   is not checked for being closed, and that a grid over the limit comes
+   *   back with `fits: false`.
+   */
+  latticePlan(mesh: MeshHandle, options: LatticeOptions): LatticePlan {
+    const { index, generation } = this.#id(mesh);
+    const values = encodeLatticeOptions(checkLatticeOptions(options, DEFAULT_LATTICE_MAX_VOXELS));
+    return decodeLatticePlan(call(() => this.#scene().lattice_plan(index, generation, values)));
+  }
+
+  /**
+   * Fills the inside of the closed, outward-wound `mesh`, or the cavity of a
+   * hollowed one, with a lattice: walls of uniform thickness that follow a
+   * gyroid, Schwarz P or diamond surface. One undo step.
+   *
+   * - Without a shell, filling the inside turns the mesh into an open
+   *   lattice, cut off at its surface.
+   * - With `shellThickness`, the mesh's surface is kept as it is, and the
+   *   space between the walls is carved out from that depth on, so shell and
+   *   walls are one solid.
+   * - In a cavity, the walls grow out of the shell that is there, whose outer
+   *   surface is kept as it is.
+   *
+   * The result is closed, manifold and free of self-intersections, as far as
+   * the surface that is kept is. It is built on a voxel grid that follows
+   * from the lengths, or from `voxelSize`: edges where walls meet the mesh's
+   * surface are cut by a fraction of a voxel. {@link Scene.latticePlan}
+   * reports the grid, the triangles and the memory beforehand, and
+   * {@link Scene.latticePreview} shows the walls on a small grid.
+   *
+   * Lengths and volumes are measured in the world. The cells are aligned with
+   * the mesh's own axes, around the middle of its bounds. Its UVs are
+   * dropped. A lattice has many triangles (about 2,000 per gyroid cell at ten
+   * voxels a cell, 12,000 at 25) and takes seconds at a few million: use
+   * `WorkerScene.latticeFill` to keep the page live.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for bad options, a mesh that is
+   *   not closed and consistently wound outward, `region: "cavity"` without
+   *   a cavity, a grid over `maxVoxels` (the message has its size and
+   *   memory) or too coarse for the walls, the shell, the cells or the wall
+   *   around a cavity, or a lattice that leaves nothing, or nothing open;
+   *   `UNKNOWN_MESH` for a removed mesh; `OUT_OF_MEMORY`. The mesh is
+   *   unchanged on error.
+   */
+  latticeFill(mesh: MeshHandle, options: LatticeOptions): LatticeReport {
+    const { index, generation } = this.#id(mesh);
+    const values = encodeLatticeOptions(checkLatticeOptions(options, DEFAULT_LATTICE_MAX_VOXELS));
+    return decodeLatticeReport(call(() => this.#scene().lattice_fill(index, generation, values)));
+  }
+
+  /**
+   * The walls {@link Scene.latticeFill} would put into `mesh`, on a small
+   * grid, without changing the mesh: buffers in its local frame, to draw at
+   * its `matrix4`. The grid has at most `maxVoxels` voxels (default
+   * {@link DEFAULT_LATTICE_PREVIEW_VOXELS}); walls it is too coarse for are
+   * drawn two voxels thick (`plan.wallThickness`), and a part with too many
+   * cells for it shows its middle only (`plan.cropped`). With a shell the
+   * walls start at its inner face.
+   *
+   * @throws {FastMeshError} as {@link Scene.latticeFill}, except that the grid
+   *   always fits and that a lattice without walls is an empty preview.
+   */
+  latticePreview(mesh: MeshHandle, options: LatticeOptions): LatticePreview {
+    const { index, generation } = this.#id(mesh);
+    const checked = checkLatticeOptions(options, DEFAULT_LATTICE_PREVIEW_VOXELS);
+    const values = encodeLatticeOptions(checked);
+    return decodeLatticePreview(
+      call(() => this.#scene().lattice_preview(index, generation, values, checked.maxVoxels)),
+    );
+  }
+
+  /**
+   * Punches a tapered/chamfered drain hole in `mesh` (with optional plug
+   * generation) in one undo step: {@link Scene.undo} fills the hole again and
+   * removes the plug, which {@link Scene.redo} brings back with the same
+   * handle.
+   */
   punchDrainHole(mesh: MeshHandle, options: DrainHoleOptions): DrainHoleReport {
     const { index, generation } = this.#id(mesh);
     const n = normalizeDrainHoleArgs(options);
@@ -6255,7 +6600,12 @@ export class Scene implements SceneLike {
     return decodeDrainHoleReport(raw, (i, g) => this.#meshHandle(i, g));
   }
 
-  /** Places `stamp` onto `target` at a hit point/normal, optionally unioning/engraving/conformance-wrapping. */
+  /**
+   * Places `stamp` onto `target` at a hit point/normal, optionally unioning/engraving/conformance-wrapping,
+   * in one undo step. Kept separate, the placed stamp is a new mesh with the hit point as its
+   * {@link Scene.origin}, which {@link Scene.undo} removes and {@link Scene.redo} brings back with
+   * the same handle.
+   */
   placeMesh(target: MeshHandle, stamp: MeshHandle, options: PlaceMeshOptions): PlaceMeshReport {
     const t = this.#id(target);
     const s = this.#id(stamp);

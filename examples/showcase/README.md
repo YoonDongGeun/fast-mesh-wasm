@@ -55,6 +55,42 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   vertices only. The font (`src/features/mesh-edit/fonts`, under its own licence, kept beside it) is
   about 62 KB, 22 KB gzipped, and loads as a chunk of its own when a text tool first opens. It has
   ASCII, Greek and some symbols; a character it lacks is drawn as `?` and named in the dialog.
+- **Polylines.** *Keep as Objects* (Section Contours), *Keep contours* (the section plane) and *Keep
+  as object* (Surface Path) keep curves as objects of the scene, in world millimetres: they stay when
+  the tool, the plane or the mesh goes. They are listed under the meshes with their length, colour,
+  visibility, focus and removal, drawn as lines that pointer rays pass through, and saved with the
+  project. The Polylines panel (on Mesh Edit and Inspect) works on the selected ones (shift-click
+  adds; the only one needs no selecting), each tool one undo step:
+  - *Simplify* drops the points a curve does without within a tolerance. *Smooth & Resample* replaces
+    it by evenly spaced points of a spline through its points, or through the curve with detail
+    shorter than *smooth under* smoothed away (a loop keeps its size).
+  - *Offset* adds the curves at a distance from a planar one: outward of a loop, to the left of an open
+    curve, negative the other way, with round or sharp corners. A narrow place may split it, a gap may
+    close into a hole, and a loop may vanish.
+  - *Make Tube* sweeps a circle along each curve into a closed mesh (it says where the curve bends
+    tighter than the radius and the tube overlaps itself). *Extrude* makes solids of closed planar
+    curves; those of one plane together, one inside another a hole, with the text tool's caps.
+  - *SVG* and *DXF* export the selected ones (with none, every visible one) through the contour
+    exporter, in their own plane or flattened onto a world one, in millimetres.
+
+  The math is in `src/features/polylines/ux`, all on the main thread and linear or nearly so: a tube
+  along 50,000 points and the offset of a loop of 8,000 each take a fraction of a second. The engine's
+  history knows meshes only, so each state of the list has an empty mesh in the scene as its marker
+  (`polyline-history.ts`): an edit swaps markers undoably, and undo and redo swap them back in order
+  with every other edit. Display settings (name, colour, visibility) are not undo steps.
+- **Height maps and reliefs.** The export panel's *Height map* section (Home) makes an orthographic
+  depth image of a mesh, or of every visible one, from a standard view or the current one: the
+  pixels along its longer side, and the meshes' own height range or a typed one. It is sampled in
+  bands of rows, with progress and *Cancel*, and downloads two files: a 16-bit grey PNG, whose code
+  is a height (`heightRange * code / 65535`; 0 is also where no surface is seen), and a JSON with
+  the pixel size, the height range and where the image's axes and first pixel are in the world.
+  *Image to Relief…* (Mesh Edit, the command search, or an image dropped anywhere on the page) does
+  the reverse: an image becomes a closed relief with a width, a height for white, a base thickness
+  and a number of samples, previewed live and added as one undo step. Picking or dropping the JSON
+  along with its image puts the relief on the surface the map saw, within one code's height. A
+  16-bit PNG is read at 16 bits (`src/io/png.ts`; a canvas reads 8), other images by the browser,
+  in a Worker of their own. The sampling and the relief's mesh run in the engine
+  (`Scene.heightMap`, `Scene.addHeightfield`), on the scene's Worker.
 - **Move.** Click a mesh to select it; the gizmo (three's `TransformControls`, through
   `attachTransformControls`) moves (<kbd>T</kbd>) or rotates (<kbd>R</kbd>) it, one undo step per drag.
   Undo and Redo, or <kbd>Ctrl</kbd>+<kbd>Z</kbd> and <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>.
@@ -73,6 +109,21 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   identity: the placement change and the vertex edit are one history step. The picks are engine
   raycasts on the selected mesh only; <kbd>Esc</kbd> cancels one. The math is in
   `src/features/transform/ux/placement-math.ts`.
+- **Build plate.** The Home tab's Build Plate panel (and shelf buttons) draws a grid rectangle on the
+  floor: a width along X, a depth along Y, the corner it starts from, and *Up*, as the placement
+  helpers have it (Z = 0, or Y = 0 with the depth along Z). They are in the display unit and persist
+  with the display settings; the plate takes no pointer rays. *Arrange* packs the footprints of the
+  selected meshes, or of every visible one, with at least *Spacing* between them, and rests each on
+  the plate with its lowest point, as one undo step. A footprint is the rectangle around the mesh's own
+  vertices as it is placed (`src/features/build-plate/ux/footprint.ts`, read in slices: about 10 ms per
+  million triangles), so a turned mesh takes what it projects to. The packing
+  (`src/features/build-plate/ux/pack.ts`) is deterministic, compact and centred on the plate; it turns
+  meshes by 90° only when not everything fits as it is, and then tries several orders and keeps the one
+  that places the most. Meshes too big for the plate, or left without room, are named and stay where
+  they are, as locked ones do; *Keep clear of other meshes* packs around the visible meshes that are
+  not arranged. *Multi-Clone* copies the selected mesh up to 1,000 times, in a grid on the floor or in a
+  line along an axis, with a gap between the copies, as one undo step; the mesh and its copies are then
+  selected, ready to arrange.
 - **View.** The box in the viewport's bottom-right corner (top right on a phone, folded to its toggle
   there at first) holds the view controls. The cube turns with the camera; a face snaps to its view
   (<kbd>1</kbd> front, <kbd>3</kbd> left, <kbd>7</kbd> top, with <kbd>Shift</kbd> the opposite face),
@@ -163,8 +214,10 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
 
   The display unit is per project with a global default: a project file stores its own (`units`),
   a file without one takes the default, and picking a unit by hand also sets the default. Opening a
-  project never changes the default. The file stores each mesh's positions in mm, and its
-  `importScale` as provenance only, so reopening cannot scale a mesh twice.
+  project never changes the default. The file stores each mesh's positions in mm, with the origin
+  they are relative to (a file from before origins were stored opens as it always did, its positions
+  taken as they are), and its `importScale` as provenance only, so reopening cannot scale a mesh
+  twice. Kept polylines are stored in mm too, and their SVG and DXF files are in mm.
 - **Settings.** Display prefs (theme, panel visibility and widths, wireframe, boundary softness,
   repair overlays, collision mode, the last-used heatmap sliders, the default display unit, the view
   box's projection, scale indicator and axis basis) persist in localStorage across
@@ -195,25 +248,31 @@ src/
   app/           App.tsx; ux/ (shortcuts, file drop, loading, display settings); state/ (app state,
                  tool state, readouts); testing/ (window.__showcase)
   shell/         ribbon, status bar, command search, help and tour
-  shared/        units, persisted settings, LengthInput
+  shared/        units, persisted settings, mesh centres, LengthInput
   viewport/      the canvas (ui/Viewport.tsx); ux/: selection clicks, the sculpt stroke and mask paint
                  drivers, camera and gizmo control, raycasts, the view registry, touch, clip planes
   engine/        the workbench op bridge and the lazy wasm loader
-  io/            loading (parser Worker), DICOM, export, project files, demo meshes
+  io/            loading (parser Worker), DICOM, export, project files, demo meshes, 16-bit PNGs and
+                 height images (their own Worker)
   features/
-    home/        mesh list, project save and open, export, the Create dialog (primitive shapes)
+    home/        mesh list, project save and open, export (height maps too), the Create dialog
+                 (primitive shapes)
     view/        navigation cube (presets, orbit and roll steps, display toggles), shading modes, wireframe
     select/      object and face selection, faces by criteria
+    build-plate/ the plate on the floor, arranging footprints on it, multi-clone
     transform/   numeric transform, scale, placement helpers; alignment: ICP, landmark pairs, coarse +
                  ICP, symmetry plane
     inspect/     ruler, angle, query, section plane, clip box, surface fields; deviation, overhang and
                  triangle quality maps; geodesic distance, surface paths, trim and split; object info, box and
                  normals overlays, quality report
     mesh-edit/   boolean (two or N-way), plane cut, offset and shell, extrude (faces, base), convex hull,
-                 resample, isotropic remesh, hollow, place mesh, text (its font in fonts/)
+                 resample, isotropic remesh, hollow, lattice infill, place mesh, text (its font in
+                 fonts/), image to relief
     mesh-repair/ analysis, healer overlays, repairs, auto repair, denoise, Delaunay flips, wrap
     sculpt/      brushes, mask, dyntopo, free-form deformation
     points/      point clouds, primitive fitting, contours, convex hull
+    polylines/   contours and paths kept as objects: list, lines, simplify, resample, offset, tube,
+                 extrude, SVG and DXF
     ct/          volume rendering, MPR slices
     collision/   contact heatmap, group mode, named groups
 ```

@@ -55,10 +55,15 @@ export function sameGeodesicRequest(a: GeodesicMapRequest | null, b: GeodesicMap
   );
 }
 
-/** Runs the request's SDK query (a local scene answers at once, a Worker one with a promise) and reads it out. */
+/**
+ * Runs the request's SDK query (a local scene answers at once, a Worker one
+ * with a promise) and reads it out. Aborting `signal` cancels the query on
+ * the Worker and rejects with the signal's reason.
+ */
 export async function runGeodesicMap(
   scene: Pick<SceneLike, "inspect" | "views">,
   request: GeodesicMapRequest,
+  signal?: AbortSignal,
 ): Promise<GeodesicMapReport> {
   const inspect = scene.inspect;
   if (inspect === undefined) {
@@ -67,7 +72,10 @@ export async function runGeodesicMap(
   if (request.sources.length === 0) {
     throw new Error("Pick at least one source vertex.");
   }
-  const values = await inspect.geodesicDistances(request.mesh, [...request.sources], { method: request.method });
+  const values = await inspect.geodesicDistances(request.mesh, [...request.sources], {
+    method: request.method,
+    ...(signal === undefined ? {} : { signal }),
+  });
   return { request, values, ...summarizeDistances(values, scene.views(request.mesh).indices()) };
 }
 

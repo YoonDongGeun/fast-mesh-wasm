@@ -22,6 +22,7 @@ export const WORKBENCH_TABS: readonly WorkbenchTabMeta[] = [
 
 export type InspectorSlot =
   | "home"
+  | "buildPlate"
   | "project"
   | "transform"
   | "select"
@@ -34,19 +35,20 @@ export type InspectorSlot =
   | "collision"
   | "volume"
   | "inspect"
+  | "polylines"
   | "export";
 
 /** Returns which right-inspector sections are shown for `tab`. */
 export function tabMatchesSlot(tab: WorkbenchTab, slot: InspectorSlot): boolean {
   switch (tab) {
     case "home":
-      return slot === "home" || slot === "project" || slot === "export";
+      return slot === "home" || slot === "buildPlate" || slot === "project" || slot === "export";
     case "select":
       return slot === "transform" || slot === "select";
     case "repair":
       return slot === "repair";
     case "edit":
-      return slot === "modeling";
+      return slot === "modeling" || slot === "polylines";
     case "sculpt":
       return slot === "sculpt" || slot === "deform";
     case "align":
@@ -54,7 +56,7 @@ export function tabMatchesSlot(tab: WorkbenchTab, slot: InspectorSlot): boolean 
     case "volume":
       return slot === "volume";
     case "inspect":
-      return slot === "inspect";
+      return slot === "inspect" || slot === "polylines";
   }
 }
 
