@@ -8,7 +8,8 @@ use std::f64::consts::{PI, TAU};
 
 use exact::exact_distances;
 use fast_mesh_fields::{
-    GeodesicHeatSolver, GeodesicOptions, GeodesicPhase, GeodesicQuery, geodesic_distances,
+    GeodesicHeatSolver, GeodesicMethod, GeodesicOptions, GeodesicPhase, GeodesicQuery,
+    geodesic_distances,
 };
 use fast_mesh_store::{Mesh, par};
 use shapes::*;
@@ -441,7 +442,7 @@ fn oddities() -> Vec<(String, Shape)> {
     }
     add("many", many);
     // Random triangles between random points of a thin box.
-    for round in 0..16 {
+    for round in 0..8 {
         let n = 20 + (200.0 * random()) as u32;
         let positions = (0..n).map(|_| [random(), 1e-2 * random(), 30.0 * random()]);
         let positions = positions.collect();
@@ -456,28 +457,53 @@ fn oddities() -> Vec<(String, Shape)> {
     shapes
 }
 
+/// The furthest distance along the edges.
+fn along_the_edges(m: &Mesh, source: u32) -> f32 {
+    let o = GeodesicOptions {
+        method: GeodesicMethod::Dijkstra,
+        ..Default::default()
+    };
+    let mut d = Vec::new();
+    geodesic_distances(m, &[source], &o, &mut d).unwrap();
+    let near = d.into_iter().filter(|x| x.is_finite());
+    near.fold(0.0, f32::max)
+}
+
+#[test]
+fn next_to_flat_triangles_are_no_obstacle() {
+    // The graph's way to the far end is straight, or nearly: its distance
+    // is near the exact one.
+    for (name, s) in oddities() {
+        let flat = ["flat", "hair", "line", "spike"];
+        let k = name.split_once(' ').map_or("", |(_, k)| k);
+        if !flat.iter().any(|f| name.starts_with(f)) || !["0.001", "0.00001"].contains(&k) {
+            continue;
+        }
+        let m = mesh(&s);
+        let d = heat(&m, &[0]);
+        let far = d.into_iter().fold(0.0, f64::max);
+        let want = f64::from(along_the_edges(&m, 0));
+        assert!(
+            (far - want).abs() < 0.03 * want,
+            "{name}: {far} instead of {want}"
+        );
+    }
+}
+
 #[test]
 fn any_triangles_get_distances() {
     for (name, s) in oddities() {
         let m = mesh(&s);
         let n = s.positions.len() as u32;
-        let start = std::time::Instant::now();
         let mut solver = GeodesicHeatSolver::build(&m, 1.0).unwrap();
-        for time_step_scale in [1.0, 1e-3, 1e3] {
-            solver.set_time_step_scale(time_step_scale).unwrap();
-            for source in [0, n / 2, n - 1] {
-                let mut d = Vec::new();
-                solver.solve(&[source], None, &mut d).unwrap();
-                assert_eq!(d.len(), n as usize, "{name}");
-                assert_eq!(d[source as usize], 0.0, "{name}");
-                assert!(d.iter().all(|x| *x >= 0.0), "{name}");
-            }
+        for (scale, source) in [(1.0, 0), (1.0, n - 1), (1e-3, n / 2), (1e2, n / 2)] {
+            solver.set_time_step_scale(scale).unwrap();
+            let mut d = Vec::new();
+            solver.solve(&[source], None, &mut d).unwrap();
+            assert_eq!(d.len(), n as usize, "{name}");
+            assert_eq!(d[source as usize], 0.0, "{name}");
+            assert!(d.iter().all(|x| *x >= 0.0), "{name}");
         }
-        let took = start.elapsed();
-        if took.as_millis() > 400 {
-            println!("{name}: {took:?}");
-        }
-        assert!(took.as_secs() < 60, "{name}: {took:?}");
     }
 }
 

@@ -45,6 +45,8 @@ const TOLERANCE: f64 = 1e-5;
 /// of rectangles, say), up to a share of their cotangents.
 const ROUNDING: f64 = 1.0 / (1u64 << 25) as f64;
 const ROUNDED: f64 = 0.01;
+/// A part of so few triangles may double them.
+const FEW: f64 = 64.0;
 /// Flips at most, per triangle. (A sphere drawn out twenty times takes two.)
 const FLIPS: usize = 64;
 /// A flip leaves each of its two triangles at least this share of their area.
@@ -487,9 +489,9 @@ enum Stage {
 
 impl Intrinsic {
     /// The triangulation of a mesh as it is, whose half cotangents are
-    /// `cots` and whose area is `area`. Each part may gain half its
-    /// triangles, and `extra` ones shared out between the parts by area, as
-    /// far as their triangles hang together.
+    /// `cots` and whose area is `area`. Each part may gain half its triangles
+    /// (all, if they are few), and `extra` ones shared out between the parts
+    /// by area, as far as their triangles hang together.
     pub(super) fn new(
         mut mesh: Numbered,
         corners: &Corners,
@@ -540,7 +542,8 @@ impl Intrinsic {
         for (part, left) in left.iter_mut().enumerate() {
             let count = f64::from(*left);
             let holds = (2.0 * f64::from(joined[part]) / (3.0 * count)).min(1.0);
-            *left = (count / 2.0 + extra * holds * areas[part] / area) as u32;
+            let share = extra * holds * areas[part] / area;
+            *left = ((count / 2.0).max(count.min(FEW)) + share) as u32;
             gain += *left as usize;
         }
         Ok(Intrinsic {

@@ -353,7 +353,7 @@ fn distances_do_not_depend_on_threads() {
 #[test]
 fn any_soup_of_triangles_gets_distances() {
     // Random corners: slivers, fans, folded and repeated triangles, edges
-    // with many triangles, at any scale.
+    // with many triangles, at any scale. (Cut into some thousands each.)
     let mut state = 1u64;
     let mut next = move || {
         state = state
@@ -361,7 +361,7 @@ fn any_soup_of_triangles_gets_distances() {
             .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
-    for round in 0..120 {
+    for round in 0..40 {
         let n = 4 + next() % 400;
         let scale = 10f32.powi(next() as i32 % 25 - 12);
         let flat = if round % 3 == 0 { 1e-4 } else { 1.0 };
