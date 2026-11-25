@@ -320,7 +320,7 @@ for (const [name, make] of [
       expect(log.splice(0)).toEqual(Array.from({ length: 48 }, (_, k) => `drop ${k + 2}`));
       // Two of them are held.
       expect(bytesOf(s)).toBeGreaterThan(2000);
-      expect(bytesOf(s)).toBeLessThan(2400);
+      expect(bytesOf(s)).toBeLessThan(3500);
       set(51, "other");
       set(52, "slider");
       set(53);
@@ -367,7 +367,7 @@ for (const [name, make] of [
       await settle(s);
       const overhead = bytesOf(s);
       expect(overhead).toBeGreaterThan(0);
-      expect(overhead).toBeLessThan(200);
+      expect(overhead).toBeLessThan(1000);
       s.recordEntry(app.push("a", { bytes: 10_000 }));
       await settle(s);
       expect(bytesOf(s)).toBe(10_000 + 2 * overhead);
@@ -613,6 +613,15 @@ describe("application entries: Scene only", () => {
     });
     s.undo();
     expect([log.splice(0), xOf(s, m)]).toEqual([["undo 1", "true"], 0]);
+    // What they undo themselves comes after the rest of their own step.
+    s.clearHistory();
+    s.recordEntry({ undo: () => log.push("before"), redo: () => {} });
+    s.beginStep();
+    s.recordEntry({ undo: () => log.push("first"), redo: () => {} });
+    s.recordEntry({ undo: () => void s.undo(), redo: () => {} });
+    s.endStep();
+    s.undo();
+    expect(log.splice(0)).toEqual(["first", "before"]);
     // Even free it.
     s.clearHistory();
     s.beginStep();
@@ -739,7 +748,7 @@ describe("application entries: WorkerScene only", () => {
         app.loose = true;
         meshes.set(s, add(s, 4));
         // Room for some of it only, in some rounds.
-        s.setHistoryBudget(round % 3 === 0 ? 1500 : 1e9);
+        s.setHistoryBudget(round % 3 === 0 ? 5000 : 1e9);
       }
       await settle(worker);
       let depth = 0;

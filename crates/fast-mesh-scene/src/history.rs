@@ -53,7 +53,7 @@ pub struct HistoryEntry {
     /// Should be unused by any entry not dropped yet.
     pub id: u64,
     /// The bytes the application keeps for it, counted against the history
-    /// budget (at most 1 TiB each, and a few for the entry itself).
+    /// budget (at most 1 TiB each) with what the entry itself takes here.
     pub bytes: u64,
     /// In an open step, an entry recorded right after one with the same key
     /// merges with it (`None`: never), as consecutive placement changes do.
@@ -74,9 +74,10 @@ pub enum EntryEvent {
     Dropped(u64),
 }
 
-/// What an entry of the application counts beside its own bytes, so that
-/// entries without any cannot pile up without limit.
-pub(crate) const ENTRY_BYTES: u64 = 64;
+/// What an entry of the application counts beside its own bytes: the change
+/// it is recorded as, so that entries without any of their own cannot pile up
+/// without limit.
+pub(crate) const ENTRY_BYTES: u64 = size_of::<Change>() as u64;
 /// The most of its own bytes an entry counts: no sum of them overflows.
 const MAX_ENTRY_BYTES: u64 = 1 << 40;
 
@@ -185,7 +186,7 @@ fn release_in(
     change: &Change,
     entries: &mut SlotMap<Entry>,
     side: PatchSide,
-    events: &mut Vec<EntryEvent>,
+    events: &mut VecDeque<EntryEvent>,
 ) {
     match change {
         Change::Edit(id, p) => {
@@ -205,7 +206,7 @@ fn release_in(
             }
         }
         Change::App(run) => {
-            events.push(EntryEvent::Dropped(run.first.id));
+            events.push_back(EntryEvent::Dropped(run.first.id));
             events.extend(run.last.map(|e| EntryEvent::Dropped(e.id)));
         }
     }
@@ -295,7 +296,7 @@ pub(crate) struct History {
     /// Steps dropped as they were made, undone or redone, not taken yet.
     permanent: VecDeque<PermanentStep>,
     /// What happened to entries of the application, not taken yet.
-    events: Vec<EntryEvent>,
+    events: VecDeque<EntryEvent>,
 }
 
 impl History {
@@ -308,18 +309,13 @@ impl History {
             budget,
             bytes: 0,
             permanent: VecDeque::new(),
-            events: Vec::new(),
+            events: VecDeque::new(),
         }
     }
 
-    /// Takes what happened to entries of the application, in order.
-    pub(crate) fn take_events(&mut self) -> Vec<EntryEvent> {
-        std::mem::take(&mut self.events)
-    }
-
-    /// Whether `take_events` would return any.
-    pub(crate) fn has_events(&self) -> bool {
-        !self.events.is_empty()
+    /// Takes the next thing that happened to an entry of the application.
+    pub(crate) fn next_event(&mut self) -> Option<EntryEvent> {
+        self.events.pop_front()
     }
 
     /// Most bytes the steps may hold.
@@ -404,7 +400,13 @@ impl History {
         #[cfg(test)]
         crate::scene::fault::before_reserve()?;
         let oom = |_| SceneError::Store(StoreError::OutOfMemory);
-        self.open.changes.try_reserve(1).map_err(oom)?;
+        let changes = &mut self.open.changes;
+        if changes.is_empty() {
+            // Most steps have one change, and a change is large.
+            changes.try_reserve_exact(1).map_err(oom)?;
+        } else {
+            changes.try_reserve(1).map_err(oom)?;
+        }
         self.undo.try_reserve(1).map_err(oom)
     }
 
@@ -479,7 +481,7 @@ impl History {
             if let Some(old) = old {
                 self.open.bytes -= old.bytes;
                 self.bytes -= old.bytes;
-                self.events.push(EntryEvent::Dropped(old.id));
+                self.events.push_back(EntryEvent::Dropped(old.id));
             }
             // Recording the run's first entry dropped the redo stack already.
             debug_assert!(self.redo.is_empty(), "redo steps beside an open step");
@@ -843,7 +845,7 @@ fn run_step(
     step: &Step,
     entries: &mut SlotMap<Entry>,
     forward: bool,
-    events: &mut Vec<EntryEvent>,
+    events: &mut VecDeque<EntryEvent>,
 ) -> Result<Vec<Done>> {
     let oom = |_| SceneError::Store(StoreError::OutOfMemory);
     let mut done: Vec<Done> = Vec::new();
@@ -887,7 +889,7 @@ fn run_step(
     }
     for i in 0..step.changes.len() {
         if let Change::App(run) = &step.changes[order(i)] {
-            events.push(run.event(forward));
+            events.push_back(run.event(forward));
         }
     }
     Ok(done)
@@ -904,7 +906,7 @@ fn release_partial(
     entries: &mut SlotMap<Entry>,
     forward: bool,
     (i, j): (usize, usize),
-    events: &mut Vec<EntryEvent>,
+    events: &mut VecDeque<EntryEvent>,
 ) {
     let order = |k: usize| {
         if forward {
@@ -943,7 +945,7 @@ fn release_recovered(
     step: &Step,
     entries: &mut SlotMap<Entry>,
     forward: bool,
-    events: &mut Vec<EntryEvent>,
+    events: &mut VecDeque<EntryEvent>,
 ) {
     let far = if forward {
         PatchSide::Redoable

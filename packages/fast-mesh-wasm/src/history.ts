@@ -24,8 +24,9 @@ export interface PermanentStep {
    */
   lost: "undo" | "redo";
   /**
-   * The meshes the step edited, moved, added or removed, each once. Those in
-   * `gone` are out of the scene, and calls on them give `UNKNOWN_MESH`.
+   * The meshes the step edited, moved, added or removed, each once (none for
+   * a step of application entries alone). Those in `gone` are out of the
+   * scene, and calls on them give `UNKNOWN_MESH`.
    */
   meshes: readonly MeshHandle[];
   /** Of those, the meshes that left the scene with the step, for good. */
@@ -64,8 +65,8 @@ export interface HistoryEntry {
   drop?(): void;
   /**
    * About the bytes the entry keeps alive, counted against
-   * {@link SceneOptions.historyBudget} until it is dropped, with a few for
-   * the entry itself. 0 by default.
+   * {@link SceneOptions.historyBudget} until it is dropped, with a few
+   * hundred for the entry itself. 0 by default.
    */
   readonly bytes?: number;
   /**
@@ -92,7 +93,7 @@ export function checkHistoryEntry(entry: HistoryEntry): { bytes: number; coalesc
   return { bytes, coalesce };
 }
 
-/** What happened to an entry: `what` as `WasmScene.take_entry_events` codes it. */
+/** What happened to an entry: `what` as `WasmScene.next_entry_event` codes it. */
 export const ENTRY_EVENTS = ["undo", "redo", "drop"] as const;
 /** See {@link ENTRY_EVENTS}. */
 export type EntryEvent = (typeof ENTRY_EVENTS)[number];

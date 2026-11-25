@@ -38,10 +38,9 @@ impl WasmScene {
         Ok(self.scene.removal_bytes(self.id(index, generation)?)? as f64)
     }
 
-    /// Whether `take_permanent` or `take_entry_events` has something to
-    /// return.
-    pub fn has_history_events(&self) -> bool {
-        self.scene.has_permanent() || self.scene.has_entry_events()
+    /// Whether `take_permanent` has something to return.
+    pub fn has_permanent(&self) -> bool {
+        self.scene.has_permanent()
     }
 
     /// Records the application's entry `id` in the history, counting `bytes`
@@ -56,18 +55,19 @@ impl WasmScene {
         })?)
     }
 
-    /// Takes what happened to the application's entries since the last call,
-    /// in order, as `[what, id]` each: `what` is 0 for undone, 1 for redone
-    /// and 2 for dropped (see `Scene::take_entry_events`).
-    pub fn take_entry_events(&mut self) -> Vec<u32> {
-        // Ids come from `record_entry`, so they fit.
-        let pair = |e| match e {
-            EntryEvent::Undone(id) => [0, id as u32],
-            EntryEvent::Redone(id) => [1, id as u32],
-            EntryEvent::Dropped(id) => [2, id as u32],
+    /// Takes the next thing that happened to an entry of the application (see
+    /// `Scene::take_entry_events`), as `4 * id + what`: `what` is 0 for
+    /// undone, 1 for redone and 2 for dropped. -1 when there is none left.
+    /// Allocates nothing, so every view stays valid.
+    pub fn next_entry_event(&mut self) -> f64 {
+        let (id, what) = match self.scene.next_entry_event() {
+            None => return -1.0,
+            Some(EntryEvent::Undone(id)) => (id, 0.0),
+            Some(EntryEvent::Redone(id)) => (id, 1.0),
+            Some(EntryEvent::Dropped(id)) => (id, 2.0),
         };
-        let events = self.scene.take_entry_events();
-        events.into_iter().flat_map(pair).collect()
+        // Ids come from `record_entry`: they are `u32`s, so this is exact.
+        4.0 * id as f64 + what
     }
 
     /// Takes the steps the history could not keep since the last call (see
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn permanent_steps_are_encoded() {
         let mut s = WasmScene::new();
-        assert!(!s.has_history_events() && s.take_permanent().is_empty());
+        assert!(!s.has_permanent() && s.take_permanent().is_empty());
         s.set_history_budget(16.0).unwrap();
         let (a, ag) = add(&mut s);
         let (b, bg) = add(&mut s);
@@ -157,7 +157,7 @@ mod tests {
         .unwrap();
         s.remove_mesh_undoable(b, bg).unwrap();
         s.end_step().unwrap();
-        assert!(s.has_history_events());
+        assert!(s.has_permanent());
         let got = s.take_permanent();
         assert!(got[1] > 16.0);
         let id = |i: u32, g: u32| [f64::from(i), f64::from(g)];
@@ -181,7 +181,14 @@ mod tests {
             got[2..],
             [1.0, n[0].into(), n[1].into(), 1.0, n[0].into(), n[1].into()]
         );
-        assert!(!s.has_history_events());
+        assert!(!s.has_permanent());
+    }
+
+    /// Every event left, as `[what, id]` each.
+    fn events(s: &mut WasmScene) -> Vec<u32> {
+        std::iter::from_fn(|| Some(s.next_entry_event()).filter(|&e| e >= 0.0))
+            .flat_map(|e| [(e % 4.0) as u32, (e / 4.0) as u32])
+            .collect()
     }
 
     #[test]
@@ -189,8 +196,8 @@ mod tests {
         let mut s = WasmScene::new();
         s.record_entry(1, 100.0, 0).unwrap();
         let one = s.history_bytes();
-        assert!(one > 100.0 && one < 300.0);
-        assert!(s.can_undo() && !s.has_history_events());
+        assert!(one > 100.0 && one < 2000.0);
+        assert!(s.can_undo() && s.next_entry_event() == -1.0);
         s.begin_step();
         for id in 2..6 {
             s.record_entry(id, 0.0, 9).unwrap();
@@ -198,19 +205,16 @@ mod tests {
         s.record_entry(6, f64::NAN, 0).unwrap();
         s.record_entry(7, -1.0, 0).unwrap();
         s.end_step().unwrap();
-        assert!(s.has_history_events());
-        assert_eq!(s.take_entry_events(), [2, 3, 2, 4]);
-        assert!(!s.has_history_events() && s.take_entry_events().is_empty());
+        assert_eq!(events(&mut s), [2, 3, 2, 4]);
+        assert!(events(&mut s).is_empty());
         s.undo().unwrap();
-        assert_eq!(s.take_entry_events(), [0, 7, 0, 6, 0, 2]);
+        assert_eq!(events(&mut s), [0, 7, 0, 6, 0, 2]);
         s.redo().unwrap();
-        assert_eq!(s.take_entry_events(), [1, 5, 1, 6, 1, 7]);
+        assert_eq!(events(&mut s), [1, 5, 1, 6, 1, 7]);
         s.record_entry(u32::MAX, f64::INFINITY, u32::MAX).unwrap();
         assert!(!s.can_undo());
-        assert_eq!(
-            s.take_entry_events(),
-            [2, 1, 2, 2, 2, 5, 2, 6, 2, 7, 2, u32::MAX]
-        );
+        let dropped = [2, 1, 2, 2, 2, 5, 2, 6, 2, 7, 2, u32::MAX];
+        assert_eq!(events(&mut s), dropped);
         assert_eq!(s.take_permanent()[2..], [0.0, 0.0]);
     }
 }

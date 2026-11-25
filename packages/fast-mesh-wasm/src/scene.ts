@@ -137,6 +137,7 @@ import {
   EntryBook,
   type HistoryEntry,
   type PermanentListener,
+  type PermanentStep,
   tellPermanent,
 } from "./history.js";
 import { checkInteractionPoints, copyRule, encodeRule } from "./rule.js";
@@ -3624,20 +3625,26 @@ export class Scene implements SceneLike {
   /** Tells the application's entries and the listeners what the history did since the last call. */
   #settleHistory(): void {
     const s = this.#raw;
-    if (s === undefined || !call(() => s.has_history_events())) {
+    if (s === undefined) {
       return;
     }
-    this.#guard?.bump();
-    // Both before any call: a callback may use the scene.
-    const events = call(() => s.take_entry_events());
-    const msg = call(() => s.take_permanent());
-    const handle = (index: number, generation: number) => {
-      const key = `${index}:${generation}`;
-      return this.#meshes.get(key) ?? this.#removed.get(key);
-    };
-    const permanent = decodePermanent(msg, handle);
-    for (let k = 0; k < events.length; k += 2) {
-      this.#entries.tell(events[k + 1], ENTRY_EVENTS[events[k]]);
+    // Before any callback, which may use the scene.
+    let permanent: PermanentStep[] = [];
+    if (call(() => s.has_permanent())) {
+      this.#guard?.bump();
+      const msg = call(() => s.take_permanent());
+      permanent = decodePermanent(msg, (index, generation) => {
+        const key = `${index}:${generation}`;
+        return this.#meshes.get(key) ?? this.#removed.get(key);
+      });
+    }
+    // One at a time: what a callback undoes itself comes after the rest.
+    while (this.#raw === s) {
+      const event = call(() => s.next_entry_event());
+      if (event < 0) {
+        break;
+      }
+      this.#entries.tell(Math.floor(event / 4), ENTRY_EVENTS[event % 4]);
     }
     tellPermanent(this.#permanentListeners, permanent);
   }

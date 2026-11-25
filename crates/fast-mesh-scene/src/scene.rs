@@ -884,7 +884,7 @@ pub struct Scene {
 
 // Every public `&mut self` method of `Scene`, in this file and the others,
 // starts by dropping an open field step unit with `drop_field_unit` (the
-// step calls, `take_permanent` and `take_entry_events` aside), and is listed in the test
+// step calls, `take_permanent` and the entry events aside), and is listed in the test
 // `fields::tests::mutating_calls_abandon_open_unit`. New ones must do both.
 impl Scene {
     /// An empty scene.
@@ -1276,12 +1276,13 @@ impl Scene {
     /// [`SceneError::Corrupted`].
     // Like `take_permanent`, it leaves an open field step unit alone.
     pub fn take_entry_events(&mut self) -> Vec<EntryEvent> {
-        self.history.take_events()
+        std::iter::from_fn(|| self.history.next_event()).collect()
     }
 
-    /// Whether [`Scene::take_entry_events`] would return any.
-    pub fn has_entry_events(&self) -> bool {
-        self.history.has_events()
+    /// The next of [`Scene::take_entry_events`], taken alone (and without
+    /// allocating); `None` when there is none left.
+    pub fn next_entry_event(&mut self) -> Option<EntryEvent> {
+        self.history.next_event()
     }
 
     /// The most bytes the history may hold (see

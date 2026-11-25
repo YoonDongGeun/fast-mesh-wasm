@@ -418,7 +418,7 @@ fn one_mesh(budget: usize) -> (Scene, MeshId) {
 #[test]
 fn entries_interleave_with_mesh_changes() {
     let (mut scene, id) = one_mesh(usize::MAX);
-    assert!(!scene.has_entry_events() && scene.take_entry_events().is_empty());
+    assert!(scene.take_entry_events().is_empty());
     entry(&mut scene, 1);
     lift(&mut scene, id, 1, 1.0);
     entry(&mut scene, 2);
@@ -448,7 +448,7 @@ fn entries_interleave_with_mesh_changes() {
         assert_eq!(undo(&mut scene), [Undone(1)]);
         assert!(!scene.can_undo());
         assert_eq!(scene.undo(), Ok(false));
-        assert!(!scene.has_entry_events());
+        assert_eq!(scene.next_entry_event(), None);
 
         let mut seen = Vec::new();
         while scene.redo().unwrap() {
@@ -489,7 +489,10 @@ fn entries_join_the_open_step_and_cancel_with_it() {
     entry(&mut scene, 4);
     scene.cancel_step().unwrap();
     let events = [Undone(4), Undone(3), Dropped(3), Dropped(4)];
-    assert_eq!(scene.take_entry_events(), events);
+    for e in events {
+        assert_eq!(scene.next_entry_event(), Some(e));
+    }
+    assert_eq!(scene.next_entry_event(), None);
     assert_eq!(z(&scene, id), 1.0);
     assert!(!scene.can_redo());
 
@@ -509,7 +512,7 @@ fn entries_of_one_key_merge_in_an_open_step() {
     let (mut scene, id) = one_mesh(usize::MAX);
     scene.begin_step();
     merged(&mut scene, 1, 7);
-    assert!(!scene.has_entry_events());
+    assert_eq!(scene.next_entry_event(), None);
     merged(&mut scene, 2, 7);
     assert!(scene.take_entry_events().is_empty());
     // The one in between is not needed any more.
@@ -522,7 +525,7 @@ fn entries_of_one_key_merge_in_an_open_step() {
     lift(&mut scene, id, 1, 1.0);
     merged(&mut scene, 8, 7);
     scene.end_step().unwrap();
-    assert!(!scene.has_entry_events());
+    assert_eq!(scene.next_entry_event(), None);
     // Seven entries are held (1 and 3 as one change), and an edit.
     assert_eq!(scene.history_bytes(), 7 * ENTRY_BYTES + edit_bytes());
     for _ in 0..2 {
@@ -608,16 +611,18 @@ fn entries_count_against_the_budget_and_are_dropped_by_it() {
         bytes,
         merge: None,
     };
-    let (mut scene, id) = one_mesh(1000);
-    scene.record_entry(sized(1, 200)).unwrap();
-    assert_eq!(scene.history_bytes(), 200 + ENTRY_BYTES);
-    scene.record_entry(sized(2, 300)).unwrap();
+    const E: u64 = ENTRY_BYTES;
+    let budget = 10 * E + edit_bytes();
+    let (mut scene, id) = one_mesh(budget as usize);
+    scene.record_entry(sized(1, 2 * E)).unwrap();
+    assert_eq!(scene.history_bytes(), 3 * E);
+    scene.record_entry(sized(2, 3 * E)).unwrap();
     lift(&mut scene, id, 1, 1.0);
-    assert!(!scene.has_entry_events());
+    assert_eq!(scene.next_entry_event(), None);
     // The oldest goes to make room.
-    scene.record_entry(sized(3, 400)).unwrap();
+    scene.record_entry(sized(3, 4 * E)).unwrap();
     assert_eq!(scene.take_entry_events(), [Dropped(1)]);
-    assert!(scene.history_bytes() <= 1000);
+    assert_eq!(scene.history_bytes(), 9 * E + edit_bytes());
     // Undone, it counts the same: it is kept for the redo.
     let held = scene.history_bytes();
     scene.undo().unwrap();
@@ -635,28 +640,26 @@ fn entries_count_against_the_budget_and_are_dropped_by_it() {
     assert_eq!(scene.take_entry_events(), [Dropped(4)]);
 
     // Larger than the whole budget: dropped at once, and reported.
-    scene.record_entry(sized(5, 1000)).unwrap();
+    scene.record_entry(sized(5, budget)).unwrap();
     assert_eq!(scene.take_entry_events(), [Dropped(2), Dropped(5)]);
     assert!(!scene.can_undo());
     let [step] = scene.take_permanent().try_into().unwrap();
     assert_eq!((step.lost, step.meshes.len()), (HistorySide::Undo, 0));
-    assert_eq!(step.bytes, 1000 + ENTRY_BYTES);
+    assert_eq!(step.bytes, budget + E);
 
     // Undone in an open step: told, then dropped.
     scene.begin_step();
-    scene.record_entry(sized(6, 2000)).unwrap();
+    scene.record_entry(sized(6, 2 * budget)).unwrap();
     scene.undo().unwrap();
     assert_eq!(scene.take_entry_events(), [Undone(6), Dropped(6)]);
 
     // A smaller budget drops them too.
     for k in 7..10 {
-        scene.record_entry(sized(k, 100)).unwrap();
+        scene.record_entry(sized(k, E)).unwrap();
     }
     scene.undo().unwrap();
     scene.take_entry_events();
-    scene
-        .set_history_budget(2 * (100 + ENTRY_BYTES as usize))
-        .unwrap();
+    scene.set_history_budget(4 * E as usize).unwrap();
     assert_eq!(scene.take_entry_events(), [Dropped(7)]);
     scene.set_history_budget(0).unwrap();
     assert_eq!(scene.take_entry_events(), [Dropped(8), Dropped(9)]);
@@ -698,7 +701,7 @@ fn a_step_that_fails_has_no_events() {
     fault::fail_reserve_on(1);
     let entry_0 = HistoryEntry::default();
     assert!(scene.record_entry(entry_0).is_err());
-    assert!(!scene.can_undo() && !scene.has_entry_events());
+    assert!(!scene.can_undo() && scene.next_entry_event().is_none());
 
     scene.begin_step();
     lift(&mut scene, id, 1, 1.0);
@@ -708,17 +711,17 @@ fn a_step_that_fails_has_no_events() {
     // The first edit's revert fails, and everything recovers.
     fault::fail_patch_on(2);
     assert!(matches!(scene.cancel_step(), Err(SceneError::Store(_))));
-    assert!(!scene.has_entry_events());
+    assert_eq!(scene.next_entry_event(), None);
     scene.end_step().unwrap();
     fault::fail_patch_on(2);
     assert!(matches!(scene.undo(), Err(SceneError::Store(_))));
-    assert!(!scene.has_entry_events());
+    assert_eq!(scene.next_entry_event(), None);
     assert_eq!(z(&scene, id), 2.0);
     scene.undo().unwrap();
     assert_eq!(scene.take_entry_events(), [Undone(2), Undone(1)]);
     fault::fail_patch_on(2);
     assert!(matches!(scene.redo(), Err(SceneError::Store(_))));
-    assert!(!scene.has_entry_events());
+    assert_eq!(scene.next_entry_event(), None);
     scene.redo().unwrap();
     assert_eq!(scene.take_entry_events(), [Redone(1), Redone(2)]);
 
