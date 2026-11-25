@@ -32,3 +32,11 @@ criterion = { version = "0.8.2", default-features = false }
 [[bench]]
 name = "ops"
 harness = false
+
+[[bench]]
+name = "hull"
+harness = false
+
+[[bench]]
+name = "primitives"
+harness = false

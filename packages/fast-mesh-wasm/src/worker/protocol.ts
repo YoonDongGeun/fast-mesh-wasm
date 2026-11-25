@@ -4,6 +4,7 @@
 // the main side allocates synchronously; the engine maps them to its handles.
 import type { Bounds, Placement, PlacementInput, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
+import type { EncodedPrimitive, PrimitiveMesh } from "../primitives.js";
 import type {
   NormalizedBooleanOptions,
   NormalizedDyntopoOptions,
@@ -323,6 +324,10 @@ export type Request =
   | { kind: "commitCollisionInteraction"; rev: number; id: ClientId; qid: number }
   | { kind: "alignToFittedPrimitive"; rev: number; id: ClientId; primitive: FittedPrimitive; targetAxis: Vec3; targetOrigin: Vec3; qid: number }
   | { kind: "reconstructPointCloud"; rev: number; addedId: ClientId; cloud: Float32Array; options: SurfaceReconstructOptions; qid: number }
+  /** `Scene.convexHull`; replies with the hull's counts. */
+  | { kind: "convexHull"; rev: number; addedId: ClientId; meshes: ClientId[]; normals: boolean; qid: number }
+  /** `Scene.convexHullOfPoints` on flat world positions; replies with the hull's counts. */
+  | { kind: "convexHullPoints"; rev: number; addedId: ClientId; points: Float64Array; normals: boolean; qid: number }
   | { kind: "hollowMesh"; rev: number; id: ClientId; options: HollowOptions; qid: number }
   | { kind: "punchDrainHole"; rev: number; id: ClientId; plugId?: ClientId; options: DrainHoleOptions; qid: number }
   | { kind: "placeMesh"; rev: number; target: ClientId; stamp: ClientId; addedId?: ClientId; options: PlaceMeshOptions; qid: number }
@@ -344,6 +349,7 @@ export interface QueryMap {
     value: { distance: number; a: Vec3; b: Vec3; triangleA: number; triangleB: number } | null;
   };
   intersects: { args: { a: ClientId; b: ClientId }; value: boolean };
+  selfIntersectingTriangles: { args: { mesh: ClientId }; value: Uint32Array };
   findContacts: {
     args: { margin?: number; pairs?: [ClientId, ClientId][] };
     value: {
@@ -389,6 +395,8 @@ export interface QueryMap {
   fitPrimitive: { args: { mesh: ClientId; options: FitPrimitiveOptions }; value: FittedPrimitiveReport };
   sliceContours: { args: { mesh: ClientId; origin: Vec3; normal: Vec3 }; value: ContourSlice };
   sliceContourStack: { args: { mesh: ClientId; origin: Vec3; normal: Vec3; spacing: number; count: number }; value: ContourSlice[] };
+  /** A primitive shape, generated in the Worker (no scene state); its buffers are transferred. */
+  generatePrimitive: { args: EncodedPrimitive; value: PrimitiveMesh };
   /** Test-only (an engine run with `debug`): copies of a mesh's buffers. */
   debugDump: {
     args: { mesh: ClientId };
@@ -596,6 +604,8 @@ export function keyOf(req: Request): string | undefined {
     case "booleanBatch":
     case "extractSelectedFaces":
     case "reconstructPointCloud":
+    case "convexHull":
+    case "convexHullPoints":
       return `mesh:${req.addedId}`;
     case "placeMesh":
       return req.addedId !== undefined ? `mesh:${req.addedId}` : `edit:${req.target}`;

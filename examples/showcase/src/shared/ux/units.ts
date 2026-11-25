@@ -37,6 +37,11 @@ export function toDisplayArea(mm2: number, unit: LengthUnit): number {
   return unit === "mm" ? mm2 : mm2 / mmPer(unit) ** 2;
 }
 
+/** An area typed in square `unit`, in square millimetres. */
+export function fromDisplayArea(value: number, unit: LengthUnit): number {
+  return unit === "mm" ? value : value * mmPer(unit) ** 2;
+}
+
 /** A volume in cubic millimetres, in cubic `unit`: the factor cubed. */
 export function toDisplayVolume(mm3: number, unit: LengthUnit): number {
   return unit === "mm" ? mm3 : mm3 / mmPer(unit) ** 3;

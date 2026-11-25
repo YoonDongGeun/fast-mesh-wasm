@@ -22,8 +22,9 @@ import type { FocusRequest } from "../../app/App";
 import type { Loader } from "../../io/loader";
 import { inspect } from "../../app/state/readouts";
 import { type AppState, type Item, useApp } from "../../app/state/app-state";
-import { evaluateSurfaceColormap } from "../../engine/workbench-ops";
+import { evaluateOverlayColor } from "../../engine/workbench-ops";
 import { InspectLayers } from "../../features/inspect/ui/InspectLayers";
+import { CreatePreviewLayer } from "../../features/home/ui/CreatePreviewLayer";
 import { SceneSlices } from "../../features/ct/ui/SceneSlices";
 import { SceneVolume } from "../../features/ct/ui/SceneVolume";
 import { matchVolume } from "../../features/ct/ux/volume-box";
@@ -44,6 +45,7 @@ import { DeformHandlesLayer } from "../../features/sculpt/ui/DeformHandlesLayer"
 import { FaceSelectionLayer } from "../../features/select/ui/FaceSelectionLayer";
 import { HollowPlaceToolsLayer } from "../../features/mesh-edit/ui/HollowPlaceToolsLayer";
 import { MetrologyOverlaysLayer } from "../../features/points/ui/MetrologyOverlaysLayer";
+import { PlacementPicksLayer } from "../../features/transform/ui/PlacementPicksLayer";
 import { useCameraRequests, useOrbitCamera } from "../ux/use-camera-controller";
 import { useGizmoDrag, useMeshBindings } from "../ux/use-gizmo";
 import { useHoverRay } from "../ux/use-hover-ray";
@@ -114,8 +116,10 @@ export function Viewport(props: {
   const wave6SelectTool = useApp(app, (s) => s.wave6.select.activeTool);
   const wave6DeformTool = useApp(app, (s) => s.wave6.deform.activeTool);
   const wave6PrintTool = useApp(app, (s) => s.wave6.printPrep.activeTool);
+  // An armed placement pick (#256) owns the pointer like the Wave 6 tools.
+  const placementPicking = useApp(app, (s) => s.placementTool.pick !== null);
   const pointerOwnedByWave6 =
-    wave6SelectTool !== null || wave6DeformTool !== null || wave6PrintTool !== null;
+    wave6SelectTool !== null || wave6DeformTool !== null || wave6PrintTool !== null || placementPicking;
   const { downAt, onMissed, onPick } = useSelectionClicks({
     app,
     select,
@@ -194,7 +198,11 @@ export function Viewport(props: {
       ) : null}
       {/* Mask paint owns the pointer while armed (like sculpt, it disarms the gizmo's claim); sculpt wins when both arm. */}
       {maskPaint && sculpt === null ? <MaskLayer app={app} scene={scene} maskTracker={maskTracker} /> : null}
-      <PickCursor picking={picking !== null || sculpt !== null || wave6SelectTool !== null || wave6PrintTool !== null} />
+      <PickCursor
+        picking={
+          picking !== null || sculpt !== null || wave6SelectTool !== null || wave6PrintTool !== null || placementPicking
+        }
+      />
       <MissTracker track={downAt} />
       <SceneSlices app={app} loader={loader} scene={scene} />
       <SceneVolume app={app} loader={loader} scene={scene} />
@@ -203,6 +211,8 @@ export function Viewport(props: {
       <DeformHandlesLayer app={app} store={store} />
       <MetrologyOverlaysLayer app={app} store={store} />
       <HollowPlaceToolsLayer app={app} store={store} />
+      <PlacementPicksLayer app={app} store={store} />
+      <CreatePreviewLayer app={app} />
     </Canvas>
   );
 }
@@ -380,7 +390,7 @@ function SurfaceFieldOverlay(props: { app: AppState; item: Item; bound: MeshBind
     const colors = new Float32Array(vertCount * 3);
     for (let i = 0; i < vertCount; i++) {
       const val = i < field.values.length ? field.values[i] : Number.NaN;
-      const [r, g, b] = evaluateSurfaceColormap(field.map, val, field.min, field.max);
+      const [r, g, b] = evaluateOverlayColor(field, val);
       colors[3 * i] = r;
       colors[3 * i + 1] = g;
       colors[3 * i + 2] = b;

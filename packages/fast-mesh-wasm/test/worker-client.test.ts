@@ -863,6 +863,9 @@ describe("WorkerScene", () => {
     const gap = await scene.meshDistance(a, b);
     expect(gap?.distance).toBeCloseTo(1, 1);
     expect(await scene.intersects(a, b)).toBe(false);
+    const selfCrossing = await scene.inspect.selfIntersectingTriangles(a);
+    expect(selfCrossing).toBeInstanceOf(Uint32Array);
+    expect(selfCrossing.length).toBe(0);
     const contacts = await scene.findContacts({ margin: 2 });
     expect(contacts).toHaveLength(1);
     expect(contacts[0].a).toBe(a);

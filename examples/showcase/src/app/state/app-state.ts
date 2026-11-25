@@ -12,6 +12,7 @@ import type { LoadedMesh } from "../../io/protocol";
 import type { SliceAxis } from "../../features/ct/ux/volume-slice";
 import type { SculptBrush, SculptMask } from "../../features/sculpt/ux/sculpt";
 import { installDiagnosticShader } from "../../features/view/ui/shading";
+import type { OrbitDirection, RollDirection } from "../../features/view/ux/view-steps";
 import {
   createGroup,
   dropMember,
@@ -24,6 +25,7 @@ import {
   clampSidebarWidth,
   DEFAULT_SIDEBAR_WIDTH,
   defaultSettings,
+  type ScaleIndicator,
   type SculptFilterSettings,
   type SculptMethods,
   type SculptSymmetrySettings,
@@ -32,6 +34,7 @@ import {
 } from "../../shared/ux/settings";
 import { type ImportScale, type LengthUnit, NO_IMPORT_SCALE } from "../../shared/ux/units";
 import { createDefaultWave6State, type Wave6State } from "./wave6-state";
+import { DEFAULT_PLACEMENT_TOOL, type PlacementToolState } from "../../features/transform/ux/placement-picks";
 
 export interface Item {
   /** A React key. */
@@ -167,12 +170,22 @@ export interface SurfaceFieldState {
   maxDistance: number;
 }
 
+/** Values from `lo` to `hi` (both inclusive) that an overlay draws in one colour instead of its colormap (#251). */
+export interface OverlayBand {
+  lo: number;
+  hi: number;
+  /** RGB, each 0..1. */
+  color: readonly [number, number, number];
+}
+
 export interface SurfaceFieldOverlayData {
   mesh: MeshHandle;
   values: Float32Array;
   map: SurfaceColormap;
   min: number;
   max: number;
+  /** A band of values drawn in one colour: a tolerance band, faces that need no support (#251). */
+  band?: OverlayBand | null;
 }
 
 export type CameraProjection = "perspective" | "orthographic";
@@ -189,6 +202,14 @@ export interface CameraDirectionRequest {
   up: readonly [number, number, number];
   n: number;
 }
+
+/** A navigation cube arrow (#255): an orbit about the screen's axes, or a roll about the view direction. */
+export type CameraStep =
+  | { kind: "orbit"; direction: OrbitDirection; deg: number }
+  | { kind: "roll"; direction: RollDirection; deg: number };
+
+/** The latest arrow step; `n` makes a repeated press new. */
+export type CameraStepRequest = CameraStep & { n: number };
 
 /** A workspace ribbon tab (#228). */
 export type WorkbenchTab = "home" | "select" | "repair" | "edit" | "sculpt" | "align" | "volume" | "inspect";
@@ -324,12 +345,18 @@ export interface AppSnapshot {
   surfaceField: SurfaceFieldState;
   /** Per-vertex scalar values for fields rendered via the client overlay (Gaussian curvature, WorkerScene thickness/mean curvature). */
   surfaceFieldValues: SurfaceFieldOverlayData | null;
-  /** Viewport camera projection mode (#195). */
+  /** Viewport camera projection mode (#195; persisted since #255). */
   cameraProjection: CameraProjection;
   /** Latest camera preset request; `n` distinguishes repeated clicks (#195). */
   cameraPresetRequest: CameraPresetRequest | null;
   /** Arbitrary ViewCube edge/corner direction request (#232). */
   cameraDirectionRequest: CameraDirectionRequest | null;
+  /** Latest navigation cube arrow step (#255). */
+  cameraStepRequest: CameraStepRequest | null;
+  /** The viewport's scale indicator (#255; a display setting: persisted, not undoable). */
+  scaleIndicator: ScaleIndicator;
+  /** Whether the XYZ axis basis shows (#255; a display setting: persisted, not undoable). */
+  showAxisBasis: boolean;
   /** Active workspace ribbon tab driving tier-2 shelf and single right inspector (#228). */
   activeTab: WorkbenchTab;
   /** Whether sculpt/mask hover restricts to `selection` instead of any visible unlocked mesh (#229). */
@@ -346,6 +373,8 @@ export interface AppSnapshot {
   commandPaletteOpen: boolean;
   /** Wave 6 feature states (#233, #193, #194, #234, #236). */
   wave6: Wave6State;
+  /** The placement helpers' armed surface pick and latest report (#256). */
+  placementTool: PlacementToolState;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -420,6 +449,9 @@ export class AppState {
     cameraProjection: "perspective",
     cameraPresetRequest: null,
     cameraDirectionRequest: null,
+    cameraStepRequest: null,
+    scaleIndicator: "ruler",
+    showAxisBasis: true,
     activeTab: "home",
     sculptPinToActive: false,
     shadingMode: "smooth",
@@ -428,6 +460,7 @@ export class AppState {
     healerFocusRequest: null,
     commandPaletteOpen: false,
     wave6: createDefaultWave6State(),
+    placementTool: DEFAULT_PLACEMENT_TOOL,
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -458,6 +491,9 @@ export class AppState {
       sculptSymmetry: { ...initial.sculptSymmetry },
       units: initial.defaultUnits,
       defaultUnits: initial.defaultUnits,
+      cameraProjection: initial.cameraProjection,
+      scaleIndicator: initial.scaleIndicator,
+      showAxisBasis: initial.showAxisBasis,
     };
   }
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
@@ -544,6 +580,16 @@ export class AppState {
       preset: null,
       importScale: NO_IMPORT_SCALE,
     });
+  }
+
+  /**
+   * Lists a mesh its caller added to the store and fills itself (the Create
+   * dialog adds an empty mesh and its geometry as one undoable edit), with
+   * the size it will have: the triangle count, centre (its origin) and half
+   * diagonal.
+   */
+  listMesh(mesh: MeshHandle, meta: Pick<Item, "name" | "triangles" | "center" | "radius">): Item {
+    return this.#registerItem(mesh, { ...meta, volumeId: null, preset: null, importScale: NO_IMPORT_SCALE });
   }
 
   #registerItem(
@@ -919,6 +965,11 @@ export class AppState {
     }
   }
 
+  /** Arms or clears (`pick: null`) a placement helper's surface pick, or sets its report (#256). */
+  setPlacementTool(patch: Partial<PlacementToolState>): void {
+    this.#set({ placementTool: { ...this.#snap.placementTool, ...patch } });
+  }
+
   /** Locks or unlocks a mesh against move/rotate/scale and sculpt/mask edits (#235). */
   setMeshLocked(mesh: MeshHandle, locked: boolean): void {
     let changed = false;
@@ -1023,6 +1074,22 @@ export class AppState {
     this.#set({ cameraDirectionRequest: { dir: [...dir], up: [...up], n: prevN + 1 } });
   }
 
+  /** Requests a navigation cube arrow step: an orbit or a roll of the view (#255). */
+  requestCameraStep(step: CameraStep): void {
+    const prevN = this.#snap.cameraStepRequest?.n ?? 0;
+    this.#set({ cameraStepRequest: { ...step, n: prevN + 1 } });
+  }
+
+  /** Sets the viewport's scale indicator (#255; a display setting: persisted, not undoable). */
+  setScaleIndicator(scaleIndicator: ScaleIndicator): void {
+    this.#set({ scaleIndicator });
+  }
+
+  /** Shows or hides the XYZ axis basis (#255; a display setting: persisted, not undoable). */
+  setShowAxisBasis(showAxisBasis: boolean): void {
+    this.#set({ showAxisBasis });
+  }
+
   /** Whether heavy loads are decimated on load (the mesh list's checkbox). */
   setDecimateOnLoad(on: boolean): void {
     this.#set({ decimateOnLoad: on });
@@ -1114,6 +1181,9 @@ export class AppState {
       creaseAngleDeg: 35,
       healerOverlays: { selfIntersections: true, inverted: true, slivers: true },
       sculptPinToActive: false,
+      cameraProjection: d.cameraProjection,
+      scaleIndicator: d.scaleIndicator,
+      showAxisBasis: d.showAxisBasis,
     });
   }
 

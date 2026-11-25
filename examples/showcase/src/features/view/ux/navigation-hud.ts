@@ -1,6 +1,8 @@
-// Pure math and layout helpers for the ViewCube, XYZ basis triad, and live scale bar (#232).
+// Pure math and layout helpers for the ViewCube, XYZ basis triad, and live scale bar (#232),
+// and the navigation cube's preset keys, scale toggle and screen grid (#255).
 import * as THREE from "three";
 import type { LengthUnit } from "../../../shared/ux/units";
+import type { ScaleIndicator } from "../../../shared/ux/settings";
 import type { CameraPreset } from "../../../app/state/app-state";
 
 export interface ViewCubeTarget {
@@ -192,5 +194,46 @@ export function computeMetricScaleBar(params: {
     widthPx,
     valueInUnits: stepMm,
     mmLength: stepMm,
+  };
+}
+
+/**
+ * The face presets' keys (#255), as the command search lists them: 1 front,
+ * 3 left, 7 top, and with Shift the opposite face. Top-row digits or the
+ * number pad.
+ */
+export const PRESET_SHORTCUTS: Readonly<Record<CameraPreset, string>> = {
+  front: "1",
+  back: "Shift+1",
+  left: "3",
+  right: "Shift+3",
+  top: "7",
+  bottom: "Shift+7",
+};
+
+/** The face preset a key press asks for (`KeyboardEvent.code` and Shift), or `null`. */
+export function cameraPresetForKey(code: string, shift: boolean): CameraPreset | null {
+  const digit = /^(?:Digit|Numpad)([137])$/.exec(code)?.[1];
+  if (digit === "1") return shift ? "back" : "front";
+  if (digit === "3") return shift ? "right" : "left";
+  if (digit === "7") return shift ? "bottom" : "top";
+  return null;
+}
+
+/** The scale indicator after a press of its toggle: ruler, then grid, then none. */
+export function nextScaleIndicator(mode: ScaleIndicator): ScaleIndicator {
+  return mode === "ruler" ? "grid" : mode === "grid" ? "off" : "ruler";
+}
+
+/**
+ * The screen grid's CSS background for cells `cellPx` wide: one line
+ * through the viewport's centre each way, then every `cellPx`.
+ */
+export function scaleGridBackground(cellPx: number): { backgroundSize: string; backgroundPosition: string } {
+  const c = Math.max(cellPx, 1);
+  const half = c / 2;
+  return {
+    backgroundSize: `${c}px ${c}px`,
+    backgroundPosition: `calc(50% + ${half}px) calc(50% + ${half}px)`,
   };
 }

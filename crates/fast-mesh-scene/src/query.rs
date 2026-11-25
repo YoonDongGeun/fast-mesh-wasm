@@ -1019,6 +1019,57 @@ impl Scene {
         )?)
     }
 
+    /// Appends to `out` the alive triangles of mesh `id` that intersect or
+    /// touch another of its triangles sharing no vertex id: the triangles of
+    /// Phase 3's [`fast_mesh_query::self_intersecting_pairs`], each listed
+    /// once, ascending. Elements already in `out` stay in front. Only this
+    /// mesh's BVH is brought up to date.
+    ///
+    /// The test runs in the mesh's local space: its placement maps every
+    /// triangle by the same affine map, which neither makes nor breaks an
+    /// intersection. As for the pairs, neighbours sharing a vertex id are
+    /// never reported, even when they also cross elsewhere, and degenerate
+    /// triangles are skipped. The list is the same with and without the
+    /// `parallel` feature.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`]; then a BVH or memory error from a Lazy
+    /// update, [`SceneError::StaleBvh`] for a stale Manual mesh, or a memory
+    /// error while collecting. On any error `out` keeps its length.
+    pub fn self_intersecting_triangles(
+        &mut self,
+        id: MeshId,
+        out: &mut Vec<TriangleId>,
+    ) -> Result<()> {
+        self.drop_field_unit();
+        self.entry(id)?;
+        self.prepare(Some(&[id]))?;
+        let e = self.entry(id)?;
+        let mut pairs = Vec::new();
+        fast_mesh_query::self_intersecting_pairs(&e.mesh, &e.bvh, &mut pairs)?;
+        let slots = e.mesh.triangle_slots();
+        let mut hit: Vec<bool> = try_vec(slots)?;
+        hit.resize(slots, false);
+        let mut found = 0usize;
+        for &(a, b) in &pairs {
+            for t in [a, b] {
+                let flag = &mut hit[t as usize];
+                if !*flag {
+                    *flag = true;
+                    found += 1;
+                }
+            }
+        }
+        out.try_reserve(found).map_err(|_| oom())?;
+        out.extend(
+            hit.iter()
+                .enumerate()
+                .filter(|&(_, &h)| h)
+                .map(|(t, _)| t as TriangleId),
+        );
+        Ok(())
+    }
+
     /// Extracts the intrinsic shortest path along mesh `id` from `sources` to
     /// `target_vertex` following gradient descent on `distances` (such as
     /// computed by [`Scene::geodesic_distances`]).
@@ -2367,5 +2418,189 @@ pub(crate) mod tests {
             assert!((f64::from(path[0].position[i]) - expected_start[i]).abs() < 1e-4);
             assert!((f64::from(path.last().unwrap().position[i]) - expected_end[i]).abs() < 1e-4);
         }
+    }
+
+    /// Two closed cubes in one mesh: `[0, 2]^3` and the one at `offset`
+    /// (size 2), triangles 0..12 and 12..24.
+    fn two_cubes(offset: [f32; 3]) -> Mesh {
+        let a = cube([0.0; 3], 2.0);
+        let b = cube(offset, 2.0);
+        let mut pos: Vec<f32> = a.positions().iter().flatten().copied().collect();
+        pos.extend(b.positions().iter().flatten());
+        let mut idx: Vec<u32> = a.triangles().iter().flatten().copied().collect();
+        idx.extend(b.triangles().iter().flatten().map(|&v| v + 8));
+        Mesh::from_buffers(&pos, &idx).unwrap()
+    }
+
+    /// The triangles of every self-intersecting pair, written out
+    /// independently: each pair tested once, without a BVH.
+    fn brute_self_triangles(mesh: &Mesh) -> Vec<TriangleId> {
+        let built = Bvh::build(mesh, &fast_mesh_bvh::BuildOptions::default()).unwrap();
+        let mut pairs = Vec::new();
+        fast_mesh_query::self_intersecting_pairs(mesh, &built, &mut pairs).unwrap();
+        let mut tris: Vec<TriangleId> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
+        tris.sort_unstable();
+        tris.dedup();
+        tris
+    }
+
+    #[test]
+    fn self_intersecting_triangles_lists_each_crossing_triangle_once() {
+        let mut scene = Scene::new(SceneOptions::default());
+        // A closed cube does not intersect itself.
+        let clean = scene
+            .add_mesh(cube([0.0; 3], 1.0), MeshOptions::default())
+            .unwrap();
+        let mut out = vec![99];
+        scene.self_intersecting_triangles(clean, &mut out).unwrap();
+        assert_eq!(out, [99], "elements already in `out` stay in front");
+
+        // Two cubes overlapping by half: the crossing triangles of both.
+        let mesh = two_cubes([1.0, 0.5, 0.5]);
+        let expected = brute_self_triangles(&mesh);
+        assert!(!expected.is_empty());
+        assert!(expected.iter().any(|&t| t < 12) && expected.iter().any(|&t| t >= 12));
+        let crossed = scene.add_mesh(mesh, MeshOptions::default()).unwrap();
+        let mut got = Vec::new();
+        scene
+            .self_intersecting_triangles(crossed, &mut got)
+            .unwrap();
+        assert_eq!(got, expected);
+        assert!(
+            got.windows(2).all(|w| w[0] < w[1]),
+            "ascending, no duplicates"
+        );
+
+        // A scaled, rotated placement lists the same triangles.
+        scene
+            .set_placement(
+                crossed,
+                Placement {
+                    rotation: tilted(30.0),
+                    translation: [4.0, -1.0, 2.0],
+                    scale: [2.0, 0.5, 1.0],
+                },
+            )
+            .unwrap();
+        let mut placed = Vec::new();
+        scene
+            .self_intersecting_triangles(crossed, &mut placed)
+            .unwrap();
+        assert_eq!(placed, expected);
+
+        // Cubes apart: nothing.
+        let apart = scene
+            .add_mesh(two_cubes([5.0, 0.0, 0.0]), MeshOptions::default())
+            .unwrap();
+        let mut none = Vec::new();
+        scene.self_intersecting_triangles(apart, &mut none).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn self_intersecting_triangles_follows_edits_and_bvh_modes() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let lazy = scene
+            .add_mesh(
+                two_cubes([5.0, 0.0, 0.0]),
+                MeshOptions {
+                    mode: UpdateMode::Lazy,
+                    ..MeshOptions::default()
+                },
+            )
+            .unwrap();
+        // Moving the second cube's corners into the first: the Lazy BVH is
+        // brought up to date and the new crossings found.
+        let moved: Vec<[f32; 3]> = (8..16u32)
+            .map(|v| {
+                let p = scene.mesh(lazy).unwrap().position(v).unwrap();
+                [p[0] - 4.0, p[1] + 0.5, p[2] + 0.5]
+            })
+            .collect();
+        let ids: Vec<u32> = (8..16).collect();
+        scene
+            .edit(lazy, |tx| tx.set_positions(&ids, &moved))
+            .unwrap();
+        let mut got = Vec::new();
+        scene.self_intersecting_triangles(lazy, &mut got).unwrap();
+        assert_eq!(got, brute_self_triangles(scene.mesh(lazy).unwrap()));
+        assert!(!got.is_empty());
+
+        // A stale Manual mesh fails, and `out` keeps its length.
+        let manual = scene
+            .add_mesh(
+                two_cubes([5.0, 0.0, 0.0]),
+                MeshOptions {
+                    mode: UpdateMode::Manual,
+                    ..MeshOptions::default()
+                },
+            )
+            .unwrap();
+        scene
+            .edit(manual, |tx| tx.set_positions(&[0], &[[0.5, 0.5, 0.5]]))
+            .unwrap();
+        let mut kept = vec![7];
+        assert_eq!(
+            scene.self_intersecting_triangles(manual, &mut kept).err(),
+            Some(SceneError::StaleBvh(manual))
+        );
+        assert_eq!(kept, [7]);
+        scene.update(manual).unwrap();
+        scene
+            .self_intersecting_triangles(manual, &mut kept)
+            .unwrap();
+        assert_eq!(kept[0], 7);
+        assert_eq!(kept[1..], brute_self_triangles(scene.mesh(manual).unwrap()));
+
+        // Unknown ids.
+        scene.remove_mesh(manual).unwrap();
+        assert_eq!(
+            scene.self_intersecting_triangles(manual, &mut kept).err(),
+            Some(SceneError::UnknownMesh)
+        );
+    }
+
+    /// A wavy `n` x `n` sheet and its mirror image in z, as one mesh: they
+    /// cross wherever the sheet is at height 0, sharing no vertex.
+    fn crossed_sheets(n: u32) -> Mesh {
+        let mut pos = Vec::new();
+        for flip in [1.0f32, -1.0] {
+            for y in 0..=n {
+                for x in 0..=n {
+                    let (fx, fy) = (x as f32, y as f32);
+                    pos.extend([fx, fy, flip * (fx * 0.5).sin() * (fy * 0.3).cos()]);
+                }
+            }
+        }
+        let sheet = (n + 1) * (n + 1);
+        let mut idx = Vec::new();
+        for base in [0, sheet] {
+            for y in 0..n {
+                for x in 0..n {
+                    let a = base + y * (n + 1) + x;
+                    idx.extend([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1]);
+                }
+            }
+        }
+        Mesh::from_buffers(&pos, &idx).unwrap()
+    }
+
+    #[test]
+    fn self_intersecting_triangles_do_not_depend_on_the_parallel_feature() {
+        // 2,304 triangles: enough for the search to split with the feature on.
+        let run = || {
+            let mut scene = Scene::new(SceneOptions::default());
+            let id = scene
+                .add_mesh(crossed_sheets(24), MeshOptions::default())
+                .unwrap();
+            let mut out = Vec::new();
+            scene.self_intersecting_triangles(id, &mut out).unwrap();
+            out
+        };
+        fast_mesh_store::par::set_force_sequential(true);
+        let sequential = run();
+        fast_mesh_store::par::set_force_sequential(false);
+        assert!(!sequential.is_empty());
+        assert_eq!(run(), sequential);
     }
 }

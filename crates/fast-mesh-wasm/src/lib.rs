@@ -10,6 +10,7 @@ mod edit;
 mod error;
 #[cfg(all(feature = "threads", target_arch = "wasm32"))]
 mod pool;
+mod primitives;
 mod render;
 mod scene;
 mod wave6;

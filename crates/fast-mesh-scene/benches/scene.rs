@@ -67,6 +67,12 @@
 //! side apart, so nothing is in reach) and, with `FAST_MESH_BENCH_LARGE=1`,
 //! `many_mesh_drag_1M` (`terrain(708)`; about 40 s per iteration without
 //! the `parallel` feature).
+//!
+//! **Self-intersections**: `self_intersecting_triangles` on one mesh of two
+//! `terrain(500)` sheets (1,000,000 triangles), the second mirrored in z so
+//! that the two cross along the terrain's zero lines, and on a clean
+//! 1M-triangle UV sphere that crosses nothing. Setup prints how many
+//! triangles each lists.
 
 use std::hint::black_box;
 
@@ -1136,7 +1142,48 @@ fn bench_many_mesh(c: &mut Criterion, name: &str, n: u32, step: f64) {
     group.finish();
 }
 
+/// One mesh of two `terrain(n)` sheets, the second mirrored in z: they cross
+/// wherever the terrain is at height 0, sharing no vertex.
+fn crossed_terrains(n: u32) -> Mesh {
+    let sheet = terrain(n);
+    let count = sheet.vertex_slots() as u32;
+    let mut positions: Vec<f32> = sheet.positions().iter().flatten().copied().collect();
+    positions.extend(sheet.positions().iter().flat_map(|p| [p[0], p[1], -p[2]]));
+    let mut indices: Vec<u32> = sheet.triangles().iter().flatten().copied().collect();
+    indices.extend(sheet.triangles().iter().flatten().map(|&v| v + count));
+    Mesh::from_buffers(&positions, &indices).unwrap()
+}
+
+fn bench_self_intersections(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scene self_intersecting_triangles");
+    group.sample_size(10);
+    // 500: two sheets of 500,000 triangles; a 708 x 708 sphere has 1,001,112.
+    for (name, mesh) in [
+        ("1M crossed terrains", crossed_terrains(500)),
+        ("1M sphere, none", uv_sphere(708, 708, 100.0)),
+    ] {
+        let mut scene = scene();
+        let id = scene.add_mesh(mesh, MeshOptions::default()).unwrap();
+        let mut out = Vec::new();
+        scene.self_intersecting_triangles(id, &mut out).unwrap();
+        eprintln!(
+            "self_intersecting_triangles {name}: {} triangles, {} listed",
+            scene.mesh(id).unwrap().triangle_count(),
+            out.len()
+        );
+        group.bench_function(name, |bn| {
+            bn.iter(|| {
+                out.clear();
+                scene.self_intersecting_triangles(id, &mut out).unwrap();
+                black_box(out.len())
+            })
+        });
+    }
+    group.finish();
+}
+
 fn benches(c: &mut Criterion) {
+    bench_self_intersections(c);
     bench_sections(c);
     bench_overhead(c, "1M", 708);
     bench_fields(c, "1M", 708);

@@ -59,6 +59,7 @@ export interface InspectBackend<Async extends boolean = false> {
     options?: { maxDistance?: number },
   ): InspectReturn<Async, MeshDistance | null>;
   intersects(a: MeshHandle, b: MeshHandle): InspectReturn<Async, boolean>;
+  selfIntersectingTriangles(mesh: MeshHandle): InspectReturn<Async, Uint32Array>;
   findContacts(options?: FindContactsOptions): InspectReturn<Async, Contact[]>;
   overhangs(mesh: MeshHandle, options?: OverhangOptions): InspectReturn<Async, OverhangReport>;
   triangleQuality(
@@ -131,6 +132,14 @@ export interface InspectDomain<Async extends boolean = false> {
     options?: { maxDistance?: number },
   ): InspectReturn<Async, MeshDistance | null>;
   intersects(a: MeshHandle, b: MeshHandle): InspectReturn<Async, boolean>;
+  /**
+   * The live triangle slots of `mesh` that intersect or touch another of its
+   * own triangles, ascending, each once. Triangles sharing a vertex are never
+   * tested against each other and degenerate triangles are skipped. The
+   * mesh's BVH is brought up to date first; a stale `"manual"` mesh throws
+   * `STALE_BVH`.
+   */
+  selfIntersectingTriangles(mesh: MeshHandle): InspectReturn<Async, Uint32Array>;
   findContacts(options?: FindContactsOptions): InspectReturn<Async, Contact[]>;
   overhangs(mesh: MeshHandle, options?: OverhangOptions): InspectReturn<Async, OverhangReport>;
   triangleQuality(
@@ -221,6 +230,7 @@ export function createInspectDomain<Async extends boolean>(backend: InspectBacke
     meshDistance: (a: MeshHandle, b: MeshHandle, options?: { maxDistance?: number }) =>
       backend.meshDistance(a, b, options),
     intersects: (a: MeshHandle, b: MeshHandle) => backend.intersects(a, b),
+    selfIntersectingTriangles: (mesh: MeshHandle) => backend.selfIntersectingTriangles(mesh),
     findContacts: (options?: FindContactsOptions) => backend.findContacts(options),
     overhangs: (mesh: MeshHandle, options?: OverhangOptions) => backend.overhangs(mesh, options),
     triangleQuality: (

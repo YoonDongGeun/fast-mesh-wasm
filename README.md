@@ -611,6 +611,14 @@ Meshes must be added through the store (`store.addMesh`). A mesh added straight 
 | `init(input?)` | `Promise<void>` | Loads the WebAssembly module. Required once in browsers; resolves immediately in Node.js and Bun. Safe to call repeatedly. `input` optionally overrides where the `.wasm` file comes from (`InitInput`). |
 | `computeVertexNormals(positions, indices)` | `Float32Array` | Smooth, area-weighted per-vertex normals. Same length as `positions`. |
 | `computeBounds(positions)` | `Bounds` | Plain object `{ min, max, center, size }`, each a `[x, y, z]` array. |
+| `generatePrimitive(shape)` | `PrimitiveMesh` | A box, cylinder, cone, UV sphere, icosphere, torus, arrow, n-gon prism or plane as `{ positions, indices }` (`Float32Array`, `Uint32Array`): centred on the origin, welded, closed (except the plane) and wound outward. `shape` is `{ kind, ...options }`; every option has a default (see `PrimitiveShape`). |
+
+`generatePrimitive` is a pure function, not a scene operation: it stores nothing and records no history, so it runs wherever the module is initialised (the main thread, or any Worker of yours). A `WorkerScene` has `scene.generatePrimitive(shape)`, which runs the same generator in the scene's Worker and transfers the buffers back, so a page on the Worker scene needs no wasm of its own. Add the result with `addMesh(positions, indices)`.
+
+```ts
+const { positions, indices } = generatePrimitive({ kind: "torus", majorRadius: 2, minorRadius: 0.5, segments: 96 });
+const mesh = scene.addMesh(positions, indices);
+```
 
 All functions throw an `Error` with a readable message when a buffer length is not a multiple of 3 or an index is out of range, and when called before `init()` has finished in the browser.
 

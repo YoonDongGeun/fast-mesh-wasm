@@ -10,6 +10,7 @@ import { Suspense, lazy, useCallback, useState, type RefObject } from "react";
 import type { Loader } from "../io/loader";
 import { CollisionPanel } from "../features/collision/ui/CollisionPanel";
 import { CommandPalette } from "../shell/ui/CommandPalette";
+import { CreatePrimitiveDialog } from "../features/home/ui/CreatePrimitiveDialog";
 import { DeformPanel } from "../features/sculpt/ui/DeformPanel";
 import { ExportPanel } from "../features/home/ui/ExportPanel";
 import { GroupsBar } from "../features/collision/ui/GroupsBar";
@@ -102,6 +103,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const wave6SelectTool = useApp(app, (s) => s.wave6.select.activeTool);
   const wave6DeformTool = useApp(app, (s) => s.wave6.deform.activeTool);
   const wave6PrintTool = useApp(app, (s) => s.wave6.printPrep.activeTool);
+  const placementPick = useApp(app, (s) => s.placementTool.pick);
   const onPickPoint = useCallback(
     (mesh: MeshHandle, point: readonly [number, number, number]) =>
       app.setBrushPick({ mesh, point: [point[0], point[1], point[2]] }),
@@ -194,6 +196,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         {grouped ? <HoverTip app={app} scene={engine.scene} items={items} members={members} /> : null}
         <VolumeOverlay app={app} />
         <ViewportNavigationHud app={app} />
+        <CreatePrimitiveDialog app={app} />
         <p className="hint">
           {viewportHint({
             sculpting: sculpt !== null,
@@ -202,6 +205,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
             deformTool: wave6DeformTool,
             printTool: wave6PrintTool,
             picking: picking !== null,
+            placementPick: placementPick !== null,
             selected: selection !== null,
             coarse: coarsePointer,
           })}

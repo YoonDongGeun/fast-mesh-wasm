@@ -1,8 +1,9 @@
 // What the navigation HUD follows each frame: the cube turned with the
 // camera (its CSS transform written straight to the element), and the XYZ
 // triad and the scale bar re-rendered only when what they show changes.
-// Clicking a cube face, edge or corner snaps the camera.
-import { type RefObject, useEffect, useState } from "react";
+// Clicking a cube face, edge or corner snaps the camera; its arrows orbit
+// and roll it (#255).
+import { type RefObject, useCallback, useEffect, useState } from "react";
 import * as THREE from "three";
 import type { AppState } from "../../../app/state/app-state";
 import type { LengthUnit } from "../../../shared/ux/units";
@@ -15,6 +16,13 @@ import {
   type TriadAxisProjection,
   type ViewCubeTarget,
 } from "./navigation-hud";
+import {
+  ORBIT_FINE_STEP_DEG,
+  ORBIT_STEP_DEG,
+  type OrbitDirection,
+  ROLL_STEP_DEG,
+  type RollDirection,
+} from "./view-steps";
 
 /** The triad as drawn, at half-pixel steps: a new key means a visible change. */
 export function triadSummaryKey(axes: readonly TriadAxisProjection[]): string {
@@ -95,4 +103,29 @@ export function snapView(app: AppState, target: ViewCubeTarget): void {
   } else {
     app.requestCameraDirection(target.dir, target.up);
   }
+}
+
+/** Orbits the view one step the way `direction` points: a quarter turn, or 15° when `fine` (Shift held). */
+export function orbitView(app: AppState, direction: OrbitDirection, fine = false): void {
+  app.requestCameraStep({ kind: "orbit", direction, deg: fine ? ORBIT_FINE_STEP_DEG : ORBIT_STEP_DEG });
+}
+
+/** Rolls the view a quarter turn about the viewing direction, the picture turning `direction`. */
+export function rollView(app: AppState, direction: RollDirection): void {
+  app.requestCameraStep({ kind: "roll", direction, deg: ROLL_STEP_DEG });
+}
+
+/**
+ * A phone-sized touch screen: there the cube box starts folded to its
+ * toggle, leaving the small canvas to the fingers.
+ */
+const compactTouch =
+  typeof matchMedia === "function" &&
+  matchMedia("(pointer: coarse) and (max-width: 600px), (pointer: coarse) and (max-height: 600px)").matches;
+
+/** Whether the cube box is open (folded on a phone at first), and its toggle. */
+export function useViewCubeOpen(): [boolean, () => void] {
+  const [open, setOpen] = useState(!compactTouch);
+  const toggle = useCallback(() => setOpen((o) => !o), []);
+  return [open, toggle];
 }

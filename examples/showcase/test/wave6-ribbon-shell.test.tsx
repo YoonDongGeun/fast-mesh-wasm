@@ -211,6 +211,8 @@ describe("Wave 6 Ribbon, Shell Slot Routing, CommandPalette & Lazy Wasm Safety",
     });
     expect(container.querySelector('[data-ribbon-focus="fit"]')).not.toBeNull();
     expect(container.querySelector('[data-ribbon-focus="contours"]')).not.toBeNull();
+    expect(container.querySelector('[data-ribbon-focus="maps"]')).not.toBeNull();
+    expect(container.querySelector("[data-inspect-maps]")).not.toBeNull();
 
     // CommandPalette Wave 6 items
     const cmds = buildCommandPaletteItems({

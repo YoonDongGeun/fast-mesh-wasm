@@ -17,6 +17,8 @@ import type { AppState } from "../state/app-state";
 import { view } from "../../viewport/ux/view";
 import { hasRepairOverlays } from "../../features/mesh-repair/ui/repair-overlays";
 import { hasWireOverlay } from "../../features/view/ui/wire";
+import { inspectMapProbe } from "../../features/inspect/ux/use-inspect-maps";
+import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 
 export function installTestHook(
   store: SceneStore,
@@ -50,6 +52,11 @@ export function installTestHook(
         drawn: (view.bindings.get(i.mesh)?.object.geometry.getIndex()?.count ?? 0) > 0,
         visible: view.bindings.get(i.mesh)?.object.visible ?? false,
       })),
+    /** The Create dialog: whether it is open, its shape, and the preview's triangles (0 with none). */
+    createDialog: () => {
+      const d = createDialogOf(app).getSnapshot();
+      return { open: d.open, kind: d.kind, previewTriangles: (d.preview?.mesh.indices.length ?? 0) / 3 };
+    },
     /** What the mesh's list picture cost, and how many were started and finished. */
     meshPreview: (name: string) => meshPreviewStats(find(name).mesh),
     /** Draws the mesh's list picture again now, as an edit would after its quiet time. */
@@ -131,6 +138,12 @@ export function installTestHook(
     },
     /** The mesh's placement translation. */
     translation: (name: string) => [...store.scene.placement(find(name).mesh).translation],
+    /** The mesh's whole placement (rotation row-major), and the armed placement pick's kind and point count (#256). */
+    placement: (name: string) => store.scene.placement(find(name).mesh),
+    placementPick: () => {
+      const pick = app.getSnapshot().placementTool.pick;
+      return pick === null ? null : { kind: pick.kind, points: pick.points.length };
+    },
     dragging: () => view.dragging,
     /**
      * The gizmo: `null` when there is none, else the mesh it is attached to
@@ -255,6 +268,17 @@ export function installTestHook(
       section: inspect.tools.section === null ? null : { ...inspect.tools.section },
       clip: inspect.tools.clip === null ? null : { ...inspect.tools.clip },
     }),
+    /** The inspect map shown (#251): its kind, mesh, reference, readouts, colour range and band, and how many queries landed. */
+    inspectMap: () => {
+      const s = inspectMapProbe.shown;
+      return {
+        runs: inspectMapProbe.runs,
+        shown:
+          s === null
+            ? null
+            : { ...s, readout: { ...s.readout }, range: [...s.range], band: s.band === null ? null : [...s.band] },
+      };
+    },
     /** The volume view: the series shown, its preset, MIP, and whether it rendered. */
     volume: () => ({ ...inspect.volume }),
     /** The slice views: the series shown, its window preset, the slice indices, and whether all rendered. */
@@ -407,12 +431,16 @@ export function installTestHook(
         svg: contoursToSvg(read.contours, read.origin, read.normal),
       };
     },
-    /** The camera and its orbit target, for scripts/showcase-touch-check.mjs. */
+    /** The camera, its orbit target and its up, for scripts/showcase-touch-check.mjs (and the cube's steps, #255). */
     cameraPose: () => {
       if (view.camera === null || view.orbit === null) {
         return null;
       }
-      return { position: view.camera.position.toArray(), target: view.orbit.target.toArray() };
+      return {
+        position: view.camera.position.toArray(),
+        target: view.orbit.target.toArray(),
+        up: view.camera.up.toArray(),
+      };
     },
     /** Where the section gizmo's handle ball is on the page, in CSS pixels; `null` without a section. */
     sectionHandle: () => {

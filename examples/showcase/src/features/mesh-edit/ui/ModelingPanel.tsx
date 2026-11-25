@@ -15,8 +15,11 @@ import {
   triangleCountInput,
   useModelingOps,
 } from "../ux/use-modeling-ops";
+import { useConvexHull } from "../ux/use-convex-hull";
 import { spinInput, stampScaleInput, taperInput, usePrintPrepOps } from "../ux/use-print-prep-ops";
 import { findCenterSurfaceHit } from "./HollowPlaceToolsLayer";
+import { BatchBooleanSection } from "./BatchBooleanSection";
+import { IsotropicRemeshSection } from "./IsotropicRemeshSection";
 
 export function ModelingPanel(props: { app: AppState }) {
   const { app } = props;
@@ -29,6 +32,7 @@ export function ModelingPanel(props: { app: AppState }) {
   const selectedItem = selection === null ? null : (items.find((i) => i.mesh === selection) ?? null);
   const activeItem = selectedItem ?? items[0] ?? null;
   const ops = useModelingOps({ app, store, items, activeItem, units });
+  const hull = useConvexHull({ app, store, items, activeItem, runAction: ops.runAction });
   const disabled = ops.busy !== null || activeItem === null;
 
   return (
@@ -115,6 +119,9 @@ export function ModelingPanel(props: { app: AppState }) {
               Run Boolean
             </button>
           </div>
+
+          {/* ---- 1b. Multi-mesh Boolean (#254) ---- */}
+          <BatchBooleanSection app={app} store={store} items={items} />
 
           {/* ---- 2. Destructive Plane Cut ---- */}
           <div className="op">
@@ -291,6 +298,24 @@ export function ModelingPanel(props: { app: AppState }) {
             </div>
           </div>
 
+          {/* ---- Convex Hull ---- */}
+          <div className="op" data-modeling-hull-section>
+            <h3>Convex Hull</h3>
+            <p className="muted" data-modeling-hull-sources>
+              {hull.hullSources.length > 1
+                ? `Hull of ${hull.hullSources.length} selected meshes, as a new mesh.`
+                : `Hull of ${activeItem?.name ?? "the selection"}, as a new mesh. Shift-click to add meshes.`}
+            </p>
+            <button
+              type="button"
+              data-modeling-hull-run
+              disabled={disabled || hull.hullSources.length === 0}
+              onClick={() => hull.runHull()}
+            >
+              Convex Hull
+            </button>
+          </div>
+
           {/* ---- 4. Resampling ---- */}
           <div className="op">
             <h3>Resampling</h3>
@@ -375,6 +400,9 @@ export function ModelingPanel(props: { app: AppState }) {
               </button>
             </div>
           </div>
+
+          {/* ---- 4b. Isotropic Remesh (#254) ---- */}
+          <IsotropicRemeshSection store={store} activeItem={activeItem} units={units} />
 
           <div className="op" data-modeling-hollow-section>
             <span className="muted">5. Print Prep — Hollow Mesh</span>

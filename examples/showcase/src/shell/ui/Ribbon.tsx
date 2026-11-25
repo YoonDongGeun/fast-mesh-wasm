@@ -7,8 +7,10 @@
  */
 import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
 import type { AppState, WorkbenchTab } from "../../app/state/app-state";
+import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 import { DYNTOPO_MODE_OPTIONS } from "../../features/sculpt/ux/sculpt";
 import { DIAGNOSTIC_SHADING_OPTIONS } from "../../features/view/ui/shading";
+import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
 import { SculptToolbox } from "../../features/sculpt/ui/Toolbox";
 import type { GizmoMode } from "../../viewport/ui/Viewport";
 import { focusElement, openFilePicker, triggerClick } from "../ux/panel-triggers";
@@ -215,6 +217,14 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button type="button" onClick={() => triggerClick('[data-action="demo-meshes"]')}>
                 Load Sample Stage
               </button>
+              <button
+                type="button"
+                data-action="create-primitive"
+                title="Create a box, cylinder, sphere, torus or other shape"
+                onClick={() => createDialogOf(app).open()}
+              >
+                Create Shape…
+              </button>
               <button type="button" onClick={onResetView}>
                 Reset View
               </button>
@@ -289,6 +299,19 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
                 Clear Faces
               </button>
             </div>
+            <div className="group" aria-label="Placement">
+              {PLACEMENT_COMMANDS.filter((c) => c.shelf).map((c) => (
+                <button
+                  key={c.action}
+                  type="button"
+                  data-ribbon-placement={c.action}
+                  disabled={selection === null}
+                  onClick={() => triggerClick(`[data-placement-action="${c.action}"]`)}
+                >
+                  {c.short}
+                </button>
+              ))}
+            </div>
             <div className="group ribbon-shading-strip" aria-label="Diagnostic shading">
               {DIAGNOSTIC_SHADING_OPTIONS.map((opt) => (
                 <button
@@ -353,6 +376,13 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button type="button" onClick={() => focusElement("[data-modeling-boolean-run]")}>
                 Boolean CSG
               </button>
+              <button
+                type="button"
+                data-ribbon-focus="batch-boolean"
+                onClick={() => focusElement("[data-batch-boolean-section]")}
+              >
+                Multi Boolean
+              </button>
               <button type="button" onClick={() => focusElement("[data-modeling-cut-run]")}>
                 Plane Cut
               </button>
@@ -364,6 +394,16 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" onClick={() => focusElement("[data-modeling-subdivide-run]")}>
                 Subdivide
+              </button>
+              <button
+                type="button"
+                data-ribbon-focus="isotropic-remesh"
+                onClick={() => focusElement("[data-isotropic-section]")}
+              >
+                Isotropic Remesh
+              </button>
+              <button type="button" data-ribbon-focus="hull" onClick={() => focusElement("[data-modeling-hull-run]")}>
+                Convex Hull
               </button>
               <button type="button" data-ribbon-focus="hollow" onClick={() => focusElement("[data-modeling-hollow-section]")}>
                 Hollow
@@ -460,6 +500,9 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" data-ribbon-focus="contours" onClick={() => focusElement("[data-inspect-contours]")}>
                 Contours
+              </button>
+              <button type="button" data-ribbon-focus="maps" onClick={() => focusElement("[data-inspect-maps]")}>
+                Maps
               </button>
               <button
                 type="button"

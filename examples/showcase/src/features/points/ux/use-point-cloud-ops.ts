@@ -1,13 +1,16 @@
 // The points panel's op sequences (#234): load a cloud from a file, the
 // active mesh or a synthetic sphere; filter it (statistical and radius
-// outlier removal, voxel downsampling); estimate normals; and reconstruct
-// a surface mesh that joins the scene. Every result replaces the cloud in
-// the app's metrology state with a one-line report.
+// outlier removal, voxel downsampling); estimate normals; reconstruct
+// a surface mesh that joins the scene; and add the cloud's convex hull as a
+// new mesh (one undo step). Every result replaces the cloud in the app's
+// metrology state with a one-line report.
 import type { MeshHandle, PackedPointCloud, SurfaceReconstructMethod } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useState } from "react";
 import type { AppState, Item } from "../../../app/state/app-state";
 import { ensureWave6Wasm } from "../../../engine/wave6-wasm-lazy";
+import { runConvexHull } from "../../../engine/workbench-ops";
+import { describeHull } from "../../mesh-edit/ux/use-convex-hull";
 import { createSyntheticSphereCloud, parsePointCloudFileContent, sampleMeshToPointCloud } from "./point-cloud";
 
 export type ReconstructUiMethod = "poisson" | "bpa";
@@ -43,6 +46,7 @@ export function usePointCloudOps(
   const [error, setError] = useState<string | null>(null);
 
   const canReconstruct = typeof store?.scene?.inspect?.reconstructPointCloud === "function";
+  const canHull = typeof (store?.scene as { convexHullOfPoints?: unknown } | undefined)?.convexHullOfPoints === "function";
 
   const commitCloud = (nextCloud: PackedPointCloud | null, report: string | null) => {
     app.updateWave6((prev) => ({
@@ -211,6 +215,23 @@ export function usePointCloudOps(
     }
   };
 
+  /** Adds the cloud's convex hull (its positions, in world space) as a new mesh. */
+  const onConvexHull = async () => {
+    if (cloud === null || cloud.count < 4 || !canHull) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await runConvexHull({ store, app, name: "Point cloud hull", points: cloud });
+      commitCloud(cloud, `Convex hull ${describeHull({ ...r, name: r.item.name })}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   /** Drops the cloud and its report. */
   const onClear = () => commitCloud(null, null);
 
@@ -247,6 +268,7 @@ export function usePointCloudOps(
     busy,
     error,
     canReconstruct,
+    canHull,
     onFileSelected,
     onSampleActiveMesh,
     onSampleSynthetic,
@@ -255,6 +277,7 @@ export function usePointCloudOps(
     onVoxelDownsample,
     onEstimateNormals,
     onReconstruct,
+    onConvexHull,
     onClear,
     setShowOverlay,
   };

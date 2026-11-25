@@ -42,12 +42,14 @@ export function buildSelectedFacesGeometry(
 ): THREE.BufferGeometry {
   const geometry = new THREE.BufferGeometry();
   const validTris: number[] = [];
-  const seen = new Set<number>();
+  // A flag per triangle slot: large selections (a criterion can pick most of
+  // a big mesh) stay one linear pass.
+  const seen = new Uint8Array(Math.floor(indices.length / 3));
   const vertCount = Math.floor(positions.length / 3);
 
   for (let i = 0; i < selectedTris.length; i++) {
     const tri = selectedTris[i];
-    if (!Number.isInteger(tri) || seen.has(tri) || !isLiveTriangleSlot(indices, tri)) {
+    if (!Number.isInteger(tri) || !isLiveTriangleSlot(indices, tri) || seen[tri] !== 0) {
       continue;
     }
     const base = tri * 3;
@@ -57,7 +59,7 @@ export function buildSelectedFacesGeometry(
     if (a >= vertCount || b >= vertCount || c >= vertCount) {
       continue;
     }
-    seen.add(tri);
+    seen[tri] = 1;
     validTris.push(tri);
   }
 

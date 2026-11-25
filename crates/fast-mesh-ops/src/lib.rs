@@ -71,8 +71,14 @@
 //! - Subdivision: [`subdivide`](subdivide::subdivide) refines every triangle
 //!   into four per level by Loop's scheme, with boundary vertices relaxing
 //!   along their own curve and other creases holding their midpoints.
+//! - Convex hulls: [`convex_hull`] builds the exact convex hull of points
+//!   (from one mesh, several meshes or a point cloud with its wrappers) as a
+//!   closed, outward-wound mesh, by quickhull on exact orientation predicates.
 //! - Registration: [`icp()`] aligns points to a mesh by rigid, point-to-plane
 //!   ICP with trimmed outlier rejection, and reports how far it got.
+//! - Primitives: [`primitives::generate`] builds a closed, welded,
+//!   outward-wound box, cylinder, cone, UV sphere, icosphere, torus, arrow or
+//!   prism (or an open plane) from its parameters, centred on the origin.
 //! - Brush deformation: [`inflate`](deform::inflate) and
 //!   [`smooth`](deform::smooth) move the vertices under a brush along their
 //!   smooth normals or toward their neighbours, and [`grab`](deform::grab)
@@ -95,12 +101,14 @@ mod error;
 mod fair;
 mod fill;
 mod fill_dp;
+pub mod hull;
 pub mod icp;
 pub mod inspect;
 pub mod marching_cubes;
 mod measure;
 mod offset;
 mod orient;
+pub mod primitives;
 pub mod protect;
 mod refine;
 pub mod remesh;
@@ -134,6 +142,9 @@ pub use error::{OpsError, Result};
 pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
     fill_holes,
+};
+pub use hull::{
+    ConvexHull, convex_hull, convex_hull_mesh, convex_hull_meshes, convex_hull_point_cloud,
 };
 pub use icp::{IcpMotion, IcpOptions, IcpReport, IcpStatus, icp, sample_surface};
 pub use marching_cubes::{IsoMesh, marching_cubes, marching_cubes_raw};

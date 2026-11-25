@@ -7,6 +7,14 @@
 // mirrors back `views()`, and placements and section results are mirrored
 // too, so everything the adapters read stays synchronous. Drags are
 // optimistic: a move shows at once and holds until the Worker has the drag.
+import {
+  type ConvexHullOptions,
+  type ConvexHullPoints,
+  type ConvexHullResult,
+  hullMeshList,
+  hullNormals,
+  hullPointsBuffer,
+} from "../hull.js";
 import { checkRegisterOptions } from "../register.js";
 import {
   checkSurfacePathOptions,
@@ -32,6 +40,7 @@ import {
 } from "../options.js";
 import type { Bounds, Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
+import { encodePrimitive, type PrimitiveMesh, type PrimitiveShape } from "../primitives.js";
 import { FastMeshError, type FastMeshErrorCode, reportListenerError } from "../core.js";
 import {
   createAlignDomain,
@@ -903,6 +912,7 @@ export class WorkerScene implements SceneLike {
     closestPoint: (point, options) => this.closestPoint(point, options),
     meshDistance: (a, b, options) => this.meshDistance(a, b, options),
     intersects: (a, b) => this.intersects(a, b),
+    selfIntersectingTriangles: (mesh) => this.selfIntersectingTriangles(mesh),
     findContacts: (options) => this.findContacts(options),
     overhangs: (mesh, options) => this.overhangs(mesh, options),
     triangleQuality: (mesh, metricOrOptions, sliverThreshold) =>
@@ -3008,6 +3018,47 @@ export class WorkerScene implements SceneLike {
     );
   }
 
+  /**
+   * Adds the convex hull of `meshes` (one mesh or several) in the Worker as a
+   * new mesh, one undo step (see `Scene.convexHull`).
+   */
+  convexHull(meshes: MeshHandle | readonly MeshHandle[], options?: ConvexHullOptions): Promise<ConvexHullResult> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        const states = hullMeshList(meshes).map((m) => this.#live(m));
+        const normals = hullNormals(options);
+        added = this.#allocMeshState([0, 0, 0], normals);
+        return { kind: "convexHull", rev, addedId: added.id, meshes: states.map((st) => st.id), normals, qid };
+      },
+      (v) => ({ mesh: (added as MeshState).handle, ...(v as Omit<ConvexHullResult, "mesh">) }),
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
+  /**
+   * Adds the convex hull of world `points` in the Worker as a new mesh, one
+   * undo step (see `Scene.convexHullOfPoints`). The points are copied.
+   */
+  convexHullOfPoints(points: ConvexHullPoints, options?: ConvexHullOptions): Promise<ConvexHullResult> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        this.#alive();
+        const buf = hullPointsBuffer(points);
+        const normals = hullNormals(options);
+        added = this.#allocMeshState([0, 0, 0], normals);
+        return { kind: "convexHullPoints", rev, addedId: added.id, points: buf, normals, qid };
+      },
+      (v) => ({ mesh: (added as MeshState).handle, ...(v as Omit<ConvexHullResult, "mesh">) }),
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
   reconstructPointCloud(
     cloud: PackedPointCloud | Float32Array,
     options: SurfaceReconstructOptions = {},
@@ -3241,6 +3292,21 @@ export class WorkerScene implements SceneLike {
   /** Whether there is a step to redo, as of the latest result. */
   get canRedo(): boolean {
     return this.#history.canRedo;
+  }
+
+  // ---- Primitives ----
+
+  /**
+   * Generates a primitive shape in the Worker, as the standalone
+   * `generatePrimitive` does on a thread with the module initialised; the
+   * buffers are transferred back, and the scene is not touched. The shape is
+   * checked by type here, its ranges in the Worker.
+   *
+   * @throws (rejects) `INVALID_ARGUMENT` for an unknown kind or a parameter
+   * out of range; `OUT_OF_MEMORY` when the buffers cannot be allocated.
+   */
+  generatePrimitive(shape: PrimitiveShape): Promise<PrimitiveMesh> {
+    return this.#query("generatePrimitive", () => encodePrimitive(shape), (v) => v);
   }
 
   // ---- Fields and colours ----
@@ -3571,6 +3637,18 @@ export class WorkerScene implements SceneLike {
     return this.#query(
       "intersects",
       () => ({ a: this.#live(a).id, b: this.#live(b).id }),
+      (v) => v,
+    );
+  }
+
+  /**
+   * The live triangle slots of `mesh` that intersect or touch another of its
+   * own triangles, ascending; see `Scene.selfIntersectingTriangles`.
+   */
+  selfIntersectingTriangles(mesh: MeshHandle): Promise<Uint32Array> {
+    return this.#query(
+      "selfIntersectingTriangles",
+      () => ({ mesh: this.#live(mesh).id }),
       (v) => v,
     );
   }

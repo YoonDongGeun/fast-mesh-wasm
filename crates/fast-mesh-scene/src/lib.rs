@@ -27,6 +27,9 @@
 //! - Booleans: [`Scene::boolean`] unions, subtracts or intersects mesh B
 //!   into mesh A in the world; the result replaces A with A's placement,
 //!   as one undo step.
+//! - Convex hulls: [`Scene::convex_hull`] and [`Scene::convex_hull_points`]
+//!   add the exact convex hull of meshes or points as a new mesh, filled as
+//!   one undo step.
 //! - Registration: [`Scene::register`] rigidly aligns one mesh to another by
 //!   trimmed point-to-plane ICP from their current placements, and sets the
 //!   moving mesh's placement as one undo step when the result is good.
@@ -97,6 +100,7 @@ mod domains;
 mod error;
 mod fields;
 mod history;
+mod hull;
 mod id;
 mod join;
 mod normals;
@@ -133,6 +137,7 @@ pub use fields::{
     FieldStatus, GeodesicHeatSolver, GeodesicMethod, GeodesicOptions, OverhangOptions,
     OverhangReport, QualityMetric, QualityReport, StepState, ThicknessField,
 };
+pub use hull::ConvexHullReport;
 pub use id::MeshId;
 pub use join::{JoinOptions, JoinReport};
 pub use placement::Placement;

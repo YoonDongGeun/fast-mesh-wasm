@@ -17,6 +17,7 @@
 // `Port`, so it runs in a browser Worker or in Node `worker_threads`.
 import type { Range } from "../changes.js";
 import { FastMeshError } from "../core.js";
+import { generateEncodedPrimitive } from "../primitives-wasm.js";
 import {
   type EditOp,
   type FieldHandle,
@@ -885,6 +886,8 @@ class Engine {
       case "extractSelectedFaces":
       case "splitSelectedFaces":
       case "reconstructPointCloud":
+      case "convexHull":
+      case "convexHullPoints":
       case "punchDrainHole":
       case "placeMesh":
       case "moveWithCollision":
@@ -1971,6 +1974,19 @@ class Engine {
         b.replies.push({ qid: req.qid, ok: true, value: undefined });
         return;
       }
+      case "convexHull":
+      case "convexHullPoints": {
+        this.#ensureUnused(req.addedId);
+        const options = { normals: req.normals };
+        const r =
+          req.kind === "convexHull"
+            ? s.convexHull(this.#meshList(req.meshes), options)
+            : s.convexHullOfPoints(req.points, options);
+        this.#bindAdded(req.addedId, r.mesh);
+        const value = { inputPoints: r.inputPoints, vertices: r.vertices, triangles: r.triangles };
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
       case "hollowMesh": {
         const value = s.hollowMesh(this.#mesh(req.id), req.options);
         b.replies.push({ qid: req.qid, ok: true, value });
@@ -2140,6 +2156,7 @@ class Engine {
         };
         if (
           req.name === "verticesInSphere" ||
+          req.name === "selfIntersectingTriangles" ||
           req.name === "geodesicDistances" ||
           req.name === "selectFacesScreen" ||
           req.name === "selectFacesInSphere" ||
@@ -2176,6 +2193,10 @@ class Engine {
           pushOwned((value as QueryMap["triangleQuality"]["value"]).vertexQuality);
         } else if (req.name === "meshDeviation") {
           pushOwned((value as QueryMap["meshDeviation"]["value"]).vertexDeviations);
+        } else if (req.name === "generatePrimitive") {
+          const mesh = value as QueryMap["generatePrimitive"]["value"];
+          pushOwned(mesh.positions);
+          pushOwned(mesh.indices);
         }
         return;
       }
@@ -2338,6 +2359,10 @@ class Engine {
         const a = args as QueryMap["intersects"]["args"];
         return s.intersects(this.#mesh(a.a), this.#mesh(a.b));
       }
+      case "selfIntersectingTriangles": {
+        const a = args as QueryMap["selfIntersectingTriangles"]["args"];
+        return s.selfIntersectingTriangles(this.#mesh(a.mesh));
+      }
       case "findContacts": {
         const a = args as QueryMap["findContacts"]["args"];
         const pairs = a.pairs?.map(([x, y]): [MeshHandle, MeshHandle] => [this.#mesh(x), this.#mesh(y)]);
@@ -2457,6 +2482,8 @@ class Engine {
         const a = args as QueryMap["sliceContourStack"]["args"];
         return s.sliceContourStack(this.#mesh(a.mesh), a.origin, a.normal, a.spacing, a.count);
       }
+      case "generatePrimitive":
+        return generateEncodedPrimitive(args as QueryMap["generatePrimitive"]["args"]);
       case "debugDump": {
         if (!this.#debug) {
           throw invalid(`unknown query ${name}`);

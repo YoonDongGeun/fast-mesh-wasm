@@ -99,6 +99,7 @@ export function useFaceSelectionActions(app: AppState, store: SceneStore) {
     }));
   };
 
+  /** Runs one action at a time: reports its line, or its error under `label`. */
   const runAction = async (label: string, fn: () => Promise<string> | string) => {
     if (busy) {
       return;
@@ -320,6 +321,7 @@ export function useFaceSelectionActions(app: AppState, store: SceneStore) {
     hasRepair,
     canConvertFromMask,
     patchSelect,
+    runAction,
     onClear,
     onInvert,
     onGrow,

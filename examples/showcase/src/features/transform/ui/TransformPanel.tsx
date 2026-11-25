@@ -1,11 +1,14 @@
 // Numeric Transform & Scale panel (#195): unit-aware Position (X, Y, Z),
 // Euler Rotation (X, Y, Z) in degrees, Scale gizmo mode (S), and undoable
-// local-space mesh scaling synced live with selection placement and edits.
+// local-space mesh scaling synced live with selection placement and edits,
+// then the placement helpers (#256).
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { GizmoMode } from "../../../viewport/ui/Viewport";
 import { type AppState, useApp } from "../../../app/state/app-state";
+import { usePlacementHelpers } from "../ux/use-placement-helpers";
 import { useTransformFields } from "../ux/use-transform-fields";
 import { LengthInput } from "../../../shared/ui/LengthInput";
+import { PlacementHelpers } from "./PlacementHelpers";
 
 export function TransformPanel(props: {
   app: AppState;
@@ -21,6 +24,7 @@ export function TransformPanel(props: {
   const selectedItem = selection === null ? null : (items.find((i) => i.mesh === selection) ?? null);
 
   const fields = useTransformFields(store, selectedItem);
+  const placement = usePlacementHelpers(app, store, selectedItem, fields.rebaseScale);
   const { pos, rotDeg, scaleVal, uniformScale, busy, error, commitScale } = fields;
 
   return (
@@ -134,6 +138,8 @@ export function TransformPanel(props: {
               </button>
             </div>
           </div>
+
+          <PlacementHelpers helpers={placement} selectedItem={selectedItem} />
         </>
       )}
 

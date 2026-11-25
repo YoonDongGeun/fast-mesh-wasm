@@ -1,11 +1,13 @@
 // The shell's keyboard shortcuts, on the window: Ctrl+K (Cmd+K) toggles
 // command search anywhere; outside text fields Ctrl+Z / Ctrl+Shift+Z /
 // Ctrl+Y undo and redo, `/` opens command search, `?` toggles help, T/R/S
-// pick the gizmo mode, F frames the selection, W wireframes every mesh, and
-// Esc closes or disarms the topmost thing. Help's SHORTCUTS lists them.
+// pick the gizmo mode, F frames the selection, W wireframes every mesh, 1 / 3 / 7
+// (Shift: the opposite face) turn the view to a face preset, and Esc closes or
+// disarms the topmost thing. Help's SHORTCUTS lists them.
 import type { MeshHandle } from "fast-mesh-wasm";
 import { type Dispatch, type SetStateAction, useEffect } from "react";
 import { selectMesh } from "../../features/select/ux/selection";
+import { cameraPresetForKey } from "../../features/view/ux/navigation-hud";
 import type { GizmoMode } from "../../viewport/ui/Viewport";
 import type { AppState } from "../state/app-state";
 
@@ -48,6 +50,8 @@ export function useKeyboardShortcuts(opts: {
         redo();
       } else if (e.ctrlKey || e.metaKey || e.altKey) {
         // Other modified keys are the browser's.
+      } else if (cameraPresetForKey(e.code, e.shiftKey) !== null) {
+        app.requestCameraPreset(cameraPresetForKey(e.code, e.shiftKey)!);
       } else if (key === "/") {
         e.preventDefault();
         app.setCommandPaletteOpen(true);
@@ -76,6 +80,8 @@ export function useKeyboardShortcuts(opts: {
             app.disarmWave6Tools();
           } else if (snap.brushPick !== null) {
             app.setBrushPick(null);
+          } else if (snap.placementTool.pick !== null) {
+            app.setPlacementTool({ pick: null });
           } else {
             selectMesh(app, select, selection, null, false);
           }

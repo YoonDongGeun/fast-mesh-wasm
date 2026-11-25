@@ -5,7 +5,10 @@
 // object.
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { AppState, CameraPreset, DiagnosticShadingMode, Item, WorkbenchTab } from "../../app/state/app-state";
+import { createPrimitiveCommands } from "../../features/home/ux/create-commands";
 import { sculptBrush, type SculptTool } from "../../features/sculpt/ux/sculpt";
+import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
+import { triggerClick } from "./panel-triggers";
 import type { GizmoMode } from "../../viewport/ui/Viewport";
 
 export interface CommandPaletteItem {
@@ -140,6 +143,8 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
     });
   }
 
+  cmds.push(...createPrimitiveCommands(app));
+
   cmds.push(
     {
       id: "tool:sculpt-disarm",
@@ -243,6 +248,16 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
           deform: { ...prev.deform, activeTool: null },
           printPrep: { ...prev.printPrep, activeTool: null },
         }));
+        app.setActiveTab("select");
+      },
+    },
+    {
+      id: "tool:select-criteria",
+      title: "Select: Faces by Criteria",
+      category: "Tool",
+      keywords:
+        "select face criteria area facing camera overhang self intersecting degenerate sliver orientation inverted boundary sharp dihedral contact touching components",
+      run: () => {
         app.setActiveTab("select");
       },
     },
@@ -369,6 +384,15 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       },
     },
     {
+      id: "tool:inspect-maps",
+      title: "Inspect: Deviation, Overhang & Quality Maps",
+      category: "Tool",
+      keywords: "inspect map deviation tolerance reference overhang support build direction critical angle triangle quality aspect ratio minimum angle sliver",
+      run: () => {
+        app.setActiveTab("inspect");
+      },
+    },
+    {
       id: "tool:inspect-ruler",
       title: "Inspect: Measure Ruler",
       category: "Tool",
@@ -438,6 +462,21 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       run: ctx.onOpenHelp,
     },
   );
+
+  // The placement helpers press the transform panel's buttons (#256).
+  for (const c of PLACEMENT_COMMANDS) {
+    cmds.push({
+      id: `placement:${c.action}`,
+      title: c.label,
+      category: "Tool",
+      keywords: c.keywords,
+      disabled: selection === null,
+      run: () => {
+        app.setActiveTab("select");
+        triggerClick(`[data-placement-action="${c.action}"]`);
+      },
+    });
+  }
 
   for (const item of items) {
     cmds.push({

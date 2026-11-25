@@ -35,6 +35,24 @@ export {
   type Vec3,
 } from "./api.js";
 export { FastMeshError, type FastMeshErrorCode } from "./core.js";
+export type { ConvexHullOptions, ConvexHullPoints, ConvexHullResult } from "./hull.js";
+export {
+  type ArrowShape,
+  type BoxShape,
+  type ConeShape,
+  type CylinderShape,
+  type IcosphereShape,
+  type PlaneShape,
+  PRIMITIVE_SHAPE_KINDS,
+  type PrimitiveAxis,
+  type PrimitiveMesh,
+  type PrimitiveShape,
+  type PrimitiveShapeKind,
+  type PrismShape,
+  type TorusShape,
+  type UvSphereShape,
+} from "./primitives.js";
+export { generatePrimitive } from "./primitives-wasm.js";
 export type { SceneDomainsLike, SceneLike } from "./scene-like.js";
 export {
   type AdaptiveRemeshOptions,
