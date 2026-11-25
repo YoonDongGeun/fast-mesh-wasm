@@ -1002,8 +1002,8 @@ impl WasmScene {
     }
 
     /// A read-only report of the mesh's defects, laid out as in
-    /// [`crate::edit::encode_analysis`]. `weld_tolerance` (local units,
-    /// equal to world units) groups coincident vertices; lists with a count
+    /// [`crate::edit::encode_analysis`]. `weld_tolerance` (local units, before
+    /// the placement's scale) groups coincident vertices; lists with a count
     /// keep their first `max_listed` entries. `self_intersection` checks
     /// for self-intersection with the mesh's BVH, which is brought up to
     /// date first unless the mesh is Manual (then `STALE_BVH` when stale).
@@ -1072,8 +1072,8 @@ impl WasmScene {
     /// undo step, and nothing changes when an operation fails. `ops` (`f64`)
     /// and `loops` (`u32`, loop ids for fill holes) are laid out as in
     /// [`crate::edit`]; returns the reports concatenated in op order.
-    /// Lengths and areas in the options are in local units, equal to world
-    /// units.
+    /// Lengths and areas in the options are in local units, before the
+    /// placement's scale.
     pub fn repair(
         &mut self,
         index: u32,

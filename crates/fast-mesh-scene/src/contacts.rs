@@ -1169,7 +1169,7 @@ impl Scene {
             for v in 0..ei.mesh.vertex_slots() as u32 {
                 if ei.mesh.is_vertex_alive(v) {
                     let p = ei.mesh.positions()[v as usize].map(f64::from);
-                    found = Some(local_to_world(&ei.placement, ei.mesh.origin(), p));
+                    found = Some(ei.local_to_world(p));
                     break;
                 }
             }
@@ -1178,14 +1178,11 @@ impl Scene {
             };
             w
         };
-        let (pl, origin, has_tris) = {
-            let eo = self.entry(outer)?;
-            (eo.placement, eo.mesh.origin(), eo.mesh.triangle_count() > 0)
-        };
-        if !has_tris {
+        let eo = self.entry(outer)?;
+        if eo.mesh.triangle_count() == 0 {
             return Ok(false);
         }
-        let local64 = world_to_local(&pl, origin, sample_world);
+        let local64 = eo.world_to_local(sample_world);
         let sample_local = [local64[0] as f32, local64[1] as f32, local64[2] as f32];
         if !sample_local.iter().all(|c| c.is_finite()) {
             return Ok(false);
@@ -1932,7 +1929,7 @@ impl Scene {
                 continue;
             }
             let p = ec.mesh.positions()[v as usize].map(f64::from);
-            world_pts.push(local_to_world(&ec.placement, ec.mesh.origin(), p));
+            world_pts.push(ec.local_to_world(p));
         }
         self.evaluate_world_points_against_indenter(indenter, rule, &world_pts, push_fraction)
     }

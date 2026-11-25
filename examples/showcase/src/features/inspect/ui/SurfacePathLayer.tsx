@@ -71,6 +71,7 @@ export function SurfacePathLayer(props: { app: AppState; store: SceneStore }) {
     setFat(parts.pathEdge, both);
     setFat(parts.pathLine, both);
     setFat(parts.pathThrough, pathSegments(path, 0, around));
+    parts.iso.position.set(...tool.isoAround);
     setLines(parts.iso, tool.isoLines ?? new Float32Array(0));
 
     if (path !== null && path.legs.length > 0) {
@@ -80,7 +81,7 @@ export function SurfacePathLayer(props: { app: AppState; store: SceneStore }) {
     } else {
       parts.label.sprite.visible = false;
     }
-  }, [parts, tool.mesh, tool.sources, tool.path, tool.isoLines, items, units]);
+  }, [parts, tool.mesh, tool.sources, tool.path, tool.isoLines, tool.isoAround, items, units]);
 
   return <primitive object={parts.group} />;
 }

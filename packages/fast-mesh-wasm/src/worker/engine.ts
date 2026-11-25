@@ -2866,11 +2866,18 @@ class Engine {
         const section = this.#sectionIds.get(sh) as ClientId;
         const result = this.#sectionResult(sh, c.mesh);
         if (result !== null) {
-          for (const contour of result.contours) {
-            b.transfer.push(contour.points.buffer);
+          for (const { points, points64 } of result.contours) {
+            b.transfer.push(points.buffer);
+            if (points64 !== undefined) {
+              b.transfer.push(points64.buffer);
+            }
           }
           if (result.fill !== undefined) {
-            b.transfer.push(result.fill.positions.buffer, result.fill.indices.buffer);
+            const { positions, positions64, indices } = result.fill;
+            b.transfer.push(positions.buffer, indices.buffer);
+            if (positions64 !== undefined) {
+              b.transfer.push(positions64.buffer);
+            }
           }
         }
         sections.push({ section, mesh: id, result });

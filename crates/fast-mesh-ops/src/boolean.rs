@@ -77,7 +77,7 @@ pub struct BooleanOptions {
     pub coplanar_tolerance: f64,
     /// Whether to collapse short/needle triangles along boolean seam edges in `Manifold` mode.
     pub snap_slivers: bool,
-    /// Optional explicit voxel size for volumetric modes (`BvhSdf` / `FhEdt`).
+    /// Optional explicit voxel size for volumetric modes (`BvhSdf` / `FhEdt`) (local units).
     pub voxel_pitch: Option<f32>,
     /// Optional upper bound on output triangle count via bounded quadric simplification.
     pub max_triangles: Option<u32>,

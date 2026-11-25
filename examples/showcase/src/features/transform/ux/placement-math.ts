@@ -398,6 +398,33 @@ export function isIdentityPlacement(placement: PlacementLike): boolean {
   );
 }
 
+/** How many times its size the vertices may be from the mesh's origin: `f32` still holds them to 1/16384 of that size. */
+const BAKE_REACH = 1024;
+
+/**
+ * Apply transform: the translation that stays. Positions are `f32` offsets
+ * from the mesh's `origin`, which is for good, so the vertices at the world
+ * `positions` need one when they are far from it for their size; else it is
+ * zero. It puts their middle at the origin.
+ */
+export function keptTranslation(positions: ArrayLike<number>, origin: Readonly<Vec3>): Vec3 {
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < positions.length; i++) {
+    const k = i % 3;
+    min[k] = Math.min(min[k], positions[i]);
+    max[k] = Math.max(max[k], positions[i]);
+  }
+  const size = Math.max(...max.map((c, k) => c - min[k]));
+  const away = max.map((c, k) => (c + min[k]) / 2 - origin[k]) as Vec3;
+  return positions.length > 0 && away.some((c) => Math.abs(c) > BAKE_REACH * size) ? away : [0, 0, 0];
+}
+
+/** Whether `placement` is a translation alone. */
+export function isTranslation(placement: PlacementLike): boolean {
+  return isIdentityPlacement({ ...placement, translation: [0, 0, 0] });
+}
+
 /**
  * Apply transform: the live vertices and the world positions the placement
  * puts them at, for an edit's `setPositions` under the identity placement.

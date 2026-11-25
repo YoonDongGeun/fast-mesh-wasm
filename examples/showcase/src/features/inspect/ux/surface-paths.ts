@@ -58,8 +58,10 @@ export interface SurfacePathToolState {
   tracing: number;
   /** Why the latest pick or cut failed, if it did. */
   error: string | null;
-  /** The shown geodesic map's iso-lines: world segment endpoints, two points per segment. */
+  /** The shown geodesic map's iso-lines: segment endpoints, two points per segment, relative to `isoAround`. */
   isoLines: Float32Array | null;
+  /** The world point the iso-lines are drawn around. */
+  isoAround: Readonly<Vec3>;
 }
 
 export const DEFAULT_SURFACE_PATH_TOOL: SurfacePathToolState = {
@@ -71,6 +73,7 @@ export const DEFAULT_SURFACE_PATH_TOOL: SurfacePathToolState = {
   tracing: 0,
   error: null,
   isoLines: null,
+  isoAround: [0, 0, 0],
 };
 
 /** How far the path and the iso-lines are drawn off the surface, as a fraction of the mesh's radius. */

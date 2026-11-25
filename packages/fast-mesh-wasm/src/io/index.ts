@@ -27,6 +27,11 @@ export interface ExportOptions {
    * writing, so the file holds world coordinates. Defaults to `true`; pass
    * `false` for the local render coordinates in `views(mesh).positions()`.
    * Normals follow through the inverse-transpose rotation.
+   *
+   * Every format is written from `f32` positions: far from the world origin
+   * world ones are rounded to its steps there (0.008 at 1e5). The local ones
+   * are as precise as the mesh wherever it is; place the file by
+   * `scene.matrix4(mesh)`.
    */
   applyPlacement?: boolean;
 }
@@ -237,15 +242,16 @@ function applyMatrix(m: ArrayLike<number>, positions: Float32Array, normals: Flo
     return;
   }
   const s = 1 / det;
-  // Transposed cofactor matrix (already the inverse-transpose), row-major.
+  // The cofactors over the determinant, column-major like `m` (n01 is the
+  // second row of the first column).
   const n00 = a00 * s;
-  const n01 = (m02 * m21 - m01 * m22) * s;
-  const n02 = (m01 * m12 - m02 * m11) * s;
-  const n10 = a01 * s;
+  const n10 = (m02 * m21 - m01 * m22) * s;
+  const n20 = (m01 * m12 - m02 * m11) * s;
+  const n01 = a01 * s;
   const n11 = (m00 * m22 - m02 * m20) * s;
-  const n12 = (m02 * m10 - m00 * m12) * s;
-  const n20 = a02 * s;
-  const n21 = (m01 * m20 - m00 * m21) * s;
+  const n21 = (m02 * m10 - m00 * m12) * s;
+  const n02 = a02 * s;
+  const n12 = (m01 * m20 - m00 * m21) * s;
   const n22 = (m00 * m11 - m01 * m10) * s;
   for (let i = 0; i < normals.length; i += 3) {
     const x = normals[i];

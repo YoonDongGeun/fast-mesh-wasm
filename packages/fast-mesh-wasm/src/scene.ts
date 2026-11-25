@@ -732,8 +732,16 @@ export interface SectionContour {
   /**
    * World xyz, 3 floats per point. A copy. Where the plane passes exactly
    * through a vertex, the contour repeats that point (a zero-length segment).
+   * Rounded to `f32`: far from the world origin that is by up to half of its
+   * steps there (0.004 at 1e5). `points64` has them as precise as the mesh.
    */
   points: Float32Array;
+  /**
+   * The same points in `f64`, as precise as the mesh's own positions however
+   * far from the world origin it is. A copy. Always there on a result of this
+   * library.
+   */
+  points64?: Float64Array;
   closed: boolean;
 }
 
@@ -746,8 +754,12 @@ export interface SectionResult {
   length: number;
   /** Summed signed area of the closed, oriented contours (positive counter-clockwise about the normal). */
   area: number;
-  /** The filled cross-section, when the section has fill on and it was computed. */
-  fill?: { positions: Float32Array; indices: Uint32Array };
+  /**
+   * The filled cross-section, when the section has fill on and it was computed.
+   * `positions64` are its `positions` before they are rounded to `f32`, as
+   * `points64` are a contour's.
+   */
+  fill?: { positions: Float32Array; positions64?: Float64Array; indices: Uint32Array };
 }
 
 /** The closest pair between two meshes' contours, from {@link Scene.sectionGap}. */
@@ -1231,8 +1243,9 @@ export interface SliverOptions {
 
 /**
  * One repair operation for {@link Scene.repair}. Distances and areas are in
- * mesh units (equal to world units). They are converted to `f32`, so a
- * tolerance or area below the `f32` range rounds to 0.
+ * the mesh's own units: before its placement's scale, so equal to world units
+ * unless it has one. They are converted to `f32`, so a tolerance or area below
+ * the `f32` range rounds to 0.
  */
 export type RepairOp =
   | SculptOp
@@ -1305,8 +1318,8 @@ export type RepairOp =
   | {
       op: "shell";
       /**
-       * Wall thickness in mesh units (equal to world units): the input
-       * surface stays and gains a reversed copy one thickness against its
+       * Wall thickness in the mesh's own units (before its placement's
+       * scale): the input surface stays and gains a reversed copy one thickness against its
        * smooth normals, with every boundary rim stitched shut. Must be
        * positive and finite.
        */
@@ -1840,11 +1853,20 @@ export interface BooleanOptions {
   op?: BooleanOp;
   /** Exact topological arrangement (`"manifold"`, default) or volumetric Marching Cubes fallback (`"bvhSdf"`, `"fhEdt"`). */
   method?: BooleanMethod;
-  /** Coplanar facet snap/classification tolerance in mesh units. */
+  /**
+   * Coplanar facet snap/classification tolerance, in the units of the mesh
+   * the result replaces (before its placement's scale); in world units for
+   * {@link Scene.booleanBatch}.
+   */
   coplanarTolerance?: number;
   /** Collapse needle/sliver triangles created along cut seams (default `true`). */
   snapSlivers?: boolean;
-  /** Voxel pitch for `"bvhSdf"` / `"fhEdt"` volumetric fallback (defaults to automatic pitch). */
+  /**
+   * Voxel pitch for `"bvhSdf"` / `"fhEdt"` volumetric fallback (defaults to
+   * automatic pitch), in the same units as `coplanarTolerance`. The voxels lie
+   * along the axes of the mesh the result replaces, or the world's for
+   * {@link Scene.booleanBatch}.
+   */
   voxelPitch?: number;
   /** Optional target triangle budget for post-boolean simplification. */
   maxTriangles?: number;
@@ -2349,9 +2371,9 @@ function invalid(message: string): FastMeshError {
 }
 
 /**
- * The mean stretch of a column-major 4x4's linear part: the cube root of
- * its determinant. World-space brush radii divide by it, exact for rigid
- * placements and a documented approximation under non-uniform scale.
+ * The stretch of a column-major 4x4's linear part, a rotation and a uniform
+ * scale: the cube root of its determinant. World-space brush radii divide by
+ * it.
  */
 function meanStretch(m: Float64Array): number {
   const det =
@@ -5671,12 +5693,19 @@ export class Scene implements SceneLike {
       case "brush": {
         let center = spec.center;
         let radius = spec.radius;
+        let stretch: Float64Array | undefined;
         if (spec.space === "world") {
-          const inv = invertMatrix4(this.matrix4(mesh));
-          center = transformPoint(inv, spec.center);
-          radius = spec.radius / meanStretch(this.matrix4(mesh));
+          const matrix = this.matrix4(mesh);
+          center = transformPoint(invertMatrix4(matrix), spec.center);
+          const { scale } = this.placement(mesh);
+          if (scale === undefined || (scale[0] === scale[1] && scale[1] === scale[2])) {
+            radius = spec.radius / meanStretch(matrix);
+          } else {
+            // The world's ball is none in the mesh: distances are the world's.
+            stretch = matrix;
+          }
         }
-        ids = brushPick(positions, topology.used, center, radius);
+        ids = brushPick(positions, topology.used, center, radius, stretch);
         break;
       }
       case "lasso":
@@ -6155,7 +6184,8 @@ export class Scene implements SceneLike {
     let at = 4;
     for (let k = 0; k < r[3]; k++) {
       const n = 3 * r[at + 1];
-      contours.push({ closed: r[at] === 1, points: Float32Array.from(r.subarray(at + 2, at + 2 + n)) });
+      const points64 = r.slice(at + 2, at + 2 + n);
+      contours.push({ closed: r[at] === 1, points: Float32Array.from(points64), points64 });
       at += 2 + n;
     }
     const result: SectionResult = {
@@ -6166,10 +6196,11 @@ export class Scene implements SceneLike {
     };
     if (r[at] === 1) {
       const np = 3 * r[at + 1];
-      const positions = Float32Array.from(r.subarray(at + 2, at + 2 + np));
+      const positions64 = r.slice(at + 2, at + 2 + np);
+      const positions = Float32Array.from(positions64);
       at += 2 + np;
       const indices = Uint32Array.from(r.subarray(at + 1, at + 1 + 3 * r[at]));
-      result.fill = { positions, indices };
+      result.fill = { positions, positions64, indices };
     }
     return result;
   }
@@ -6196,7 +6227,10 @@ export class Scene implements SceneLike {
 
   // ---- #233 Face Selection ----
 
-  /** Selects triangles enclosed by or intersecting a screen-space rectangle or lasso in NDC. */
+  /**
+   * Selects triangles enclosed by or intersecting a screen-space rectangle or lasso in NDC. The
+   * camera is in world coordinates and taken in `f64`: see {@link ScreenSelectOptions.viewProj}.
+   */
   selectFacesScreen(mesh: MeshHandle, shape: ScreenSelectionShape, options: ScreenSelectOptions): Uint32Array {
     const { index, generation } = this.#id(mesh);
     const n = normalizeScreenSelectArgs(shape, options);
@@ -6432,7 +6466,10 @@ export class Scene implements SceneLike {
 
   // ---- #193 Free-Form Deformation ----
 
-  /** Builds a zero-offset world-aligned FFD lattice around `mesh`. */
+  /**
+   * Builds a zero-offset FFD lattice around `mesh`, in its local coordinates
+   * and along its own axes; `padding` is in its own units.
+   */
   buildFfdLattice(
     mesh: MeshHandle,
     dims: readonly [number, number, number],

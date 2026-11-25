@@ -5,7 +5,7 @@
 // iso-lines at a fixed spacing. Vertices no source reaches (another part of
 // the mesh) have no finite distance and show grey. No React and no three, so
 // vitest covers it; `use-geodesic-map.ts` wires it to the panel.
-import type { GeodesicMethod, MeshHandle, SceneLike } from "fast-mesh-wasm";
+import type { GeodesicMethod, MeshHandle, SceneLike, Vec3 } from "fast-mesh-wasm";
 import type { SurfaceColormap, SurfaceFieldOverlayData } from "../../../app/state/app-state";
 import { formatLength, type LengthUnit } from "../../../shared/ux/units";
 import { cssColor } from "./inspect-maps";
@@ -178,14 +178,15 @@ export function isoLevelSpacing(spacing: number, max: number): number {
 
 /**
  * The iso-lines of per-vertex `values` at every multiple of `spacing`
- * (zero excluded), as world line segments: two endpoints per segment, each
+ * (zero excluded), as line segments in the world: two endpoints per segment, each
  * `x, y, z`. Each triangle with three finite values that a level passes
  * strictly between its lowest and highest value adds one segment per level,
  * from the crossings on its two edges that straddle it. `positions` are the
  * mesh's local render positions and `matrix` its column-major world matrix
  * (`scene.matrix4`). With `offset > 0` every segment is drawn twice, moved
  * `offset` along the face's world normal and against it, so it shows over
- * the surface from either side.
+ * the surface from either side. The points are relative to the world point
+ * `around`: one near the mesh, so that `f32` holds them wherever it is.
  */
 export function isoLineSegments(
   positions: ArrayLike<number>,
@@ -194,20 +195,22 @@ export function isoLineSegments(
   values: ArrayLike<number>,
   spacing: number,
   offset = 0,
+  around: Readonly<Vec3> = [0, 0, 0],
 ): Float32Array {
   if (!(spacing > 0) || !Number.isFinite(spacing)) {
     return new Float32Array(0);
   }
   const m = matrix;
+  const [tx, ty, tz] = [m[12] - around[0], m[13] - around[1], m[14] - around[2]];
   const nv = Math.min(Math.floor(positions.length / 3), values.length);
   const world = new Float64Array(3 * nv);
   for (let i = 0; i < nv; i++) {
     const x = positions[3 * i];
     const y = positions[3 * i + 1];
     const z = positions[3 * i + 2];
-    world[3 * i] = m[0] * x + m[4] * y + m[8] * z + m[12];
-    world[3 * i + 1] = m[1] * x + m[5] * y + m[9] * z + m[13];
-    world[3 * i + 2] = m[2] * x + m[6] * y + m[10] * z + m[14];
+    world[3 * i] = m[0] * x + m[4] * y + m[8] * z + tx;
+    world[3 * i + 1] = m[1] * x + m[5] * y + m[9] * z + ty;
+    world[3 * i + 2] = m[2] * x + m[6] * y + m[10] * z + tz;
   }
   const copies = offset > 0 ? [offset, -offset] : [0];
   let out = new Float32Array(1024);

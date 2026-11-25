@@ -516,7 +516,7 @@ impl Scene {
         let entry = self.entry(id)?;
         if let Some(scale) = entry.placement.uniform_scale() {
             let local_center = vec3_to_f32(
-                world_to_local(&entry.placement, entry.mesh.origin(), world_center),
+                entry.world_to_local(world_center),
                 "sphere center in local space overflows f32",
             )?;
             let local_radius = (world_radius / scale) as f32;
@@ -862,7 +862,8 @@ impl Scene {
     // #193 Free-Form Deformation
     // -----------------------------------------------------------------------
 
-    /// Builds an identity-offset FFD control lattice tightly enclosing `id` in mesh-local coordinates.
+    /// Builds an identity-offset FFD control lattice tightly enclosing `id` in mesh-local
+    /// coordinates, as of its stored positions.
     pub fn build_ffd_lattice(
         &self,
         id: MeshId,
@@ -884,7 +885,8 @@ impl Scene {
         )?)
     }
 
-    /// Applies an atomic FFD, ARAP, Kelvinlet, or XPBD freeform deformation on `id`.
+    /// Applies an atomic FFD, ARAP, Kelvinlet, or XPBD freeform deformation on `id`, in
+    /// mesh-local coordinates, as of its stored positions.
     pub fn apply_freeform(&mut self, id: MeshId, op: &FreeformOp) -> Result<FreeformReport> {
         self.edit(id, |tx| apply_freeform(tx, op))
     }
@@ -1053,7 +1055,8 @@ impl Scene {
     // #236 Hollow, Drain Holes & Place Mesh
     // -----------------------------------------------------------------------
 
-    /// Hollows solid mesh `id` into an inner cavity shell in one undoable edit step.
+    /// Hollows solid mesh `id` into an inner cavity shell in one undoable edit step. The
+    /// options' lengths are in the mesh's own units, before its placement's scale.
     pub fn hollow_mesh(&mut self, id: MeshId, options: &HollowOptions) -> Result<HollowReport> {
         self.edit(id, |tx| hollow_mesh(tx, options))
     }

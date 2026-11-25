@@ -69,15 +69,15 @@ function rotate(q: Quat, v: Readonly<Vec3>): Vec3 {
  * detaches it (ending a drag in progress first).
  *
  * Pose and placement: `bound.object.matrix` is the scene mesh's
- * `matrix4 = placement · translate(origin)`, so with placement `(R, t)` the
- * object's quaternion is `R` and its position is `R · origin + t`. A pose is
- * therefore sent as `{ rotation: quaternion, translation: position − R · origin }`,
- * all in f64. The origin (fixed for the mesh) comes from the placement and
- * matrix at the start of each drag: `origin = Rᵀ (m − t)`, with `m` the
- * matrix's translation column.
+ * `matrix4 = placement · translate(origin)`, so with placement `(R, S, t)` the
+ * object's quaternion is `R` and its position is `R · (S · origin) + t`. A pose
+ * is therefore sent as `{ rotation: quaternion, translation: position −
+ * R · (S · origin), scale: S }`, all in f64. The scaled origin (fixed for the
+ * drag) comes from the placement and matrix at the start of each drag:
+ * `S · origin = Rᵀ (m − t)`, with `m` the matrix's translation column.
  *
- * Placements are rigid: TransformControls' scale mode has no effect (the
- * object's scale is kept at 1). The object must be a direct child of an
+ * A drag keeps the placement's scale: TransformControls' scale mode has no
+ * effect. The object must be a direct child of an
  * untransformed parent (its matrix is a world matrix), as for `bindMesh`;
  * a transformed ancestor is detected and warned about once.
  *
@@ -103,8 +103,10 @@ export function attachTransformControls(
   let drag: DragSession | undefined;
   /** True from a drag's start until the gizmo lets go, even if the scene ended the drag. */
   let grabbed = false;
-  /** The mesh origin during a drag: `Rᵀ (m − t)`. */
+  /** The scaled mesh origin during a drag: `Rᵀ (m − t)`. */
   let origin: Vec3 = [0, 0, 0];
+  /** The placement's scale during a drag. */
+  let scale: Vec3 = [1, 1, 1];
   let pending: Pose | undefined;
   let scheduled = false;
   let attached = true;
@@ -172,6 +174,7 @@ export function attachTransformControls(
       d.move({
         rotation: pose.rotation,
         translation: [pose.position[0] - r[0], pose.position[1] - r[1], pose.position[2] - r[2]],
+        scale,
       }),
     );
     if (!moved) {
@@ -194,6 +197,7 @@ export function attachTransformControls(
       const p = scene.placement(mesh);
       const m = scene.matrix4(mesh);
       const r = p.rotation;
+      scale = p.scale ?? [1, 1, 1];
       const d: Vec3 = [m[12] - p.translation[0], m[13] - p.translation[1], m[14] - p.translation[2]];
       // Rᵀ d, with R row-major.
       origin = [
@@ -245,8 +249,8 @@ export function attachTransformControls(
     }
     // The pose read below is a world pose only under untransformed parents.
     checkUntransformedParent(object);
-    // Rigid placements only: undo scale mode.
-    object.scale.set(1, 1, 1);
+    // The scale stays: undo scale mode.
+    object.scale.set(scale[0], scale[1], scale[2]);
     // The object shows the gizmo's pose right away (matrixAutoUpdate is off).
     object.updateMatrix();
     const q = object.quaternion;

@@ -108,7 +108,9 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   one for the origin (its plane becomes X = 0), and puts the datum origin where those planes meet at
   the world origin. *Up* picks the floor: Z = 0 (the default) or Y = 0. *Apply Transform* bakes
   the placement into the vertices (the world positions it gave them), so the placement becomes the
-  identity: the placement change and the vertex edit are one history step. The picks are engine
+  identity: the placement change and the vertex edit are one history step. Vertices are `f32` offsets
+  from the mesh's origin, which is for good: a mesh more than 1024 times its size from that keeps a
+  translation, so as not to lose its shape. The picks are engine
   raycasts on the selected mesh only; <kbd>Esc</kbd> cancels one. The math is in
   `src/features/transform/ux/placement-math.ts`.
 - **Build plate.** The Home tab's Build Plate panel (and shelf buttons) draws a grid rectangle on the

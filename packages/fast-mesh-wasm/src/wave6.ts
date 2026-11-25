@@ -79,9 +79,17 @@ export type ScreenSelectionShape =
 
 /** World-space camera and visibility options for {@link Scene.selectFacesScreen}. */
 export interface ScreenSelectOptions {
-  /** Column-major 4×4 view-projection matrix (16 finite numbers). */
+  /**
+   * Column-major 4×4 view-projection matrix (16 finite numbers), of world points.
+   *
+   * It is taken in `f64`. Give it so (an array of numbers or a `Float64Array`, multiplied in `f64`)
+   * for a camera far from the world origin: a `Float32Array` holds it only to the steps of `f32`
+   * there (0.008 at 1e5).
+   */
   viewProj: ReadonlyArray<number> | Float32Array | Float64Array;
+  /** Where the camera is in the world. */
   cameraOrigin: Readonly<Vec3>;
+  /** Where it looks in the world, of any length. */
   cameraForward: Readonly<Vec3>;
   isOrthographic?: boolean;
   visibleOnly?: boolean;
@@ -222,14 +230,14 @@ export type ArapWeights = "cotangent" | "uniform";
 export type ArapSolver = "auto" | "direct" | "pcg";
 export type KelvinletScale = "single" | "bi" | "tri";
 
-/** World-space oriented box frame for an FFD lattice. */
+/** Oriented box frame for an FFD lattice, in local mesh coordinates, as in `views(mesh).positions()`. */
 export interface FfdFrameData {
   center: Vec3;
   axes: [Vec3, Vec3, Vec3];
   halfExtents: Vec3;
 }
 
-/** 3D Free-Form Deformation control lattice and control-point offsets. */
+/** 3D Free-Form Deformation control lattice and control-point offsets, in local mesh coordinates. */
 export interface FfdLatticeData {
   dims: [number, number, number];
   basis: FfdBasis;
@@ -251,7 +259,12 @@ export interface FreeformProtection {
   weights?: Float32Array | ArrayLike<number>;
 }
 
-/** Optional spatial region, vertex subset, and protection filter shared across freeform deformers. */
+/**
+ * Optional spatial region, vertex subset, and protection filter shared across freeform deformers.
+ *
+ * Every point, vector and length the deformers take or report is in local mesh coordinates, as in
+ * `views(mesh).positions()`: relative to the mesh's origin, before its placement.
+ */
 export interface FreeformScope {
   region?: { center: Readonly<Vec3>; radius: number };
   vertices?: Indices;
@@ -318,7 +331,7 @@ export interface XpbdHandleInput {
   compliance?: number;
 }
 
-/** Options for {@link Scene.applyXpbd}. */
+/** Options for {@link Scene.applyXpbd}, in local mesh coordinates and units (see {@link FreeformScope}). */
 export interface XpbdOptions {
   substeps?: number;
   iterations?: number;
@@ -1449,6 +1462,7 @@ export type HollowBackend = "bvhSdf" | "fhEdt";
 export type PlaceUpAxis = "negZ" | "posZ" | "posY" | "negY";
 export type PlaceMode = "keepSeparate" | "appendShell" | "embedUnion" | "engraveSubtract";
 
+/** Options for {@link Scene.hollowMesh}; lengths and volumes in the mesh's own units, before its placement's scale. */
 export interface HollowOptions {
   wallThickness: number;
   backend?: HollowBackend;

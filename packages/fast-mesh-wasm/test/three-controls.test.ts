@@ -68,12 +68,12 @@ afterEach(() => {
  * A scene with a box mesh (origin away from zero) at a rotated placement and
  * no history, bound and attached to mock controls with a hand-run scheduler.
  */
-function setup() {
+function setup(scale?: Vec3) {
   const s = new Scene();
   scenes.push(s);
   const g = box([2, -1, 0.5], [1, 3, 2]);
   const m = s.addMesh(g.positions, g.indices);
-  s.setPlacement(m, { rotation: QUARTER_Z, translation: [1, 2, 3] });
+  s.setPlacement(m, { rotation: QUARTER_Z, translation: [1, 2, 3], ...(scale === undefined ? {} : { scale }) });
   s.clearHistory();
   const bound = bindMesh(s, m);
   s.commitFrame();
@@ -113,6 +113,33 @@ describe("attachTransformControls", () => {
     // TransformControls reads position/quaternion when a drag starts.
     expectPoseMatchesScene(s, m, bound);
     expect(bound.object.position.length()).toBeGreaterThan(0);
+  });
+
+  it("a drag keeps the placement's scale (#289)", () => {
+    const { s, m, bound, controls, runFrames } = setup([2, 0.5, 3]);
+    const start = s.placement(m);
+    expect(start.scale).toEqual([2, 0.5, 3]);
+    expectPoseMatchesScene(s, m, bound);
+    const q = quat([1, 1, 0], 0.7);
+    for (let grab = 0; grab < 2; grab++) {
+      controls.setDragging(true);
+      controls.moveObject([4, 5, 6], q);
+      // It shows its scale while the gizmo leads.
+      const shown = new THREE.Matrix4().compose(new THREE.Vector3(4, 5, 6), q, new THREE.Vector3(2, 0.5, 3));
+      expectClose(bound.object.matrix.elements, shown.elements);
+      runFrames();
+      s.commitFrame();
+      expect(s.placement(m).scale).toEqual([2, 0.5, 3]);
+      controls.setDragging(false);
+      s.commitFrame();
+      // The object is where the gizmo has it, the mesh under it.
+      expectClose(bound.object.position.toArray(), [4, 5, 6]);
+      expectPoseMatchesScene(s, m, bound);
+    }
+    s.undo();
+    s.commitFrame();
+    expect(s.placement(m)).toEqual(start);
+    expectPoseMatchesScene(s, m, bound);
   });
 
   it("drag_maps_to_one_undo_step", () => {

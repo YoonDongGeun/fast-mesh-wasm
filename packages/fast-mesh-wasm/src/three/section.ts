@@ -25,7 +25,9 @@ export interface BoundSection {
    * Add it to the THREE.Scene, untransformed (results are in world
    * coordinates; a transformed ancestor is detected and warned about once).
    * Per bound mesh the section cuts, it holds a `LineSegments` of the contours
-   * and a `Mesh` of the fill (empty while the section has no fill).
+   * and a `Mesh` of the fill (empty while the section has no fill). Far from
+   * the world origin their matrices are translations, and their positions
+   * offsets from there.
    */
   readonly group: THREE.Group;
   /**
@@ -53,11 +55,31 @@ interface Entry {
   fill: THREE.Mesh;
 }
 
+/** The spacing of the points to draw around: offsets stay below half of it, plus what is drawn. */
+const STEP = 1024;
+
+/**
+ * A point near a result to draw around: zero for one near the world origin, so
+ * that it is drawn at its coordinates. Far from there `f32` buffers hold world
+ * coordinates only to its steps (0.008 at 1e5); an object's matrix does not.
+ */
+function drawOrigin(result: SectionResult): THREE.Vector3 {
+  const first = result.contours.find((c) => c.points.length > 0)?.points ?? [0, 0, 0];
+  const at = (k: number) => Math.round(first[k] / STEP) * STEP + 0;
+  return new THREE.Vector3(at(0), at(1), at(2));
+}
+
+/** World points, less `origin`. */
+function offsets(points: ArrayLike<number>, origin: THREE.Vector3): Float32Array {
+  const o = [origin.x, origin.y, origin.z];
+  return Float32Array.from(points, (c, i) => c - o[i % 3]);
+}
+
 /**
  * Line segment endpoints of a result's contours: consecutive point pairs,
- * plus the last-to-first pair of a closed contour.
+ * plus the last-to-first pair of a closed contour; less `origin`.
  */
-function segments(result: SectionResult): Float32Array {
+function segments(result: SectionResult, origin: THREE.Vector3): Float32Array {
   let count = 0;
   for (const c of result.contours) {
     const n = c.points.length / 3;
@@ -65,7 +87,9 @@ function segments(result: SectionResult): Float32Array {
   }
   const out = new Float32Array(count * 6);
   let at = 0;
-  for (const { points, closed } of result.contours) {
+  for (const contour of result.contours) {
+    const { closed } = contour;
+    const points = offsets(contour.points64 ?? contour.points, origin);
     const n = points.length / 3;
     if (n < 2) {
       continue;
@@ -156,10 +180,16 @@ export function bindSection(
     const lines = new THREE.BufferGeometry();
     const fill = new THREE.BufferGeometry();
     if (result !== null) {
-      lines.setAttribute("position", new THREE.BufferAttribute(segments(result), 3));
+      const around = drawOrigin(result);
+      for (const object of [e.lines, e.fill]) {
+        object.matrix.makeTranslation(around);
+        object.matrixWorldNeedsUpdate = true;
+      }
+      lines.setAttribute("position", new THREE.BufferAttribute(segments(result, around), 3));
       if (result.fill !== undefined) {
-        fill.setAttribute("position", new THREE.BufferAttribute(result.fill.positions, 3));
-        fill.setIndex(new THREE.BufferAttribute(result.fill.indices, 1));
+        const { positions, positions64, indices } = result.fill;
+        fill.setAttribute("position", new THREE.BufferAttribute(offsets(positions64 ?? positions, around), 3));
+        fill.setIndex(new THREE.BufferAttribute(indices, 1));
       }
     }
     lines.computeBoundingSphere();

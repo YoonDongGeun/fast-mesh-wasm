@@ -20,7 +20,7 @@ use fast_mesh_store::{StoreError, Transaction, TriangleId, VertexId};
 use crate::baked::baked_in_place;
 use crate::curve_surface::{CurvePoint, CurveSurface, Fans, distinct};
 use crate::ops::{CutOptions as OpsCutOptions, cut_by_plane as ops_cut_by_plane};
-use crate::placement::{local_to_world, plane_to_local, world_to_local};
+use crate::placement::{local_to_world, plane_to_local};
 use crate::{MeshId, MeshOptions, Plane, Result, Scene, SceneError};
 
 /// What to cut: a world plane and whether to cap.
@@ -238,8 +238,7 @@ impl Scene {
             };
             let mut points = Vec::with_capacity(options.points.len());
             for &world_pt in &options.points {
-                let local = world_to_local(&entry.placement, entry.mesh.origin(), world_pt)
-                    .map(|c| c as f32);
+                let local = entry.world_to_local(world_pt).map(|c| c as f32);
                 let at = match &baked {
                     Some((copy, _)) => {
                         let o = copy.origin();

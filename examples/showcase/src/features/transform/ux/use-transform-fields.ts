@@ -77,7 +77,9 @@ export function useTransformFields(store: SceneStore, selectedItem: Item | null)
   const commitPlacement = (nextPos: [number, number, number], nextRotDeg: [number, number, number]) => {
     if (selectedItem === null) return;
     setError(null);
-    store.setPlacement(selectedItem.mesh, valuesToPlacement({ position: nextPos, rotationDeg: nextRotDeg }));
+    const { mesh } = selectedItem;
+    const values = { position: nextPos, rotationDeg: nextRotDeg };
+    store.setPlacement(mesh, valuesToPlacement(values, store.scene.placement(mesh)));
     setPos(nextPos);
     setRotDeg(nextRotDeg);
   };

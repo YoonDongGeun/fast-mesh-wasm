@@ -9,7 +9,7 @@ import { attachTransformControls, type MeshBinding } from "fast-mesh-wasm/three"
 import { useCallback, useEffect, useState } from "react";
 import type { TrackballControls } from "three/addons/controls/TrackballControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
-import { applyMeshScale } from "../../features/transform/ux/transform-math";
+import { applyMeshScale, scaleFactor } from "../../features/transform/ux/transform-math";
 import type { GizmoMode } from "../ui/Viewport";
 import { isExtraFinger } from "./touch";
 import { setDragging, view } from "./view";
@@ -85,15 +85,18 @@ export function useGizmoDrag(params: {
     if (isScale) {
       controls.setMode("scale");
     }
+    // What the object has before a scale drag: not 1 on a mesh with a scale of its own.
+    const startScale = bound.object.scale.clone();
     const onDragging = (e: { value: unknown }) => {
       const active = e.value === true;
       orbit.enabled = !active;
       setDragging(active);
+      if (isScale && active) {
+        startScale.copy(bound.object.scale);
+      }
       if (isScale && !active) {
-        const sx = bound.object.scale.x;
-        const sy = bound.object.scale.y;
-        const sz = bound.object.scale.z;
-        bound.object.scale.set(1, 1, 1);
+        const [sx, sy, sz] = scaleFactor(startScale, bound.object.scale);
+        bound.object.scale.copy(startScale);
         if (
           Number.isFinite(sx) &&
           Number.isFinite(sy) &&
@@ -117,7 +120,7 @@ export function useGizmoDrag(params: {
       canvas.removeEventListener("pointercancel", onCancel);
       controls.removeEventListener("dragging-changed", onDragging);
       detach?.();
-      bound.object.scale.set(1, 1, 1);
+      bound.object.scale.copy(startScale);
       controls.detach();
       scene.remove(helper);
       controls.dispose();

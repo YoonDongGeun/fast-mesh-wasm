@@ -389,6 +389,35 @@ fn extruded_bases() {
     }
 }
 
+/// The largest loop is the world's: the strip along x, whatever the mesh's own
+/// coordinates make of it.
+#[test]
+fn extruded_base_of_the_largest_loop() {
+    let strip = |x: f64, y: f64, z: f64| Shape {
+        points: vec![[0.0, 0.0, z], [x, 0.0, z], [x, y, z], [0.0, y, z]],
+        triangles: vec![[0, 1, 2], [0, 2, 3]],
+    };
+    let mut shape = strip(3.0, 0.4, 0.0);
+    let other = strip(0.3, 2.9, 0.0).moved([0.5, 1.0, 0.2]);
+    shape.points.extend(other.points);
+    shape
+        .triangles
+        .extend(other.triangles.iter().map(|t| t.map(|v| v + 4)));
+    agree("extrude_base", 2e-5, |put| {
+        let mut s = scene();
+        let id = put.add(&mut s, &shape);
+        let options = ExtrudeBaseOptions {
+            direction: [0.0, 0.0, -1.0],
+            plane: BasePlane::Below(0.5),
+            loops: BaseLoops::Largest,
+            refine: false,
+            check_self_intersections: false,
+        };
+        s.extrude_base(id, &options).unwrap();
+        with_history(&mut s, id, put)
+    });
+}
+
 #[test]
 fn hulls() {
     agree_pairs("convex_hull", TOL, |pa, pb| {

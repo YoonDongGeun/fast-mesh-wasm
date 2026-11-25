@@ -143,6 +143,37 @@ describe("io export", () => {
     expect(triangleSet(positions, indices)).toEqual(EXPECTED);
   });
 
+  it("normals_follow_a_turned_and_unevenly_scaled_placement", () => {
+    // The quad's plane, turned about z and x and stretched; its normals must
+    // stay perpendicular to it, on the side its triangles face (#289).
+    const [cz, sz, cx, sx] = [Math.cos(0.4), Math.sin(0.4), Math.cos(-0.7), Math.sin(-0.7)];
+    const rotation = [cz, -sz, 0, cx * sz, cx * cz, -sx, sx * sz, sx * cz, cx];
+    for (const scale of [[1, 1, 1], [2, 2, 2], [2, 1.5, 0.5]]) {
+      const tilted = Float32Array.from([0, 0, 0, 2, 0, 0.6, 2, 2, 1.4, 0, 2, 0.8, 9, 9, 9]);
+      const n = [-0.3, -0.4, 1].map((c) => c / Math.hypot(0.3, 0.4, 1));
+      const normals = Float32Array.from({ length: 15 }, (_, k) => n[k % 3]);
+      const matrix = Float64Array.from({ length: 16 }, (_, k) => {
+        const [col, row] = [k >> 2, k % 4];
+        return col === 3 ? [7, -8, 9, 1][row] : row === 3 ? 0 : rotation[3 * row + col] * scale[col];
+      });
+      const scene = new FakeScene(tilted, QUAD_TRIS, normals, null, matrix);
+      const text = new TextDecoder().decode(exportOBJ(scene, scene.mesh));
+      const rows = (key: string) =>
+        text
+          .split("\n")
+          .filter((l) => l.startsWith(`${key} `))
+          .map((l) => l.split(" ").slice(1).map(Number));
+      const [a, b, c] = rows("v");
+      const [u, v] = [b.map((x, k) => x - a[k]), c.map((x, k) => x - a[k])];
+      const facet = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+      const length = Math.hypot(...facet);
+      expect(rows("vn").length).toBe(4);
+      for (const got of rows("vn")) {
+        for (let k = 0; k < 3; k++) expect(got[k]).toBeCloseTo(facet[k] / length, 5);
+      }
+    }
+  });
+
   it("obj_without_normals_or_colors", () => {
     const scene = new FakeScene(QUAD, QUAD_TRIS, null, null);
     const text = new TextDecoder().decode(exportOBJ(scene, scene.mesh));
