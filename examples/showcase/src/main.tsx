@@ -42,12 +42,13 @@ async function createEngine(): Promise<{ store: SceneStore; engine: Engine }> {
 const root = createRoot(document.getElementById("root")!);
 
 async function start(): Promise<void> {
-  // The first screen's panels, and the volume panel of the mesh it boots onto,
-  // arrive while the engine starts.
-  preloadTab("home");
-  preloadTab("volume");
   try {
-    const { store, engine } = await createEngine();
+    const starting = createEngine();
+    // The first screen's panels, and the volume panel of the mesh it boots
+    // onto, arrive while the engine starts.
+    preloadTab("home");
+    preloadTab("volume");
+    const { store, engine } = await starting;
     const app = new AppState(loadSettings());
     // `?decimate=0` opts out of decimate-on-load (for testing; see load/big-file.ts).
     // An explicit param wins over the stored prefs; otherwise they stand.

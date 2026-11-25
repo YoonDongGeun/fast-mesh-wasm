@@ -134,7 +134,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { launchChrome, startServer } from "./chrome-cdp.mjs";
+import { launchChrome, SHOWCASE_READY, startServer } from "./chrome-cdp.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const example = join(root, "examples", "showcase");
@@ -447,7 +447,7 @@ const q = JSON.stringify;
 
 try {
   const query = threads === undefined ? "" : `?threads=${threads}`;
-  await browser.goto(`http://127.0.0.1:${port}/${query}`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/${query}`, SHOWCASE_READY);
 
   // ---- page ----
   const info = await page(`({
@@ -1551,7 +1551,7 @@ try {
   // A fresh page: 1 in cubes loaded "as inches", a known gap, known area and
   // volume. Every expected string is written out: 1 in = 25.4 mm,
   // 1 in² = 645.16 mm², 1 in³ = 16387.064 mm³.
-  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/`, SHOWCASE_READY);
   const bootHead = await waitFor(`__showcase.items().find((m) => m.name.includes("headsq") && m.drawn)?.name`, 60_000);
   await clickOn(`[data-mesh=${q(bootHead)}] button.danger`);
   await waitFor(`__showcase.items().length === 0`, 10_000);
@@ -1774,7 +1774,7 @@ try {
   // The global default survives a reload; Reset settings restores mm.
   await useInches(); // the project's in -> mm, by hand
   await useInches(); // -> in, by hand: the default too
-  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/`, SHOWCASE_READY);
   const reloaded = await hook("units()");
   const buttonText = await textOf("[data-action=units]");
   await clickOn("[data-action=reset-settings]");
@@ -1790,7 +1790,7 @@ try {
 
   // ---- previews: each built-in model's picture, and the loaded meshes' ----
   {
-  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/`, SHOWCASE_READY);
   await waitFor(`__showcase.items().find((m) => m.name.includes("headsq") && m.drawn)`, 60_000);
   // Decoded to premultiplied RGBA at the picture's size, so empty pixels compare equal.
   await page(`(() => {
@@ -2006,7 +2006,7 @@ try {
   }
 
   // ---- local: ?local, the synchronous Scene on the main thread ----
-  await browser.goto(`http://127.0.0.1:${port}/?local`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/?local`, SHOWCASE_READY);
   await waitFor(`document.querySelector("[data-action=demo-meshes]") !== null`, 10_000);
   await clickOn("[data-action=demo-meshes]");
   const localDemo = await waitFor(

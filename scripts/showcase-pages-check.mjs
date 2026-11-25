@@ -30,7 +30,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchChrome } from "./chrome-cdp.mjs";
+import { launchChrome, SHOWCASE_READY } from "./chrome-cdp.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const example = join(root, "examples", "showcase");
@@ -145,7 +145,7 @@ async function settle(browser, quiet = 3000) {
     seen = navigations;
     await sleep(quiet);
   }
-  return waitFor(browser, "window.__showcase !== undefined && document.readyState === 'complete'", 30_000);
+  return waitFor(browser, `${SHOWCASE_READY} && document.readyState === 'complete'`, 30_000);
 }
 
 /** The page's isolation and thread count, then the head boot, the demo meshes and the A-B heatmap. */

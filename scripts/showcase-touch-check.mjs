@@ -56,7 +56,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchChrome, startServer } from "./chrome-cdp.mjs";
+import { launchChrome, SHOWCASE_READY, startServer } from "./chrome-cdp.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const example = join(root, "examples", "showcase");
@@ -300,7 +300,7 @@ async function checkLayout(name, minWidth, minHeight) {
 try {
   await metrics(390, 844);
   await browser.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
-  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/`, SHOWCASE_READY);
   await page(`window.__showcase_canvas = () => document.querySelector(".viewport canvas")`);
   const media = await page(`({ coarse: matchMedia("(pointer: coarse)").matches, touch: navigator.maxTouchPoints, gl: !!document.createElement("canvas").getContext("webgl2") })`);
   console.log(`${browser.name}; pointer: coarse ${media.coarse}; maxTouchPoints ${media.touch}; WebGL2 ${media.gl}`);

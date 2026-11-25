@@ -25,7 +25,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { ISOLATION, launchChrome, serveStatic } from "./chrome-cdp.mjs";
+import { ISOLATION, launchChrome, serveStatic, SHOWCASE_READY } from "./chrome-cdp.mjs";
 
 const argv = process.argv.slice(2);
 const opt = (name, fallback) => {
@@ -172,7 +172,7 @@ function printProfile(profile) {
 
 /** Loads the sphere in `mode` and frames it, with the boot head gone. */
 async function load(mode, path) {
-  await browser.goto(`${server.url}/?decimate=0${mode === "sync" ? "&local" : ""}`, "window.__showcase !== undefined");
+  await browser.goto(`${server.url}/?decimate=0${mode === "sync" ? "&local" : ""}`, SHOWCASE_READY);
   const { root: doc } = await browser.send("DOM.getDocument", { depth: 0 });
   const { nodeId } = await browser.send("DOM.querySelector", { nodeId: doc.nodeId, selector: "#file-input" });
   await browser.send("DOM.setFileInputFiles", { nodeId, files: [path] });
@@ -196,7 +196,7 @@ async function load(mode, path) {
 async function verifyOnDemo(check) {
   const name = "B · rounded box";
   const q = JSON.stringify(name);
-  await browser.goto(`${server.url}/`, "window.__showcase !== undefined");
+  await browser.goto(`${server.url}/`, SHOWCASE_READY);
   await waitFor(`__showcase.items().some((m) => m.name.includes("headsq") && m.drawn)`);
   await clickOn('[data-action="demo-meshes"]');
   await waitFor(`__showcase.items().filter((m) => m.drawn).length >= 3`);

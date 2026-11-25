@@ -5,22 +5,14 @@
 //
 // Not React.lazy: nothing suspends (a part that arrives inside the canvas
 // leaves the canvas and its other layers alone), no fallback shows for a frame
-// once the chunk is here, and a failed import is not for good. The content
-// mounts in a transition, so a panel that arrives does not hold up a frame.
-import { type ComponentType, startTransition, useEffect, useLayoutEffect, useState } from "react";
+// once the chunk is here, and a failed import is not for good. Not a transition either:
+// one that edits or a drag keep interrupting would not finish.
+import { type ComponentType, useEffect, useLayoutEffect, useSyncExternalStore } from "react";
 import { type ChunkState, type LazyChunk, waitForChunk } from "../ux/lazy-chunk";
 
 /** The chunk's state, as the part shows it. */
 function useChunk<M>(chunk: LazyChunk<M>): ChunkState<M> {
-  const [state, setState] = useState(chunk.getSnapshot);
-  useEffect(() => {
-    const follow = () => {
-      const next = chunk.getSnapshot();
-      startTransition(() => setState(next));
-    };
-    follow(); // it may have moved on since the render
-    return chunk.subscribe(follow);
-  }, [chunk]);
+  const state = useSyncExternalStore(chunk.subscribe, chunk.getSnapshot, chunk.getSnapshot);
   const here = state.status === "ready";
   // A layout effect: a command run right after the mount already finds it waiting.
   useLayoutEffect(() => (here ? undefined : waitForChunk(chunk)), [chunk, here]);
