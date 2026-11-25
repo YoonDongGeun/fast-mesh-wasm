@@ -29,6 +29,10 @@
 // - select: a click on A in the canvas selects it.
 // - face-select: through the Select tab's panel on A, a box drag selects some
 //   faces, a shell click all of them, grow and clear work.
+// - remove-last: on a fresh page, removing the only mesh (the boot head) enables
+//   Undo, and Undo brings it back.
+// - permanent: with 1 MiB of undo memory (?history=1), removing it is permanent,
+//   and the status bar says so.
 // - multiselect: shift-clicking B adds it (the primary stays A), and the
 //   Repair panel seeds its Join source from the queue.
 // - drag: dragging the gizmo's centre handle moves A (one undo step).
@@ -2040,6 +2044,27 @@ try {
   );
   verdict("previews-empty", typeof emptied === "string" && backAgain === true, `emptied: ${q(emptied ?? null)}; back after Undo: ${backAgain === true}`);
   }
+
+  // ---- remove-last, permanent: the only mesh leaves ----
+  const boots = async (query) => {
+    await browser.goto(`http://127.0.0.1:${port}/${query}`, SHOWCASE_READY);
+    await waitFor(`__showcase.items().length === 1 && __showcase.status().status === "idle"`, 30_000);
+    await clickOn("button.danger[title='Remove the mesh']");
+    return waitFor("__showcase.items().length === 0", 5000);
+  };
+  const left = await boots("");
+  const undoable = await waitFor("__showcase.status().canUndo", 5000);
+  await clickOn("[data-action=undo]");
+  const returned = await waitFor("__showcase.items().length === 1", 10_000);
+  verdict("remove-last", left === true && undoable === true && returned === true, `removed ${left}, undo enabled ${undoable}, back ${returned}`);
+  const gone = await boots("?history=1");
+  const notice = await waitFor(`document.querySelector("[data-history-notice]")?.textContent`, 5000);
+  const undo = (await hook("status()")).canUndo;
+  verdict(
+    "permanent",
+    gone === true && typeof notice === "string" && notice.includes("cannot be undone") && undo === false,
+    `notice ${JSON.stringify(notice ?? null)}; canUndo ${undo}`,
+  );
 
   // ---- local: ?local, the synchronous Scene on the main thread ----
   await browser.goto(`http://127.0.0.1:${port}/?local`, SHOWCASE_READY);

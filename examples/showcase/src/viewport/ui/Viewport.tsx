@@ -12,7 +12,7 @@
 // chunks (`app/ui/feature-parts`): each draws nothing until it is here.
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
-import { FastMesh } from "fast-mesh-wasm/r3f";
+import { FastMesh, useFrameDriver } from "fast-mesh-wasm/r3f";
 import { useScene, useSelection, useStoreSelector } from "fast-mesh-wasm/react";
 import { meshState } from "fast-mesh-wasm/store";
 import type { MeshBinding } from "fast-mesh-wasm/three";
@@ -166,6 +166,7 @@ export function Viewport(props: {
 
   return (
     <Canvas camera={{ position: [-0.6, 3.4, 8.2], fov: 45, near: 0.01, far: 5000 }} onPointerMissed={onMissed}>
+      <FrameDriver />
       <color attach="background" args={["#1b1e23"]} />
       <hemisphereLight args={["#e8eef8", "#30343c", 1.1]} />
       <directionalLight position={[3, 6, 4]} intensity={2} />
@@ -246,6 +247,16 @@ export function Viewport(props: {
 }
 
 /** The canvas's pointerdowns, recorded for the missed click (`usePressTracker`). */
+/**
+ * Commits the store's frame with every rendered one, also while the scene has
+ * no mesh: each `<FastMesh>` does, but the last one leaves with its mesh, and
+ * the removal itself (and an undo of it) would never be sent.
+ */
+function FrameDriver() {
+  useFrameDriver();
+  return null;
+}
+
 function MissTracker(props: { track: { current: { x: number; y: number } | null } }) {
   usePressTracker(props.track);
   return null;
