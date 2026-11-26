@@ -13,9 +13,10 @@ use proptest::test_runner::RngSeed;
 use crate::normals::NormalState;
 use crate::scene::fault;
 use crate::{
-    CollisionMode, CollisionRule, ColorRule, Coloring, CsgNode, CutOptions, DistanceField, FieldId,
-    MeshBuild, MeshId, MeshOptions, Placement, Plane, Scene, SceneClosestOptions, SceneError,
-    SceneOptions, SectionDesc, SignMode, SubscriberId, ThicknessField, UpdateMode,
+    CollisionMode, CollisionRule, ColorRule, Coloring, CsgNode, CutOptions, DistanceField,
+    EntryEvent, FieldId, HistoryEntry, MeshBuild, MeshId, MeshOptions, Placement, Plane, Scene,
+    SceneClosestOptions, SceneError, SceneOptions, SectionDesc, SignMode, SubscriberId,
+    ThicknessField, UpdateMode,
 };
 
 fn grid(n: u32) -> Mesh {
@@ -1214,8 +1215,19 @@ enum Op {
     Undo,
     Redo,
     Clear,
+    Budget(usize),
+    App { key: Option<u64>, bytes: u64 },
     Take { second: bool },
     Flush,
+}
+
+/// Budgets of a few steps, of some meshes, and without a limit.
+fn budget() -> impl Strategy<Value = usize> {
+    prop_oneof![
+        3 => Just(usize::MAX),
+        1 => 200usize..6000,
+        3 => 6000usize..200_000,
+    ]
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -1239,6 +1251,9 @@ fn op() -> impl Strategy<Value = Op> {
         9 => Just(Op::Undo),
         7 => Just(Op::Redo),
         1 => Just(Op::Clear),
+        2 => budget().prop_map(Op::Budget),
+        6 => (prop::option::weighted(0.6, 0u64..2), 0u64..3000)
+            .prop_map(|(key, bytes)| Op::App { key, bytes }),
         4 => any::<bool>().prop_map(|second| Op::Take { second }),
         3 => Just(Op::Flush),
     ]
@@ -1249,15 +1264,26 @@ enum Kind {
     Edit,
     Place,
     Presence,
+    /// Application entries `first` to `last`, merged under `key`. They took
+    /// the application's value from `before` to `after`.
+    App {
+        first: u64,
+        last: u64,
+        key: Option<u64>,
+        before: u64,
+        after: u64,
+    },
 }
 
 type State = BTreeMap<MeshId, Snap>;
+/// A change by the mesh it is of (an application's entry is of none).
+type Change = (Option<MeshId>, Kind);
 
 #[derive(Debug, Clone)]
 struct ModelStep {
     before: State,
     after: State,
-    entries: Vec<(MeshId, Kind)>,
+    entries: Vec<Change>,
 }
 
 /// The history rules on whole-scene snapshots.
@@ -1266,8 +1292,10 @@ struct Model {
     undo: Vec<ModelStep>,
     redo: Vec<ModelStep>,
     /// The state before the open step and its entries.
-    open: Option<(State, Vec<(MeshId, Kind)>)>,
+    open: Option<(State, Vec<Change>)>,
     depth: u32,
+    /// The application's value.
+    value: u64,
 }
 
 impl Model {
@@ -1285,14 +1313,34 @@ impl Model {
     }
 
     /// Records an entry that took the scene from `before` to `now`.
-    fn record(&mut self, before: &State, now: &State, id: MeshId, kind: Kind) {
+    fn record(&mut self, before: &State, now: &State, change: Change) {
         self.redo.clear();
         let (_, entries) = self
             .open
             .get_or_insert_with(|| (before.clone(), Vec::new()));
-        // Placement runs of one mesh coalesce in an open step.
-        if !(self.depth > 0 && kind == Kind::Place && entries.last() == Some(&(id, kind))) {
-            entries.push((id, kind));
+        // Placement runs of one mesh, and entries of one key, coalesce in an
+        // open step.
+        let open = self.depth > 0;
+        match (change.1, entries.last_mut()) {
+            (Kind::Place, Some(last)) if open && *last == change => {}
+            (
+                Kind::App {
+                    key: Some(new),
+                    last: new_last,
+                    after: new_after,
+                    ..
+                },
+                Some((
+                    _,
+                    Kind::App {
+                        key, last, after, ..
+                    },
+                )),
+            ) if open && *key == Some(new) => {
+                *last = new_last;
+                *after = new_after;
+            }
+            _ => entries.push(change),
         }
         if self.depth == 0 {
             self.close(now);
@@ -1312,7 +1360,7 @@ impl Model {
 
     /// Drops the entries of `id` that `drop` picks; steps left empty go.
     fn forget(&mut self, id: MeshId, drop: impl Fn(Kind) -> bool) {
-        let keep = |e: &(MeshId, Kind)| e.0 != id || !drop(e.1);
+        let keep = |e: &Change| e.0 != Some(id) || !drop(e.1);
         for s in self.undo.iter_mut().chain(&mut self.redo) {
             s.entries.retain(keep);
         }
@@ -1330,9 +1378,41 @@ impl Model {
         steps
             .chain(self.open.iter().map(|(_, e)| e))
             .flatten()
-            .filter(|(id, k)| *k == Kind::Presence && !now.contains_key(id))
-            .map(|(id, _)| *id)
+            .filter(|(_, k)| *k == Kind::Presence)
+            .filter_map(|(id, _)| *id)
+            .filter(|id| !now.contains_key(id))
             .collect()
+    }
+
+    /// The application entries the history holds.
+    fn apps(&self) -> BTreeSet<u64> {
+        let steps = self.undo.iter().chain(&self.redo).map(|s| &s.entries);
+        steps
+            .chain(self.open.iter().map(|(_, e)| e))
+            .flatten()
+            .flat_map(|(_, k)| match k {
+                Kind::App { first, last, .. } => vec![*first, *last],
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// The application's value after `entries` are undone (or redone).
+    fn run_apps(&mut self, entries: &[Change], forward: bool) {
+        let mut runs: Vec<(u64, u64)> = entries
+            .iter()
+            .filter_map(|(_, k)| match k {
+                Kind::App { before, after, .. } => Some((*before, *after)),
+                _ => None,
+            })
+            .collect();
+        if !forward {
+            runs = runs.iter().rev().map(|(b, a)| (*a, *b)).collect();
+        }
+        for (from, to) in runs {
+            assert_eq!(self.value, from);
+            self.value = to;
+        }
     }
 }
 
@@ -1474,6 +1554,13 @@ struct Run {
     ids: BTreeSet<MeshId>,
     fields: Vec<(FieldId, MeshId)>,
     budget: usize,
+    /// The budget has had no limit so far: no step was evicted.
+    unlimited: bool,
+    /// The application's value, kept up from the events alone, and what each
+    /// entry not dropped takes it from and to.
+    value: u64,
+    values: BTreeMap<u64, (u64, u64)>,
+    next_entry: u64,
 }
 
 impl Run {
@@ -1486,8 +1573,21 @@ impl Run {
     fn after(&mut self, recorded: Option<(MeshId, Kind)>) {
         let before = std::mem::replace(&mut self.now, state(&self.scene));
         if let Some((id, kind)) = recorded {
-            self.model.record(&before, &self.now, id, kind);
+            self.model.record(&before, &self.now, (Some(id), kind));
         }
+    }
+
+    /// Follows what happened to the application's entries. A value undone or
+    /// redone is of an entry not dropped, and each is dropped once.
+    fn follow_entries(&mut self) {
+        for e in self.scene.take_entry_events() {
+            match e {
+                EntryEvent::Undone(id) => self.value = self.values[&id].0,
+                EntryEvent::Redone(id) => self.value = self.values[&id].1,
+                EntryEvent::Dropped(id) => assert!(self.values.remove(&id).is_some()),
+            }
+        }
+        assert_eq!(self.value, self.model.value);
     }
 
     fn apply(&mut self, op: &Op) {
@@ -1639,8 +1739,9 @@ impl Run {
                 self.scene.cancel_step().unwrap();
                 self.now = state(&self.scene);
                 self.model.depth = 0;
-                let (before, _) = self.model.open.take().unwrap();
+                let (before, entries) = self.model.open.take().unwrap();
                 assert_eq!(self.now, before);
+                self.model.run_apps(&entries, false);
             }
             Op::Undo => {
                 let open = self.model.open.as_ref().is_some_and(|o| !o.1.is_empty());
@@ -1657,6 +1758,7 @@ impl Run {
                 if expect {
                     let s = self.model.undo.pop().unwrap();
                     assert_eq!(self.now, s.before);
+                    self.model.run_apps(&s.entries, false);
                     self.model.redo.push(s);
                 }
             }
@@ -1668,12 +1770,42 @@ impl Run {
                 if expect {
                     let s = self.model.redo.pop().unwrap();
                     assert_eq!(self.now, s.after);
+                    self.model.run_apps(&s.entries, true);
                     self.model.undo.push(s);
                 }
             }
             Op::Clear => {
                 self.scene.clear_history().unwrap();
-                self.model = Model::default();
+                self.model = Model {
+                    value: self.model.value,
+                    ..Model::default()
+                };
+            }
+            Op::App { key, bytes } => {
+                self.next_entry += 1;
+                let id = self.next_entry;
+                let before = std::mem::replace(&mut self.value, id);
+                self.values.insert(id, (before, id));
+                let merge = key;
+                self.scene
+                    .record_entry(HistoryEntry { id, bytes, merge })
+                    .unwrap();
+                self.model.value = id;
+                let kind = Kind::App {
+                    first: id,
+                    last: id,
+                    key,
+                    before,
+                    after: id,
+                };
+                let now = self.now.clone();
+                self.model.record(&now, &now, (None, kind));
+            }
+            Op::Budget(bytes) => {
+                self.scene.set_history_budget(bytes).unwrap();
+                self.budget = bytes;
+                self.unlimited &= bytes == usize::MAX;
+                assert_eq!(self.scene.history_budget(), bytes);
             }
             Op::Take { second } => {
                 let s = second.then_some(self.second);
@@ -1711,11 +1843,14 @@ impl Run {
         // Evicted: the oldest steps go first, on both stacks.
         let (undo, redo) = (self.scene.history.undo_len(), self.scene.history.redo_len());
         assert!(undo <= self.model.undo.len() && redo <= self.model.redo.len());
-        if self.budget == usize::MAX {
+        if self.unlimited {
             assert_eq!((undo, redo), (self.model.undo.len(), self.model.redo.len()));
         }
         self.model.undo.drain(..self.model.undo.len() - undo);
         self.model.redo.drain(..self.model.redo.len() - redo);
+        self.follow_entries();
+        let held: BTreeSet<u64> = self.values.keys().copied().collect();
+        assert_eq!(held, self.model.apps(), "the entries not dropped");
         if self.model.depth == 0 {
             assert!(self.scene.history.bytes() <= self.budget);
         }
@@ -1748,11 +1883,7 @@ proptest! {
     #[test]
     fn random_sequences_match_the_model(
         ops in prop::collection::vec(op(), 1..70),
-        budget in prop_oneof![
-            3 => Just(usize::MAX),
-            1 => 200usize..6000,
-            3 => 6000usize..200_000,
-        ],
+        budget in budget(),
     ) {
         let mut scene = Scene::new(SceneOptions { history_budget: budget });
         let second = scene.subscribe();
@@ -1765,6 +1896,10 @@ proptest! {
             ids: BTreeSet::new(),
             fields: Vec::new(),
             budget,
+            unlimited: budget == usize::MAX,
+            value: 0,
+            values: BTreeMap::new(),
+            next_entry: 0,
         };
         for op in &ops {
             run.apply(op);
@@ -1787,6 +1922,8 @@ proptest! {
         run.apply(&Op::Take { second: false });
         run.apply(&Op::Take { second: true });
         run.scene.clear_history().unwrap();
+        run.follow_entries();
+        prop_assert!(run.values.is_empty());
         prop_assert!(run.scene.restorable_ids().next().is_none());
         prop_assert_eq!(run.scene.history.bytes(), 0);
     }

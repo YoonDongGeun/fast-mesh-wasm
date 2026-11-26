@@ -6,15 +6,16 @@ use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_query::{Plane, Slice, contour_length, signed_area, slice};
 use fast_mesh_store::Mesh;
 
-use crate::allocation_allowed;
 use crate::error::{OpsError, Result};
-use crate::icp::{norm, sub};
+use crate::icp::{dot, norm, sub, unit};
+use crate::{allocation_allowed, reserve};
 
 /// Extracted 2D/3D planar section loop or open polyline chain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContourLoop {
-    /// Ordered vertices in 3D world coordinates.
-    pub points_3d: Vec<[f32; 3]>,
+    /// Ordered vertices in 3D world coordinates: the mesh's origin plus an offset as precise as
+    /// its `f32` positions, wherever in the world that is.
+    pub points_3d: Vec<[f64; 3]>,
     /// Ordered vertices projected into the slice plane's `(u, v)` frame.
     pub points_2d: Vec<[f64; 2]>,
     /// `true` if the contour forms a closed loop; `false` for an open chain.
@@ -36,8 +37,9 @@ pub struct ContourLoop {
 /// All contours extracted by slicing a mesh with a single plane.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContourSlice {
-    /// Plane origin point in world coordinates.
-    pub plane_origin: [f32; 3],
+    /// Plane origin point in world coordinates: the one asked for, to a few `f32` steps of the
+    /// mesh's positions (see [`slice_contours`]).
+    pub plane_origin: [f64; 3],
     /// Unit plane normal vector.
     pub plane_normal: [f32; 3],
     /// First in-plane orthonormal basis vector in world coordinates.
@@ -52,81 +54,66 @@ pub struct ContourSlice {
     pub total_area: f64,
 }
 
-/// Extract planar cross-section contours from `mesh` cut by `(origin, normal)`.
-pub fn slice_contours(mesh: &Mesh, origin: [f32; 3], normal: [f32; 3]) -> Result<ContourSlice> {
-    let world_plane = build_plane(origin, normal)?;
-    if mesh.triangle_count() == 0 {
-        return Ok(empty_slice(origin, &world_plane));
-    }
-
-    allocation_allowed()?;
-    let bvh = Bvh::build(mesh, &BuildOptions::default())
-        .map_err(|_| OpsError::InvalidInput("failed to build BVH for contour slicing"))?;
-    slice_with_bvh(mesh, &bvh, origin, &world_plane)
+/// Extract planar cross-section contours from `mesh` cut by the world plane `(origin, normal)`.
+///
+/// The slice is taken around [`Mesh::origin`], where positions are small, so it is as precise far
+/// from the world origin as near it. The plane's point is rounded to the `f32` steps of the
+/// positions, so that a plane through vertices runs exactly through them; the point may be
+/// anywhere on the plane, however far from the mesh.
+pub fn slice_contours(mesh: &Mesh, origin: [f64; 3], normal: [f64; 3]) -> Result<ContourSlice> {
+    let mut slices = slice_layers(mesh, origin, normal, 0.0, 1)?;
+    slices
+        .pop()
+        .ok_or(OpsError::InvalidInput("no contour slice"))
 }
 
-/// Extract `count` parallel planar slices spaced by `spacing` along normalized `normal`.
+/// Extract `count` parallel planar slices spaced by `spacing` along normalized `normal`, each as
+/// [`slice_contours`] does.
 pub fn slice_contour_stack(
     mesh: &Mesh,
-    origin: [f32; 3],
-    normal: [f32; 3],
+    origin: [f64; 3],
+    normal: [f64; 3],
     spacing: f32,
     count: usize,
 ) -> Result<Vec<ContourSlice>> {
-    let base_plane = build_plane(origin, normal)?;
     if !spacing.is_finite() || spacing <= 0.0 {
         return Err(OpsError::InvalidInput(
             "slice spacing must be positive and finite",
         ));
     }
-    if count == 0 {
-        return Ok(Vec::new());
+    slice_layers(mesh, origin, normal, f64::from(spacing), count)
+}
+
+fn slice_layers(
+    mesh: &Mesh,
+    origin: [f64; 3],
+    normal: [f64; 3],
+    spacing: f64,
+    count: usize,
+) -> Result<Vec<ContourSlice>> {
+    if !origin.iter().chain(&normal).all(|v| v.is_finite()) {
+        return Err(OpsError::InvalidInput(
+            "slice plane origin and normal must be finite",
+        ));
     }
-
-    allocation_allowed()?;
-    let mut out = Vec::with_capacity(count);
-    let step_n = base_plane.normal();
-    let step_len = f64::from(spacing);
-    let base_orig = [
-        f64::from(origin[0]),
-        f64::from(origin[1]),
-        f64::from(origin[2]),
-    ];
-
-    if mesh.triangle_count() == 0 {
-        for idx in 0..count {
-            let offset = (idx as f64) * step_len;
-            let o_k = [
-                (base_orig[0] + offset * step_n[0]) as f32,
-                (base_orig[1] + offset * step_n[1]) as f32,
-                (base_orig[2] + offset * step_n[2]) as f32,
-            ];
-            let p_k = Plane::new(
-                [f64::from(o_k[0]), f64::from(o_k[1]), f64::from(o_k[2])],
-                step_n,
-            )?;
-            out.push(empty_slice(o_k, &p_k));
-        }
-        return Ok(out);
+    let bvh = if mesh.triangle_count() == 0 || count == 0 {
+        None
+    } else {
+        allocation_allowed()?;
+        let bvh = Bvh::build(mesh, &BuildOptions::default())
+            .map_err(|_| OpsError::InvalidInput("failed to build BVH for contour slicing"))?;
+        Some(bvh)
+    };
+    let base = LocalPlane::new(mesh, bvh.as_ref(), origin, normal)?;
+    let mut out = Vec::new();
+    reserve(&mut out, count)?;
+    for layer in 0..count {
+        let plane = base.moved(layer as f64 * spacing)?;
+        out.push(match &bvh {
+            Some(bvh) => slice_with_bvh(mesh, bvh, &plane)?,
+            None => plane.slice_of(mesh, Vec::new()),
+        });
     }
-
-    let bvh = Bvh::build(mesh, &BuildOptions::default())
-        .map_err(|_| OpsError::InvalidInput("failed to build BVH for contour stack"))?;
-
-    for idx in 0..count {
-        let offset = (idx as f64) * step_len;
-        let o_k = [
-            (base_orig[0] + offset * step_n[0]) as f32,
-            (base_orig[1] + offset * step_n[1]) as f32,
-            (base_orig[2] + offset * step_n[2]) as f32,
-        ];
-        let p_k = Plane::new(
-            [f64::from(o_k[0]), f64::from(o_k[1]), f64::from(o_k[2])],
-            step_n,
-        )?;
-        out.push(slice_with_bvh(mesh, &bvh, o_k, &p_k)?);
-    }
-
     Ok(out)
 }
 
@@ -215,9 +202,9 @@ pub fn contours_to_json(slices: &[ContourSlice]) -> String {
         let _ = write!(
             out,
             "{{\"plane_origin\":[{:.6},{:.6},{:.6}],\"plane_normal\":[{:.6},{:.6},{:.6}],\"u_axis\":[{:.6},{:.6},{:.6}],\"v_axis\":[{:.6},{:.6},{:.6}],\"total_perimeter\":{:.6},\"total_area\":{:.6},\"loops\":[",
-            clean_zero(f64::from(s.plane_origin[0])),
-            clean_zero(f64::from(s.plane_origin[1])),
-            clean_zero(f64::from(s.plane_origin[2])),
+            clean_zero(s.plane_origin[0]),
+            clean_zero(s.plane_origin[1]),
+            clean_zero(s.plane_origin[2]),
             clean_zero(f64::from(s.plane_normal[0])),
             clean_zero(f64::from(s.plane_normal[1])),
             clean_zero(f64::from(s.plane_normal[2])),
@@ -262,9 +249,9 @@ pub fn contours_to_json(slices: &[ContourSlice]) -> String {
                 let _ = write!(
                     out,
                     "[{:.6},{:.6},{:.6}]",
-                    clean_zero(f64::from(p3[0])),
-                    clean_zero(f64::from(p3[1])),
-                    clean_zero(f64::from(p3[2])),
+                    clean_zero(p3[0]),
+                    clean_zero(p3[1]),
+                    clean_zero(p3[2]),
                 );
             }
             out.push_str("]}");
@@ -306,127 +293,131 @@ pub fn contours_to_csv(slices: &[ContourSlice]) -> String {
 // Internal Geometry Helpers
 // ============================================================================
 
-fn build_plane(origin: [f32; 3], normal: [f32; 3]) -> Result<Plane> {
-    if !origin.iter().all(|v| v.is_finite()) || !normal.iter().all(|v| v.is_finite()) {
+/// How far from the mesh's origin a plane's point may be, in units of the largest local
+/// coordinate, for `f32` to hold it to about their precision.
+const REACH: f64 = 16.0;
+
+/// A plane in the local coordinates of a mesh, which are relative to its `f64` origin.
+struct LocalPlane {
+    plane: Plane,
+    /// Along the plane, from its local origin to the point it was given by: zero unless that is
+    /// out of [`REACH`].
+    slide: [f64; 3],
+}
+
+impl LocalPlane {
+    /// The world plane `(origin, normal)`. A point of it far from the mesh of `bvh` (or from
+    /// nothing) is first moved along the plane, to the mesh.
+    fn new(mesh: &Mesh, bvh: Option<&Bvh>, origin: [f64; 3], normal: [f64; 3]) -> Result<Self> {
+        let given = sub(origin, mesh.origin());
+        let reach = bvh.and_then(Bvh::root_bounds).map_or(0.0, |b| {
+            let largest = b.min.iter().chain(&b.max);
+            REACH * f64::from(largest.fold(0.0f32, |m, c| m.max(c.abs())))
+        });
+        let (point, normal) = if given.iter().all(|c| c.abs() <= reach) {
+            (given, normal.map(|c| f64::from(c as f32)))
+        } else {
+            let n = unit(normal).ok_or(OpsError::InvalidInput("slice plane normal is zero"))?;
+            let d = dot(given, n);
+            (n.map(|c| d * c), n)
+        };
+        Ok(Self {
+            plane: plane_at(point, normal)?,
+            slide: sub(given, point),
+        })
+    }
+
+    /// The plane `offset` further along its normal.
+    fn moved(&self, offset: f64) -> Result<Self> {
+        let (o, n) = (self.plane.origin(), self.plane.normal());
+        let point = std::array::from_fn(|k| o[k] + offset * n[k]);
+        Ok(Self {
+            plane: plane_at(point, n)?,
+            slide: self.slide,
+        })
+    }
+
+    /// The slide in the plane's `(u, v)` coordinates.
+    fn slide_2d(&self) -> [f64; 2] {
+        [
+            dot(self.slide, self.plane.u()),
+            dot(self.slide, self.plane.v()),
+        ]
+    }
+
+    /// The slice that has these loops.
+    fn slice_of(&self, mesh: &Mesh, loops: Vec<ContourLoop>) -> ContourSlice {
+        let (o, n) = (self.plane.origin(), self.plane.normal());
+        ContourSlice {
+            plane_origin: std::array::from_fn(|k| mesh.origin()[k] + (o[k] + self.slide[k])),
+            plane_normal: n.map(|c| c as f32),
+            u_axis: self.plane.u(),
+            v_axis: self.plane.v(),
+            total_perimeter: loops.iter().map(|l| l.perimeter).sum(),
+            total_area: compute_nested_total_area(&loops),
+            loops,
+        }
+    }
+}
+
+/// The plane through `point`, rounded to `f32`.
+fn plane_at(point: [f64; 3], normal: [f64; 3]) -> Result<Plane> {
+    let rounded = point.map(|c| f64::from(c as f32));
+    if !rounded.iter().all(|c| c.is_finite()) {
         return Err(OpsError::InvalidInput(
-            "slice plane origin and normal must be finite",
+            "slice plane is too far from the mesh",
         ));
     }
-    Ok(Plane::new(
-        [
-            f64::from(origin[0]),
-            f64::from(origin[1]),
-            f64::from(origin[2]),
-        ],
-        [
-            f64::from(normal[0]),
-            f64::from(normal[1]),
-            f64::from(normal[2]),
-        ],
-    )?)
+    Ok(Plane::new(rounded, normal)?)
 }
 
-fn empty_slice(origin: [f32; 3], plane: &Plane) -> ContourSlice {
-    let n = plane.normal();
-    ContourSlice {
-        plane_origin: origin,
-        plane_normal: [n[0] as f32, n[1] as f32, n[2] as f32],
-        u_axis: plane.u(),
-        v_axis: plane.v(),
-        loops: Vec::new(),
-        total_perimeter: 0.0,
-        total_area: 0.0,
-    }
-}
-
-fn slice_with_bvh(
-    mesh: &Mesh,
-    bvh: &Bvh,
-    world_origin: [f32; 3],
-    world_plane: &Plane,
-) -> Result<ContourSlice> {
-    let mesh_orig = mesh.origin();
-    let local_plane = Plane::new(
-        [
-            f64::from(world_origin[0]) - mesh_orig[0],
-            f64::from(world_origin[1]) - mesh_orig[1],
-            f64::from(world_origin[2]) - mesh_orig[2],
-        ],
-        world_plane.normal(),
-    )?;
-
+fn slice_with_bvh(mesh: &Mesh, bvh: &Bvh, at: &LocalPlane) -> Result<ContourSlice> {
     let mut raw = Slice {
         contours: Vec::new(),
     };
-    slice(mesh, bvh, &local_plane, &mut raw)?;
-
-    let mut loops = Vec::with_capacity(raw.contours.len());
-    for c in raw.contours {
-        if let Some(contour_loop) = build_contour_loop(&c.points, c.closed, mesh_orig, world_plane)
-        {
-            loops.push(contour_loop);
-        }
-    }
-
-    let total_perimeter = loops.iter().map(|l| l.perimeter).sum();
-    let total_area = compute_nested_total_area(&loops);
-    let pn = world_plane.normal();
-
-    Ok(ContourSlice {
-        plane_origin: world_origin,
-        plane_normal: [pn[0] as f32, pn[1] as f32, pn[2] as f32],
-        u_axis: world_plane.u(),
-        v_axis: world_plane.v(),
-        loops,
-        total_perimeter,
-        total_area,
-    })
+    slice(mesh, bvh, &at.plane, &mut raw)?;
+    let loops = raw
+        .contours
+        .iter()
+        .filter_map(|c| build_contour_loop(&c.points, c.closed, mesh.origin(), at))
+        .collect();
+    Ok(at.slice_of(mesh, loops))
 }
 
 fn build_contour_loop(
     local_pts: &[[f64; 3]],
     raw_closed: bool,
     mesh_origin: [f64; 3],
-    world_plane: &Plane,
+    at: &LocalPlane,
 ) -> Option<ContourLoop> {
     if local_pts.is_empty() {
         return None;
     }
 
-    // Lift to world space and deduplicate consecutive coincident vertices.
-    let mut world_pts = Vec::with_capacity(local_pts.len());
-    for &lp in local_pts {
-        let wp = [
-            lp[0] + mesh_origin[0],
-            lp[1] + mesh_origin[1],
-            lp[2] + mesh_origin[2],
-        ];
-        if world_pts
-            .last()
-            .is_some_and(|&prev| norm(sub(wp, prev)) <= 1e-9)
-        {
+    // Deduplicate consecutive coincident vertices.
+    let mut pts: Vec<[f64; 3]> = Vec::with_capacity(local_pts.len());
+    for &p in local_pts {
+        if pts.last().is_some_and(|&prev| norm(sub(p, prev)) <= 1e-9) {
             continue;
         }
-        world_pts.push(wp);
+        pts.push(p);
     }
 
-    if raw_closed
-        && world_pts.len() >= 2
-        && norm(sub(world_pts[0], *world_pts.last().unwrap_or(&[0.0; 3]))) <= 1e-9
-    {
-        world_pts.pop();
+    if raw_closed && pts.len() >= 2 && norm(sub(pts[0], *pts.last().unwrap_or(&[0.0; 3]))) <= 1e-9 {
+        pts.pop();
     }
 
-    if world_pts.len() < 2 {
+    if pts.len() < 2 {
         return None;
     }
 
-    let closed = raw_closed && world_pts.len() >= 3;
-    let points_3d: Vec<[f32; 3]> = world_pts
+    let closed = raw_closed && pts.len() >= 3;
+    let to_world = |p: [f64; 3]| std::array::from_fn(|k| mesh_origin[k] + p[k]);
+    let points_3d = pts
         .iter()
-        .map(|&p| [p[0] as f32, p[1] as f32, p[2] as f32])
+        .map(|p| to_world(p.map(|c| f64::from(c as f32))))
         .collect();
-    let points_2d: Vec<[f64; 2]> = world_pts.iter().map(|&p| world_plane.to_uv(p)).collect();
+    let mut points_2d: Vec<[f64; 2]> = pts.iter().map(|&p| at.plane.to_uv(p)).collect();
 
     let perimeter = contour_length(&points_2d, closed);
     let enclosed_area = if closed {
@@ -434,9 +425,14 @@ fn build_contour_loop(
     } else {
         0.0
     };
-    let centroid_2d = compute_centroid_2d(&points_2d, closed);
-    let centroid_3d = world_plane.from_uv(centroid_2d);
+    let mut centroid_2d = compute_centroid_2d(&points_2d, closed);
+    let centroid_3d = to_world(at.plane.from_uv(centroid_2d));
     let (min_caliper_diameter, max_caliper_diameter) = caliper_diameters_2d(&points_2d);
+    // Coordinates around the point the plane was given by.
+    let slide = at.slide_2d();
+    for q in points_2d.iter_mut().chain([&mut centroid_2d]) {
+        *q = [q[0] - slide[0], q[1] - slide[1]];
+    }
 
     Some(ContourLoop {
         points_3d,

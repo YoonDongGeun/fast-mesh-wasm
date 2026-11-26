@@ -1,15 +1,21 @@
-//! Booleans, cuts, hulls, wraps, hollows and placed meshes far from the world
-//! origin (#278). Whatever mix of a mesh's `f64` origin and its placement puts
+//! Booleans, cuts, hulls, wraps, hollows and placed meshes (#278), contours,
+//! fits, point clouds, trims, selections and surface paths (#280) far from the
+//! world origin. Whatever mix of a mesh's `f64` origin and its placement puts
 //! it there, the results keep the `f32` precision of small local coordinates:
 //! world coordinates in `f32` would be off by 0.004 at 1e5.
 
 use fast_mesh_ops::boolean::{
     DrainHoleOptions, DrainHoleSpec, HollowBackend, HollowOptions, PlaceMeshParams, PlaceMode,
+    PlaceUpAxis,
+};
+use fast_mesh_ops::inspect::{
+    ContourSlice, FitPrimitiveOptions, FitPrimitiveReport, FittedPrimitive, PointCloud,
+    PrimitiveKind, ReconstructMethod, SurfaceReconstructOptions,
 };
 use fast_mesh_ops::wrap::WrapOptions;
 use fast_mesh_scene::{
-    BooleanMethod, BooleanOp, BooleanOptions, CsgNode, CutOptions, MeshId, MeshOptions, Placement,
-    Plane, Scene, SceneOptions,
+    BooleanMethod, BooleanOp, BooleanOptions, CsgNode, CutOptions, GeodesicMethod, GeodesicOptions,
+    MeshId, MeshOptions, Placement, Plane, Scene, SceneOptions, TrimCurveOptions,
 };
 use fast_mesh_store::Mesh;
 
@@ -100,13 +106,41 @@ impl Pose {
         TOL / self.placement.scale.iter().fold(1.0, |m, s| s.min(m))
     }
 
-    fn add_box(self, scene: &mut Scene, lo: V3, hi: V3) -> MeshId {
-        let mesh = box_mesh(add(self.geometry, lo), add(self.geometry, hi));
+    /// The pose without what puts this one far away: the model as turned and
+    /// scaled, its zero at the world's.
+    fn near(self) -> Pose {
+        Pose {
+            geometry: [0.0; 3],
+            placement: Placement {
+                translation: [0.0; 3],
+                ..self.placement
+            },
+        }
+    }
+
+    /// From where [`Pose::near`] puts a point of the model to where this does.
+    fn shift(self) -> V3 {
+        self.to_world([0.0; 3])
+    }
+
+    fn add_mesh(self, scene: &mut Scene, mesh: Mesh) -> MeshId {
         let options = MeshOptions {
             placement: self.placement,
             ..MeshOptions::default()
         };
         scene.add_mesh(mesh, options).unwrap()
+    }
+
+    fn add_box(self, scene: &mut Scene, lo: V3, hi: V3) -> MeshId {
+        let mesh = box_mesh(add(self.geometry, lo), add(self.geometry, hi));
+        self.add_mesh(scene, mesh)
+    }
+
+    fn add_model(self, scene: &mut Scene, model: &Model) -> MeshId {
+        let moved = model.positions.iter().map(|&p| add(self.geometry, p));
+        let positions: Vec<f64> = moved.flatten().collect();
+        let mesh = Mesh::from_buffers_f64(&positions, &model.triangles).unwrap();
+        self.add_mesh(scene, mesh)
     }
 
     fn add_a(self, scene: &mut Scene) -> MeshId {
@@ -686,5 +720,620 @@ fn drain_holes_keep_local_precision_far_away() {
                 .fold(0.0, f64::max);
             assert!((reach - RADIUS).abs() < 1e-5, "{what}: plug to {reach}");
         }
+    }
+}
+
+/// Positions around zero, and triangles.
+struct Model {
+    positions: Vec<V3>,
+    triangles: Vec<u32>,
+}
+
+/// The surface that the profile `(radius, z)` sweeps around the z axis, in
+/// `segments` steps, around [`MID`].
+fn revolved(profile: &[(f64, f64)], segments: u32) -> Model {
+    let positions = profile
+        .iter()
+        .flat_map(|&(r, z)| {
+            (0..segments).map(move |j| {
+                let turn = f64::from(j) / f64::from(segments) * std::f64::consts::TAU;
+                add(MID, [r * turn.cos(), r * turn.sin(), z])
+            })
+        })
+        .collect();
+    let mut triangles = Vec::new();
+    for i in 0..profile.len() as u32 - 1 {
+        for j in 0..segments {
+            let (a, b) = (i * segments + j, i * segments + (j + 1) % segments);
+            let (c, d) = (a + segments, b + segments);
+            triangles.extend([a, b, d, a, d, c]);
+        }
+    }
+    Model {
+        positions,
+        triangles,
+    }
+}
+
+const MID: V3 = [0.55, 0.45, 0.35];
+const RADIUS: f64 = 0.6;
+const RINGS: u32 = 24;
+const SEGMENTS: u32 = 48;
+
+/// A ball around [`MID`] with small holes at its poles: triangles of about
+/// 0.08.
+fn ball() -> Model {
+    let profile: Vec<(f64, f64)> = (0..=RINGS)
+        .map(|i| {
+            let polar = std::f64::consts::PI * (0.04 + 0.92 * f64::from(i) / f64::from(RINGS));
+            (RADIUS * polar.sin(), -RADIUS * polar.cos())
+        })
+        .collect();
+    revolved(&profile, SEGMENTS)
+}
+
+/// How far `got` is from `want` moved by `shift`, at most: infinite for
+/// another number of points.
+fn off(got: &[V3], want: &[V3], shift: V3) -> f64 {
+    if got.len() != want.len() {
+        return f64::INFINITY;
+    }
+    let pairs = got.iter().zip(want);
+    pairs.fold(0.0, |m: f64, (g, w)| {
+        (0..3).fold(m, |m, k| m.max((g[k] - (w[k] + shift[k])).abs()))
+    })
+}
+
+/// [`off`] for plain numbers.
+fn off_by(got: &[f64], want: &[f64]) -> f64 {
+    if got.len() != want.len() {
+        return f64::INFINITY;
+    }
+    let pairs = got.iter().zip(want);
+    pairs.fold(0.0, |m: f64, (g, w)| m.max((g - w).abs()))
+}
+
+/// Compares what `run` makes of each of the `poses` of every far place with
+/// what it makes of it near, and the shift between the two.
+fn far_and_near<T>(
+    poses: impl Fn(V3) -> Vec<Pose>,
+    run: impl Fn(Pose) -> T,
+    compare: impl Fn(Pose, T, &T),
+) {
+    for (i, pose) in poses(FAR[0]).into_iter().enumerate() {
+        let near = run(pose.near());
+        for far in FAR {
+            let pose = poses(far)[i];
+            compare(pose, run(pose), &near);
+        }
+    }
+}
+
+/// [`TOL`] in the world, at the largest scale of [`poses`].
+const WORLD_TOL: f64 = 2.0 * TOL;
+
+fn check(off: f64, tol: f64, what: &str) {
+    assert!(off <= tol, "{what}: off by {off:e}");
+}
+
+/// What a slice has in its plane, which does not depend on where that is.
+fn in_plane(slice: &ContourSlice) -> Vec<f64> {
+    let mut out = vec![slice.total_area, slice.total_perimeter];
+    for l in &slice.loops {
+        out.extend([l.perimeter, l.enclosed_area]);
+        out.extend([l.min_caliper_diameter, l.max_caliper_diameter]);
+        out.extend(l.centroid_2d);
+        out.extend(l.points_2d.iter().flatten());
+    }
+    out
+}
+
+/// The points of a slice in the world: its plane's origin, then the loops'.
+fn in_world(slice: &ContourSlice) -> Vec<V3> {
+    let mut out = vec![slice.plane_origin];
+    for l in &slice.loops {
+        out.push(l.centroid_3d);
+        out.extend(&l.points_3d);
+    }
+    out
+}
+
+/// The points of a slice from its axes and `(u, v)` coordinates.
+fn from_plane(slice: &ContourSlice) -> Vec<V3> {
+    let o = slice.plane_origin;
+    let points = slice.loops.iter().flat_map(|l| &l.points_2d);
+    points
+        .map(|[u, v]| std::array::from_fn(|k| o[k] + u * slice.u_axis[k] + v * slice.v_axis[k]))
+        .collect()
+}
+
+const NORMALS: [V3; 2] = [[0.0, 0.0, 1.0], [0.36, 0.48, 0.8]];
+
+#[test]
+fn contours_keep_local_precision_far_away() {
+    for normal in NORMALS {
+        let run = |pose: Pose| {
+            let mut scene = new_scene();
+            let (a, b) = (pose.add_a(&mut scene), pose.add_model(&mut scene, &ball()));
+            let o = pose.to_world(MID);
+            let mut out = Vec::new();
+            for id in [a, b] {
+                out.push(scene.slice_contours_world(id, o, normal).unwrap());
+                let stack = scene.slice_contour_stack_world(id, o, normal, 0.05, 4);
+                out.extend(stack.unwrap());
+            }
+            out
+        };
+        far_and_near(poses, run, |pose, got, near| {
+            let what = format!("contours of {pose:?} along {normal:?}");
+            assert!(near.iter().all(|s| !s.loops.is_empty()), "{what}");
+            for (slice, want) in got.iter().zip(near) {
+                let off_world = off(&in_world(slice), &in_world(want), pose.shift());
+                check(off_world, WORLD_TOL, &what);
+                let off_plane = off_by(&in_plane(slice), &in_plane(want));
+                check(off_plane, 4.0 * WORLD_TOL, &what);
+            }
+        });
+    }
+}
+
+#[test]
+fn contours_on_a_plane_given_by_a_far_point() {
+    // A point of the plane 1e5 from the mesh along it: the world's origin,
+    // say, for a plane through a mesh far away.
+    for normal in NORMALS {
+        let run = |pose: Pose| {
+            let mut scene = new_scene();
+            let id = pose.add_model(&mut scene, &ball());
+            let plane = Plane::new([0.0; 3], normal).unwrap();
+            let (mid, u, v) = (pose.to_world(MID), plane.u(), plane.v());
+            let is_near = [pose.geometry, pose.placement.translation] == [[0.0; 3]; 2];
+            let along = if is_near { 0.0 } else { 1.0e5 };
+            let o = std::array::from_fn(|k| mid[k] + along * (u[k] - 0.5 * v[k]));
+            scene.slice_contours_world(id, o, normal).unwrap()
+        };
+        let points = |s: &ContourSlice| in_world(s).split_off(1);
+        far_and_near(poses, run, |pose, got, near| {
+            let what = format!("contours of {pose:?} along {normal:?}");
+            let off_world = off(&points(&got), &points(near), pose.shift());
+            check(off_world, WORLD_TOL, &what);
+            let off_plane = off(&from_plane(&got), &from_plane(near), pose.shift());
+            check(off_plane, WORLD_TOL, &what);
+        });
+    }
+}
+
+/// The primitive's point, and its other numbers.
+fn fitted(report: &FitPrimitiveReport) -> (V3, Vec<f64>) {
+    let mut rest = vec![report.rms_error, report.max_error, report.inlier_ratio];
+    let point = match report.primitive {
+        FittedPrimitive::Plane { origin, normal } => {
+            rest.extend(normal);
+            origin
+        }
+        FittedPrimitive::Sphere { center, radius } => {
+            rest.push(radius);
+            center
+        }
+        FittedPrimitive::Cylinder {
+            axis_origin,
+            axis_dir,
+            radius,
+            height,
+        } => {
+            rest.extend(axis_dir);
+            rest.extend([radius, height]);
+            axis_origin
+        }
+        FittedPrimitive::Cone {
+            apex,
+            axis_dir,
+            half_angle_rad,
+            height,
+        } => {
+            rest.extend(axis_dir);
+            rest.extend([half_angle_rad, height]);
+            apex
+        }
+    };
+    (point, rest)
+}
+
+#[test]
+fn fitted_primitives_keep_local_precision_far_away() {
+    let line = |r0: f64, r1: f64| -> Vec<(f64, f64)> {
+        (0..=8)
+            .map(|i| {
+                let t = f64::from(i) / 8.0;
+                (r0 + t * (r1 - r0), 0.9 * t - 0.45)
+            })
+            .collect()
+    };
+    let shapes = [
+        (PrimitiveKind::Sphere, ball()),
+        (PrimitiveKind::Cylinder, revolved(&line(0.4, 0.4), 32)),
+        (PrimitiveKind::Cone, revolved(&line(0.1, 0.55), 32)),
+        (PrimitiveKind::Auto, revolved(&line(0.4, 0.4), 32)),
+    ];
+    let poses = |far| {
+        let mut all = rigid_poses(far).to_vec();
+        all.push(scaled_pose(far, [1.5; 3]));
+        all.push(scaled_pose(far, [1.5, 1.5, 2.0]));
+        all
+    };
+    for (kind, model) in &shapes {
+        let run = |pose: Pose| {
+            let mut scene = new_scene();
+            let id = pose.add_model(&mut scene, model);
+            let fit = |scene: &Scene| {
+                let options = FitPrimitiveOptions::default();
+                scene.fit_primitive_world(id, None, Some(*kind), &options)
+            };
+            let report = fit(&scene).unwrap();
+            // Aligning it takes the mesh to the target.
+            scene
+                .align_to_fitted_primitive(id, &report.primitive, [0.0, 0.0, 1.0], [0.0; 3])
+                .unwrap();
+            let aligned = fitted(&fit(&scene).unwrap()).0;
+            (report, aligned)
+        };
+        far_and_near(poses, run, |pose, (got, aligned), (near, _)| {
+            let what = format!("{kind:?} fitted to {pose:?}");
+            let ((point, rest), (near_point, near_rest)) = (fitted(&got), fitted(near));
+            check(off(&[point], &[near_point], pose.shift()), 1e-5, &what);
+            check(off_by(&rest, &near_rest), 1e-5, &what);
+            let residuals = |r: &FitPrimitiveReport| -> Vec<f64> {
+                r.residuals.iter().map(|&x| f64::from(x)).collect()
+            };
+            check(off_by(&residuals(&got), &residuals(near)), 1e-5, &what);
+            check(off(&[aligned], &[[0.0; 3]], [0.0; 3]), 1e-5, &what);
+        });
+    }
+}
+
+/// Points on the ball around a point of it, `angle` from it, in the model.
+fn around_on_ball(angle: f64, count: u32) -> Vec<V3> {
+    (0..count)
+        .map(|k| {
+            let turn = f64::from(k) / f64::from(count) * std::f64::consts::TAU + 0.05;
+            let (s, c) = angle.sin_cos();
+            let d = [c, s * turn.cos(), s * turn.sin()];
+            add(MID, d.map(|x| RADIUS * x))
+        })
+        .collect()
+}
+
+/// The vertices of a mesh in the model, and its triangles.
+fn model_buffers(scene: &Scene, id: MeshId, pose: Pose) -> (Vec<V3>, Vec<[u32; 3]>) {
+    let mesh = scene.mesh(id).unwrap();
+    let mut slots = vec![u32::MAX; mesh.vertex_slots()];
+    let mut positions = Vec::new();
+    for v in 0..mesh.vertex_slots() as u32 {
+        if let Some(p) = mesh.position(v) {
+            slots[v as usize] = positions.len() as u32;
+            let w = scene.local_to_world(id, p.map(f64::from)).unwrap();
+            positions.push(pose.to_model(w));
+        }
+    }
+    let triangles = (0..mesh.triangle_slots() as u32)
+        .filter_map(|t| mesh.triangle(t))
+        .map(|tri| tri.map(|v| slots[v as usize]))
+        .collect();
+    (positions, triangles)
+}
+
+#[test]
+fn trims_keep_local_precision_far_away() {
+    for closed in [true, false] {
+        let run = |pose: Pose| {
+            let mut scene = new_scene();
+            let id = pose.add_model(&mut scene, &ball());
+            let options = TrimCurveOptions {
+                points: around_on_ball(0.5, 12)
+                    .into_iter()
+                    .map(|p| pose.to_world(p))
+                    .collect(),
+                closed,
+                delete_inside: true,
+                snap_tolerance: 1e-3,
+            };
+            let report = scene.trim_by_curve(id, &options).unwrap();
+            (report, model_buffers(&scene, id, pose))
+        };
+        far_and_near(poses, run, |pose, (got, mesh), (near, near_mesh)| {
+            let what = format!("trim of {pose:?}, closed {closed}");
+            assert_eq!(near.removed_area > 0.1, closed, "{what}");
+            let off_area = (got.removed_area - near.removed_area).abs();
+            check(off_area, 1e-5, &what);
+            let off_mesh = off(&mesh.0, &near_mesh.0, [0.0; 3]);
+            check(off_mesh, 4.0 * pose.tol(), &what);
+            assert_eq!(mesh.1, near_mesh.1, "{what}");
+        });
+    }
+}
+
+#[test]
+fn selections_far_away_are_those_near() {
+    let run = |pose: Pose| {
+        let mut scene = new_scene();
+        let id = pose.add_model(&mut scene, &ball());
+        let center = pose.to_world(around_on_ball(0.2, 5)[1]);
+        let axis = pose.placement.normal_to_world([1.0, 0.1, 0.2]);
+        let mut found = Vec::new();
+        for radius in [0.04, 0.17, 0.43] {
+            for cone in [None, Some((axis, 0.5))] {
+                let faces = scene
+                    .select_faces_in_sphere_world(id, center, radius, cone)
+                    .unwrap();
+                found.push((format!("sphere of {radius}, cone {cone:?}"), faces));
+            }
+        }
+        for angle in [0.05, 0.1, 0.125, 0.15, 0.25, 0.4] {
+            let faces = scene.select_by_crease_angle(id, 1_200, angle).unwrap();
+            found.push((format!("crease of {angle}"), faces));
+        }
+        let a = pose.add_a(&mut scene);
+        for id in [id, a] {
+            for area in [1.0, 2.0, 4.0, 5.1, 8.0, 12.0] {
+                let faces = scene
+                    .select_small_face_islands(id, 1_000_000, Some(area))
+                    .unwrap();
+                found.push((format!("islands of at most {area}"), faces));
+            }
+        }
+        found
+    };
+    far_and_near(poses, run, |pose, got, near| {
+        for ((what, got), (_, want)) in got.iter().zip(near) {
+            let (n, m) = (got.len(), want.len());
+            assert!(got == want, "{what} on {pose:?}: {n} faces, not {m}");
+        }
+    });
+}
+
+#[test]
+fn surface_paths_keep_local_precision_far_away() {
+    let (from, to) = (4 * SEGMENTS + 3, 20 * SEGMENTS + 26);
+    let run = |pose: Pose| -> Vec<V3> {
+        let what = format!("path on {pose:?}");
+        let mut scene = new_scene();
+        let id = pose.add_model(&mut scene, &ball());
+        let mut distances = Vec::new();
+        let options = GeodesicOptions {
+            method: GeodesicMethod::Dijkstra,
+            ..GeodesicOptions::default()
+        };
+        scene
+            .geodesic_distances(id, &[from], &options, &mut distances)
+            .unwrap();
+        let mut path = Vec::new();
+        scene
+            .shortest_surface_path(id, &distances, &[from], to, &mut path)
+            .unwrap();
+        // Every point is where its barycentric coordinates say.
+        let mesh = scene.mesh(id).unwrap();
+        let corner = |v: u32| mesh.position(v).unwrap().map(f64::from);
+        for p in &path {
+            let [a, b, c] = mesh.triangle(p.triangle).unwrap().map(corner);
+            let [wa, wb, wc] = p.barycentric.map(f64::from);
+            let at = std::array::from_fn(|k| wa * a[k] + wb * b[k] + wc * c[k]);
+            let on = scene.local_to_world(id, at).unwrap();
+            check(off(&[p.position], &[on], [0.0; 3]), WORLD_TOL, &what);
+        }
+        path.iter().map(|p| p.position).collect()
+    };
+    far_and_near(poses, run, |pose, got, near| {
+        assert!(near.len() > 20);
+        let what = format!("path on {pose:?}");
+        check(off(&got, near, pose.shift()), WORLD_TOL, &what);
+    });
+}
+
+/// The vertices of a mesh in the world.
+fn world_positions(scene: &Scene, id: MeshId) -> Vec<V3> {
+    model_buffers(scene, id, Pose::NEAR).0
+}
+
+#[test]
+fn reconstructed_clouds_keep_local_precision_far_away() {
+    // As a file has them: text, with every digit.
+    let cloud_at = |at: V3| {
+        let rows: Vec<String> = around_on_ball(0.3, 24)
+            .into_iter()
+            .chain(around_on_ball(0.2, 18))
+            .chain(around_on_ball(0.1, 9))
+            .chain([add(MID, [RADIUS, 0.0, 0.0])])
+            .map(|p| {
+                let ([x, y, z], n) = (add(at, p), sub(p, MID).map(|c| c / RADIUS));
+                format!("{x:?} {y:?} {z:?} {:?} {:?} {:?}", n[0], n[1], n[2])
+            })
+            .collect();
+        PointCloud::parse_xyz_centered(&rows.join("\n")).unwrap()
+    };
+    for method in [
+        ReconstructMethod::ImplicitMlsMarchingCubes,
+        ReconstructMethod::BallPivoting,
+    ] {
+        let options = SurfaceReconstructOptions {
+            method,
+            ..SurfaceReconstructOptions::default()
+        };
+        let run = |at: V3| {
+            let mut scene = new_scene();
+            let (cloud, origin) = cloud_at(at);
+            let id = scene
+                .reconstruct_point_cloud_at(&cloud, origin, &options)
+                .unwrap();
+            assert_eq!(scene.mesh(id).unwrap().origin(), origin);
+            // One step, which redo brings back as it was.
+            let made = world_positions(&scene, id);
+            assert!(scene.undo().unwrap());
+            assert!(scene.redo().unwrap());
+            assert_eq!(world_positions(&scene, id), made);
+            made
+        };
+        let near = run([0.0; 3]);
+        for far in FAR {
+            let what = format!("{method:?} at {far:?}");
+            check(off(&run(far), &near, far), 4.0 * TOL, &what);
+        }
+    }
+    let mut scene = new_scene();
+    let (cloud, _) = cloud_at([0.0; 3]);
+    let options = SurfaceReconstructOptions::default();
+    for x in [f64::NAN, f64::INFINITY] {
+        let made = scene.reconstruct_point_cloud_at(&cloud, [0.0, x, 0.0], &options);
+        assert!(made.is_err());
+    }
+}
+
+/// Places `stamp` on the top of box A in `pose`, and returns what that made:
+/// the stamp itself, or the box with it. With `anchor` by that point of it.
+fn placed_on_top(
+    pose: Pose,
+    add_stamp: impl Fn(&mut Scene) -> MeshId,
+    anchor: Option<V3>,
+    params: &PlaceMeshParams,
+) -> Vec<V3> {
+    let mut scene = new_scene();
+    let (a, stamp) = (pose.add_a(&mut scene), add_stamp(&mut scene));
+    let (hit, normal) = top_of(pose);
+    let (report, added) = match anchor {
+        None => scene.place_mesh_world(a, stamp, hit, normal, params),
+        Some(p) => scene.place_mesh_anchored(a, stamp, p, hit, normal, params),
+    }
+    .unwrap();
+    let placed = world_positions(&scene, added.unwrap_or(a));
+    // The transform takes the stamp's own coordinates there.
+    if let Some(added) = added
+        && !params.conform_to_surface
+    {
+        let t = &report.transform;
+        let scale = scene.placement(stamp).unwrap().scale;
+        let mesh = scene.mesh(stamp).unwrap();
+        let by_transform: Vec<V3> = (0..mesh.vertex_slots() as u32)
+            .map(|v| {
+                let p = mesh.world_position(v).unwrap();
+                let s: V3 = std::array::from_fn(|k| t.scale * scale[k] * p[k]);
+                std::array::from_fn(|k| {
+                    let r = t.rigid.rotation[k];
+                    r[0] * s[0] + r[1] * s[1] + r[2] * s[2] + t.rigid.translation[k]
+                })
+            })
+            .collect();
+        for p in &placed {
+            let nearest = by_transform
+                .iter()
+                .map(|&q| off(&[*p], &[q], [0.0; 3]))
+                .fold(f64::INFINITY, f64::min);
+            check(nearest, 1e-5, "transform");
+        }
+        assert_eq!(scene.placement(added).unwrap(), Placement::IDENTITY);
+    }
+    placed
+}
+
+/// [`add_stamp`] with its geometry moved by `at`, and lying on another side
+/// for another up axis.
+fn add_stamp_at(scene: &mut Scene, at: V3, up: PlaceUpAxis) -> MeshId {
+    let (lo, hi) = match up {
+        PlaceUpAxis::PosZ => ([-0.1, -0.1, 0.0], [0.1, 0.1, 0.3]),
+        PlaceUpAxis::NegZ => ([-0.1, -0.1, -0.3], [0.1, 0.1, 0.0]),
+        PlaceUpAxis::PosY => ([-0.1, 0.0, -0.1], [0.1, 0.3, 0.1]),
+        PlaceUpAxis::NegY => ([-0.1, -0.3, -0.1], [0.1, 0.0, 0.1]),
+    };
+    let mesh = box_mesh(add(at, lo), add(at, hi));
+    let options = MeshOptions {
+        // What counts of it is the scale.
+        placement: Placement {
+            scale: [1.0, 1.25, 0.8],
+            ..moved([40.0, 50.0, 60.0])
+        },
+        ..MeshOptions::default()
+    };
+    scene.add_mesh(mesh, options).unwrap()
+}
+
+#[test]
+fn stamps_far_from_their_own_zero_stand_on_the_hit_point() {
+    for far in FAR {
+        for pose in [Pose::NEAR, rigid_poses(far)[2], scaled_pose(far, [1.5; 3])] {
+            for up_axis in [
+                PlaceUpAxis::PosZ,
+                PlaceUpAxis::NegZ,
+                PlaceUpAxis::PosY,
+                PlaceUpAxis::NegY,
+            ] {
+                for (mode, conform_to_surface) in [
+                    (PlaceMode::KeepSeparate, false),
+                    (PlaceMode::KeepSeparate, true),
+                    (PlaceMode::AppendShell, false),
+                    (PlaceMode::EmbedUnion, false),
+                ] {
+                    let what = format!("{up_axis:?} {mode:?} stamp of {far:?} on {pose:?}");
+                    let params = PlaceMeshParams {
+                        mode,
+                        conform_to_surface,
+                        up_axis,
+                        twist_angle_rad: 0.4,
+                        uniform_scale: 0.9,
+                        embed_depth: 0.05,
+                        ..PlaceMeshParams::default()
+                    };
+                    let at = |p: V3| move |s: &mut Scene| add_stamp_at(s, p, up_axis);
+                    let near = placed_on_top(pose, at([0.0; 3]), None, &params);
+                    let got = placed_on_top(pose, at(far), None, &params);
+                    check(off(&got, &near, [0.0; 3]), 1e-5, &what);
+                    // Or with the point given.
+                    let got = placed_on_top(pose, at(far), Some(far), &params);
+                    check(off(&got, &near, [0.0; 3]), 1e-5, &what);
+                    let moved = [0.02, -0.03, 0.01];
+                    let near = placed_on_top(pose, at([0.0; 3]), Some(moved), &params);
+                    let got = placed_on_top(pose, at(far), Some(add(far, moved)), &params);
+                    check(off(&got, &near, [0.0; 3]), 1e-5, &what);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stamps_near_their_own_zero_are_placed_by_it() {
+    let params = PlaceMeshParams {
+        mode: PlaceMode::KeepSeparate,
+        ..PlaceMeshParams::default()
+    };
+    let (up, zero) = (PlaceUpAxis::PosZ, Some([0.0; 3]));
+    // The stamp is 0.3 large: in reach of its zero up to 307.2 from it.
+    for (x, in_reach) in [(0.5, true), (300.0, true), (-300.0, true), (310.0, false)] {
+        let at = |s: &mut Scene| add_stamp_at(s, [x, 0.0, 0.0], up);
+        let by_default = placed_on_top(Pose::NEAR, at, None, &params);
+        let by_zero = placed_on_top(Pose::NEAR, at, zero, &params);
+        assert_eq!(by_default == by_zero, in_reach, "{x}");
+        let underside = placed_on_top(Pose::NEAR, at, Some([x, 0.0, 0.0]), &params);
+        let off_underside = off(&by_default, &underside, [0.0; 3]);
+        assert_eq!(off_underside < 1e-6, !in_reach, "{x}");
+    }
+}
+
+#[test]
+fn a_stamp_by_its_far_zero_keeps_local_precision() {
+    let params = PlaceMeshParams {
+        mode: PlaceMode::KeepSeparate,
+        twist_angle_rad: 0.4,
+        ..PlaceMeshParams::default()
+    };
+    let up = PlaceUpAxis::PosZ;
+    for far in FAR {
+        let pose = rigid_poses(far)[2];
+        let near = placed_on_top(pose, |s| add_stamp_at(s, [0.0; 3], up), None, &params);
+        let zero = Some([0.0; 3]);
+        let got = placed_on_top(pose, |s| add_stamp_at(s, far, up), zero, &params);
+        // Off the hit point by its own distance from zero: everywhere the same.
+        let shift = sub(got[0], near[0]);
+        let length = |v: V3| (0..3).map(|k| v[k] * v[k]).sum::<f64>().sqrt();
+        let scaled = [far[0], 1.25 * far[1], 0.8 * far[2]];
+        check((length(shift) - length(scaled)).abs(), 1e-5, "distance");
+        check(off(&got, &near, shift), 1e-5, &format!("stamp of {far:?}"));
     }
 }

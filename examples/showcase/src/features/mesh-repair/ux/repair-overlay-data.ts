@@ -115,9 +115,11 @@ export function triangleEdgeSegments(
 /**
  * The triangle slots of every component but the largest (by triangle
  * count): the "small components" a removal would drop. Ties keep the first
- * largest; a single component (or none) highlights nothing.
+ * largest; a single component (or none) highlights nothing. Cavities belong
+ * to the solid around them and are left out.
  */
-export function smallComponentTris(components: readonly MeshComponent[]): Uint32Array {
+export function smallComponentTris(all: readonly MeshComponent[]): Uint32Array {
+  const components = all.filter((c) => !c.cavity);
   if (components.length < 2) {
     return new Uint32Array(0);
   }

@@ -11,7 +11,9 @@
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_store::{Mesh, StoreError, TriangleId, VertexId};
 
-use crate::{Result, SceneError};
+use crate::placement::local_to_world;
+use crate::scene::Entry;
+use crate::{Placement, Result, SceneError};
 
 fn oom() -> SceneError {
     SceneError::Store(StoreError::OutOfMemory)
@@ -86,12 +88,85 @@ pub(crate) fn baked_copy(mesh: &Mesh, map: impl Fn([f32; 3]) -> [f64; 3]) -> Res
     Ok(baked)
 }
 
+/// How far from the world origin a mesh may be, in units of its largest local
+/// coordinate, for `f32` world positions to be about as good as its own: they
+/// are rounded by up to eight steps of those.
+const NEAR: f64 = 16.0;
+
+/// The world point a mesh at `placement` is baked around when it must be
+/// measured in world axes: where its own origin is, from which its positions
+/// are small, or zero for one near the world origin (see [`NEAR`]), whose
+/// positions are the world's then.
+pub(crate) fn world_base(mesh: &Mesh, placement: &Placement) -> [f64; 3] {
+    let at = local_to_world(placement, mesh.origin(), [0.0; 3]);
+    let alive = (0..mesh.vertex_slots() as VertexId).filter_map(|v| mesh.position(v));
+    let largest = alive.flatten().fold(0.0f32, |m, c| m.max(c.abs()));
+    let reach = NEAR * placement.max_scale() * f64::from(largest);
+    if at.iter().all(|c| c.abs() <= reach) {
+        [0.0; 3]
+    } else {
+        at
+    }
+}
+
+/// A copy of `mesh` as `placement` places it, in world axes, with `base` as
+/// its origin: its positions are the offsets from that world point, and as
+/// precise as the mesh's when the point is near it ([`world_base`]), however
+/// far from the world origin that is. Slot ids match the mesh's.
+///
+/// # Errors
+/// As for [`baked_mesh`].
+pub(crate) fn baked_around(mesh: &Mesh, placement: &Placement, base: [f64; 3]) -> Result<Mesh> {
+    let origin = mesh.origin();
+    let turn = Placement {
+        translation: [0.0; 3],
+        ..*placement
+    };
+    // Around its own origin nothing large is added and taken away again.
+    let own = base != [0.0; 3] && base == local_to_world(placement, origin, [0.0; 3]);
+    let copy = baked_copy(mesh, |l| {
+        let l = l.map(f64::from);
+        if own {
+            return turn.apply(l);
+        }
+        let w = local_to_world(placement, origin, l);
+        std::array::from_fn(|k| w[k] - base[k])
+    })?;
+    Ok(copy.with_origin(base)?)
+}
+
+/// [`baked_around`] of a scene mesh at `placement`, with a BVH built by its
+/// own options.
+///
+/// # Errors
+/// As for [`baked_mesh`].
+pub(crate) fn baked_pose(
+    entry: &Entry,
+    placement: &Placement,
+    base: [f64; 3],
+) -> Result<(Mesh, Bvh)> {
+    let baked = baked_around(&entry.mesh, placement, base)?;
+    let bvh = Bvh::build(&baked, entry.bvh.options())?;
+    Ok((baked, bvh))
+}
+
+/// A copy of a scene mesh as it is placed, in world axes, around the point
+/// that keeps its precision ([`world_base`]), its origin.
+///
+/// # Errors
+/// As for [`baked_mesh`].
+pub(crate) fn baked_in_place(entry: &Entry) -> Result<Mesh> {
+    let base = world_base(&entry.mesh, &entry.placement);
+    baked_around(&entry.mesh, &entry.placement, base)
+}
+
 #[cfg(test)]
 mod tests {
     use fast_mesh_bvh::BuildOptions;
     use fast_mesh_store::Mesh;
 
     use super::*;
+    use crate::{MeshOptions, Scene, SceneOptions};
 
     fn quad() -> Mesh {
         Mesh::from_buffers(
@@ -124,6 +199,58 @@ mod tests {
         let (empty, _) =
             baked_mesh(&Mesh::new(), |p| p.map(f64::from), &BuildOptions::default()).unwrap();
         assert_eq!(empty.triangle_slots(), 0);
+    }
+
+    #[test]
+    fn baked_in_place_is_around_the_world_origin_only_near_it() {
+        let placed = |translation: [f64; 3], scale: [f64; 3]| {
+            let mut scene = Scene::new(SceneOptions::default());
+            let placement = Placement {
+                translation,
+                scale,
+                ..Placement::IDENTITY
+            };
+            let options = MeshOptions {
+                placement,
+                ..MeshOptions::default()
+            };
+            let id = scene.add_mesh(quad(), options).unwrap();
+            let mesh = baked_in_place(scene.entry(id).unwrap()).unwrap();
+            (mesh.origin(), mesh.position(2).unwrap())
+        };
+        // Positions of up to 2: near is up to 32 away.
+        let near = placed([-32.0, 0.0, 31.0], [1.0; 3]);
+        assert_eq!(near, ([0.0; 3], [-30.0, 2.0, 31.0]));
+        let far = placed([-32.0, 0.0, 33.0], [1.0; 3]);
+        assert_eq!(far, ([-32.0, 0.0, 33.0], [2.0, 2.0, 0.0]));
+        let scaled = placed([0.0, 0.0, 33.0], [1.0, 2.0, 1.0]);
+        assert_eq!(scaled, ([0.0; 3], [2.0, 4.0, 33.0]));
+        let far = placed([1.0e7, 0.0, 0.0], [1.0, 2.0, 1.0]);
+        assert_eq!(far, ([1.0e7, 0.0, 0.0], [2.0, 4.0, 0.0]));
+    }
+
+    #[test]
+    fn baked_in_place_goes_by_the_vertices_there_are() {
+        let mut mesh = quad();
+        let mut tx = mesh.begin_edit();
+        tx.add_vertices(&[[900.0, 0.0, 0.0]]).unwrap();
+        let _ = tx.commit().unwrap();
+        let options = MeshOptions {
+            placement: Placement {
+                translation: [1000.0, 0.0, 0.0],
+                ..Placement::IDENTITY
+            },
+            ..MeshOptions::default()
+        };
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene.add_mesh(mesh, options).unwrap();
+        let origin = |scene: &Scene| {
+            let mesh = baked_in_place(scene.entry(id).unwrap()).unwrap();
+            mesh.origin()
+        };
+        assert_eq!(origin(&scene), [0.0; 3]);
+        scene.edit(id, |tx| tx.remove_vertices(&[4])).unwrap();
+        assert_eq!(origin(&scene), [1000.0, 0.0, 0.0]);
     }
 
     #[test]

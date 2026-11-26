@@ -14,7 +14,7 @@ use fast_mesh_ops::heightfield::{HeightfieldOptions, heightfield};
 use fast_mesh_query::{RAY_TILE, RayGrid};
 use fast_mesh_store::{Mesh, VertexId, par};
 
-use crate::placement::{local_to_world, world_to_local};
+use crate::placement::local_to_world;
 use crate::query::{
     Aabb64, F32_SLACK, PLACEMENT_SLACK, cached_world_box, local_mag, oom, round_up, try_vec,
     unit_dir,
@@ -517,7 +517,7 @@ fn target<'a>(e: &'a Entry, wbox: &Aabb64, frame: &HeightMapFrame) -> Result<Opt
     let grid = RayGrid::new(
         &e.mesh,
         &e.bvh,
-        world_to_local(p, e.mesh.origin(), frame.point(0.0, 0.0, start)),
+        e.world_to_local(frame.point(0.0, 0.0, start)),
         p.inverse_direction(normal.map(|c| -c)),
         local(frame.right),
         local(down),

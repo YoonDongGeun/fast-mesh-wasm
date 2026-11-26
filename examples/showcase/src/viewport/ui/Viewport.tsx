@@ -8,10 +8,11 @@
 // (`scene.raycast`, async on the Worker), one at a time and at most every
 // HOVER_PERIOD_MS, never three's per-triangle `Mesh.raycast`. This file
 // composes the scene; how it behaves (clicks, the brushes' pointer loops, the
-// gizmo, the camera) is in `viewport/ux/`.
+// gizmo, the camera) is in `viewport/ux/`. The features' layers come with their
+// chunks (`app/ui/feature-parts`): each draws nothing until it is here.
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
-import { FastMesh } from "fast-mesh-wasm/r3f";
+import { FastMesh, useFrameDriver } from "fast-mesh-wasm/r3f";
 import { useScene, useSelection, useStoreSelector } from "fast-mesh-wasm/react";
 import { meshState } from "fast-mesh-wasm/store";
 import type { MeshBinding } from "fast-mesh-wasm/three";
@@ -22,19 +23,31 @@ import type { FocusRequest } from "../../app/App";
 import type { Loader } from "../../io/loader";
 import { inspect } from "../../app/state/readouts";
 import { type AppState, type Item, useApp } from "../../app/state/app-state";
+import {
+  AlignToolsLayer,
+  BuildPlateLayer,
+  CreatePreviewLayer,
+  DeformHandlesLayer,
+  FaceSelectionLayer,
+  HollowPlaceToolsLayer,
+  InspectLayers,
+  LatticePreviewLayer,
+  LatticeSeeThrough,
+  MaskLayer,
+  MetrologyOverlaysLayer,
+  PlacementPicksLayer,
+  PolylineLayer,
+  ReliefPreviewLayer,
+  SculptLayer,
+  SculptMaskOverlay,
+  SurfacePathLayer,
+  TextPreviewLayer,
+} from "../../app/ui/feature-parts";
 import { evaluateOverlayColor } from "../../engine/workbench-ops";
-import { BuildPlateLayer } from "../../features/build-plate/ui/BuildPlateLayer";
-import { InspectLayers } from "../../features/inspect/ui/InspectLayers";
-import { CreatePreviewLayer } from "../../features/home/ui/CreatePreviewLayer";
-import { TextPreviewLayer } from "../../features/mesh-edit/ui/TextPreviewLayer";
-import { ReliefPreviewLayer } from "../../features/mesh-edit/ui/ReliefPreviewLayer";
 import { SceneSlices } from "../../features/ct/ui/SceneSlices";
 import { SceneVolume } from "../../features/ct/ui/SceneVolume";
 import { matchVolume } from "../../features/ct/ux/volume-box";
 import type { SculptBrush } from "../../features/sculpt/ux/sculpt";
-import { makeBrushCursor } from "../../features/sculpt/ui/brush-cursor";
-import { MaskOverlay } from "../../features/sculpt/ui/mask-overlay";
-import type { MaskLiveTracker } from "../../features/sculpt/ux/mask-protect";
 import {
   type AppliedShadingState,
   clearMeshDiagnosticShading,
@@ -44,20 +57,10 @@ import {
   countRepairOverlays,
 } from "../../features/mesh-repair/ux/repair-overlay-data";
 import { buildHealerOverlayGroup, disposeHealerOverlayGroup } from "../../features/mesh-repair/ui/healer-overlays";
-import { DeformHandlesLayer } from "../../features/sculpt/ui/DeformHandlesLayer";
-import { FaceSelectionLayer } from "../../features/select/ui/FaceSelectionLayer";
-import { HollowPlaceToolsLayer } from "../../features/mesh-edit/ui/HollowPlaceToolsLayer";
-import { LatticePreviewLayer, LatticeSeeThrough } from "../../features/mesh-edit/ui/LatticePreviewLayer";
-import { MetrologyOverlaysLayer } from "../../features/points/ui/MetrologyOverlaysLayer";
-import { PlacementPicksLayer } from "../../features/transform/ui/PlacementPicksLayer";
-import { PolylineLayer } from "../../features/polylines/ui/PolylineLayer";
-import { AlignToolsLayer } from "../../features/transform/ui/AlignToolsLayer";
-import { SurfacePathLayer } from "../../features/inspect/ui/SurfacePathLayer";
 import { useCameraRequests, useOrbitCamera } from "../ux/use-camera-controller";
 import { useGizmoDrag, useMeshBindings } from "../ux/use-gizmo";
 import { useHoverRay } from "../ux/use-hover-ray";
-import { useMaskPaint, useMaskPaintDisarm, useMaskTracker } from "../ux/use-mask-paint";
-import { useSculptStroke } from "../ux/use-sculpt-stroke";
+import { useMaskPaintDisarm, useMaskTracker } from "../ux/use-mask-tracker";
 import { useMeshClick, usePressTracker, useSelectionClicks } from "../ux/use-selection-clicks";
 
 export type GizmoMode = "translate" | "rotate" | "scale";
@@ -163,6 +166,7 @@ export function Viewport(props: {
 
   return (
     <Canvas camera={{ position: [-0.6, 3.4, 8.2], fov: 45, near: 0.01, far: 5000 }} onPointerMissed={onMissed}>
+      <FrameDriver />
       <color attach="background" args={["#1b1e23"]} />
       <hemisphereLight args={["#e8eef8", "#30343c", 1.1]} />
       <directionalLight position={[3, 6, 4]} intensity={2} />
@@ -243,6 +247,16 @@ export function Viewport(props: {
 }
 
 /** The canvas's pointerdowns, recorded for the missed click (`usePressTracker`). */
+/**
+ * Commits the store's frame with every rendered one, also while the scene has
+ * no mesh: each `<FastMesh>` does, but the last one leaves with its mesh, and
+ * the removal itself (and an undo of it) would never be sent.
+ */
+function FrameDriver() {
+  useFrameDriver();
+  return null;
+}
+
 function MissTracker(props: { track: { current: { x: number; y: number } | null } }) {
   usePressTracker(props.track);
   return null;
@@ -443,49 +457,6 @@ function SurfaceFieldOverlay(props: { app: AppState; item: Item; bound: MeshBind
 }
 
 /**
- * The sculpt mask's tint on its mesh (see `viewport/mask-overlay.ts`), while
- * a sculpt tool or the mask paint is armed and it is not hidden. A child of
- * the bound mesh, so it hides with it; the frame loop follows the mask and
- * the mesh's triangles (a remesh, an undo), at most one build per frame.
- */
-function SculptMaskOverlay(props: { app: AppState; item: Item; bound: MeshBinding | null }) {
-  const { app, item, bound } = props;
-  const masked = useApp(app, (s) => (s.sculptMask?.mesh === item.mesh ? s.sculptMask.vertices : null));
-  const armed = useApp(app, (s) => s.sculpt !== null || s.maskPaint);
-  const shown = useApp(app, (s) => s.sculptMaskShown);
-  const on = armed && shown && masked !== null;
-  const object = bound?.object ?? null;
-  const overlayRef = useRef<MaskOverlay | null>(null);
-  useLayoutEffect(() => {
-    if (!on || object === null) {
-      return;
-    }
-    const created = new MaskOverlay(object);
-    overlayRef.current = created;
-    return () => {
-      overlayRef.current = null;
-      created.dispose();
-      inspect.sculpt.maskOverlay.triangles = 0;
-    };
-  }, [on, object]);
-  useFrame(() => {
-    const overlay = overlayRef.current;
-    if (overlay === null || masked === null) {
-      return;
-    }
-    const start = performance.now();
-    if (overlay.sync(masked)) {
-      const stats = inspect.sculpt.maskOverlay;
-      stats.lastMs = performance.now() - start;
-      stats.maxMs = Math.max(stats.maxMs, stats.lastMs);
-      stats.builds++;
-      stats.triangles = overlay.triangles;
-    }
-  });
-  return null;
-}
-
-/**
  * The repair-issue overlays on their analysed mesh: hole boundaries,
  * non-manifold edges, degenerate triangles and small components from the
  * repair panel's latest analysis, as children of the bound mesh's object
@@ -551,57 +522,6 @@ function RepairOverlays(props: {
 /** The vertex under the pointer, into `view.hover` (`useHoverRay`), while Group mode hovers. */
 function HoverRay(props: { scene: Scene | WorkerScene }) {
   useHoverRay(props.scene);
-  return null;
-}
-
-/**
- * The sculpt brush on its mesh: the brush cursor (amber), which the stroke
- * driver (`useSculptStroke`) lays on the surface under the pointer while it
- * paints the stroke's dabs.
- */
-function SculptLayer(props: {
-  app: AppState;
-  scene: Scene | WorkerScene;
-  sculpt: SculptBrush;
-  remesh: boolean;
-  liveRemesh: boolean;
-  maskTracker: MaskLiveTracker;
-}) {
-  const { app, scene, sculpt, remesh, liveRemesh, maskTracker } = props;
-  const ball = useMemo(() => makeBrushCursor(0xffd166), []);
-  useEffect(() => {
-    return () => {
-      ball.removeFromParent();
-      for (const child of ball.children) {
-        const part = child as THREE.Mesh | THREE.Line;
-        part.geometry.dispose();
-        (part.material as THREE.Material).dispose();
-      }
-    };
-  }, [ball]);
-  useSculptStroke({ app, scene, sculpt, remesh, liveRemesh, maskTracker, ball });
-  return null;
-}
-
-/**
- * The mask paint on the selected mesh: the paint ball (blue, against sculpt's
- * amber), which `useMaskPaint` lays on the surface under the pointer while it
- * paints the mask.
- */
-function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene; maskTracker: MaskLiveTracker }) {
-  const { app, scene, maskTracker } = props;
-  const ball = useMemo(() => makeBrushCursor(0x6ea8d9), []);
-  useEffect(() => {
-    return () => {
-      ball.removeFromParent();
-      for (const child of ball.children) {
-        const part = child as THREE.Mesh | THREE.Line;
-        part.geometry.dispose();
-        (part.material as THREE.Material).dispose();
-      }
-    };
-  }, [ball]);
-  useMaskPaint({ app, scene, maskTracker, ball });
   return null;
 }
 

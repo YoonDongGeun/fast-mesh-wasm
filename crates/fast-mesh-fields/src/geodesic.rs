@@ -5,8 +5,9 @@
 //!   edges with Euclidean edge weights.
 //! - [`GeodesicMethod::HeatMethod`]: Crane, Weischedel & Wardetzky (2013),
 //!   *Geodesics in Heat*, solving a backward-Euler heat diffusion step on the
-//!   clamped cotangent Laplacian followed by unit-gradient normalization and a
-//!   Poisson distance reconstruction.
+//!   cotangent Laplacian followed by unit-gradient normalization and a Poisson
+//!   distance reconstruction, on an intrinsic Delaunay triangulation of the
+//!   surface where the mesh's own triangles are not good enough.
 //!
 //! For repeated queries on the same mesh with varying source sets, build
 //! [`GeodesicHeatSolver`] once and call [`GeodesicHeatSolver::solve`]. To
@@ -15,6 +16,7 @@
 mod amg;
 mod diffuse;
 mod heat;
+mod intrinsic;
 
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -34,9 +36,42 @@ use heat::{HeatSolve, SolverBuild};
 pub enum GeodesicMethod {
     /// Multi-source Dijkstra along mesh edges weighted by Euclidean edge length.
     Dijkstra,
-    /// Crane et al. (2013) *Geodesics in Heat* via the clamped cotangent
-    /// Laplacian: the diffusion solved outwards from the sources in bands,
-    /// the distances by conjugate gradients with a multigrid preconditioner.
+    /// Crane et al. (2013) *Geodesics in Heat* via the cotangent Laplacian:
+    /// the diffusion solved outwards from the sources in bands, the distances
+    /// by conjugate gradients with a multigrid preconditioner.
+    ///
+    /// Stretched, obtuse and large triangles (fans, say) do not spoil the
+    /// distances: where the mesh has such, the surface is cut into other ones
+    /// first, without moving it (an intrinsic Delaunay triangulation; Sharp,
+    /// Soliman & Crane 2019). It gets vertices of its own in triangles whose
+    /// circumcircles are larger than the mean edge length, and more yet on a
+    /// mesh of fewer than some thousand vertices: each connected part at most
+    /// half as many triangles as it has, and all parts together 8000 on top.
+    /// An evenly triangulated mesh is used as it is.
+    ///
+    /// # Accuracy
+    /// The distances are off by about 1 % on average, more on some meshes
+    /// (2 %) and less on others. On the reference meshes of the tests
+    /// (spheres stretched and skewed up to a hundred times, capped cylinders,
+    /// discs and strips that are single fans, sheared grids, triangles of all
+    /// sizes, edges with many triangles; 64 to 17 000 triangles), against
+    /// exact distances over the surface:
+    /// - the mean relative error of the distances above a tenth of the
+    ///   largest one is below 3 %, and
+    /// - no distance is off by more than 4 % of the largest one.
+    ///
+    /// A distance of only a few mean edge lengths is relatively further off,
+    /// by up to about one of these lengths. The error does not go to zero on
+    /// ever finer meshes: for that the time step must not shrink as fast. From
+    /// some 10 000 triangles on, a [`GeodesicOptions::time_step_scale`] of 2
+    /// to 4 gives mostly better distances (two thirds to a third of the error
+    /// on a sphere), further away from the sources.
+    ///
+    /// The bounds do not hold where a part would have to grow by more than it
+    /// may (most of its triangles are much smaller than the rest of it),
+    /// where triangles are some ten million times as long as they are high,
+    /// and where the triangles do not make up a surface (random ones that
+    /// share corners, not edges).
     HeatMethod,
 }
 
@@ -48,8 +83,9 @@ pub struct GeodesicOptions {
     /// Optional distance cutoff; vertices farther than this bound (or on
     /// unreachable components) receive `f32::INFINITY`.
     pub max_distance: Option<f32>,
-    /// Multiplier `m` for the heat diffusion time step `t = m * h_mean^2`.
-    /// Must be finite and strictly positive. Default: `1.0`.
+    /// Multiplier `m` for the heat diffusion time step `t = m * h^2`, where
+    /// `h` is the mean edge length, or `sqrt(area / 2000)` where that is
+    /// smaller. Must be finite and strictly positive. Default: `1.0`.
     pub time_step_scale: f64,
 }
 
@@ -68,7 +104,8 @@ impl Default for GeodesicOptions {
 pub enum GeodesicPhase {
     /// Dijkstra: building the edge graph and walking it.
     Graph,
-    /// Heat method: assembling the operators of the mesh.
+    /// Heat method: cutting the surface into better triangles if need be, and
+    /// assembling its operators.
     Assemble,
     /// Heat method: building the Laplacian's multigrid levels.
     Factorize,

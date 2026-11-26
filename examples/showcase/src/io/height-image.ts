@@ -9,6 +9,8 @@
 import type { HeightMapFrame } from "fast-mesh-wasm";
 import { canDecodePng, decodePng, encodePng16, isPng, type PngImage, readPngHeader } from "./png";
 
+export { isImageFile } from "./image-file";
+
 /** The largest code of a 16-bit image. */
 export const MAX_CODE = 65535;
 
@@ -17,11 +19,6 @@ export const MAX_IMAGE_PIXELS = 2 ** 26;
 
 /** Files the image import takes, for a file input's `accept`. */
 export const IMAGE_ACCEPT = ".png,.jpg,.jpeg,.webp,.bmp,.gif,.avif,image/*";
-
-/** Whether a file is an image, by its type or else its extension. */
-export function isImageFile(file: { name: string; type: string }): boolean {
-  return file.type.startsWith("image/") || /\.(?:png|jpe?g|webp|bmp|gif|avif)$/i.test(file.name);
-}
 
 // ---- Heights to an image ----
 

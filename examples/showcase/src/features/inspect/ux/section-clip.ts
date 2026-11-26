@@ -159,10 +159,11 @@ export function fitWorldBox(scene: Scene | WorkerScene, item: Item): ClipBox | n
   try {
     const m = scene.matrix4(item.mesh);
     const [cx, cy, cz] = worldCenter(scene, item.mesh);
-    // The placement's axis scales (columns' lengths): non-uniform scale (#103) stretches the box.
-    const sx = Math.sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
-    const sy = Math.sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
-    const sz = Math.sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
+    // How far the matrix takes a unit ball along each world axis (its rows' lengths):
+    // non-uniform scale (#103) stretches the box, and a turned one along other axes.
+    const sx = Math.sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]);
+    const sy = Math.sqrt(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
+    const sz = Math.sqrt(m[2] * m[2] + m[6] * m[6] + m[10] * m[10]);
     const r = Math.max(item.radius, 1e-6) / 2;
     return {
       min: [cx - sx * r, cy - sy * r, cz - sz * r],

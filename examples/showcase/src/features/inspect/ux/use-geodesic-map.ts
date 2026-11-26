@@ -10,6 +10,7 @@ import type { MeshHandle } from "fast-mesh-wasm";
 import { useScene } from "fast-mesh-wasm/react";
 import { useEffect, useRef, useState } from "react";
 import { type AppState, type Item, type SurfaceFieldOverlayData, useApp } from "../../../app/state/app-state";
+import { drawOrigin } from "../../../shared/ux/draw-origin";
 import {
   autoIsoSpacing,
   type GeodesicMapReport,
@@ -243,16 +244,18 @@ export function useGeodesicMap(
     try {
       const mesh = report.request.mesh;
       const views = store.scene.views(mesh);
-      app.setSurfacePath({
-        isoLines: isoLineSegments(
-          views.positions(),
-          views.indices(),
-          store.scene.matrix4(mesh),
-          report.values,
-          spacing,
-          radius * SURFACE_LINE_OFFSET,
-        ),
-      });
+      const matrix = store.scene.matrix4(mesh);
+      const isoAround = drawOrigin([matrix[12], matrix[13], matrix[14]]);
+      const isoLines = isoLineSegments(
+        views.positions(),
+        views.indices(),
+        matrix,
+        report.values,
+        spacing,
+        radius * SURFACE_LINE_OFFSET,
+        isoAround,
+      );
+      app.setSurfacePath({ isoLines, isoAround });
     } catch {
       clear(); // removed meanwhile
     }

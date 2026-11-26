@@ -18,7 +18,7 @@ use fast_mesh_store::{Mesh, StoreError, TriangleId, UV_CHANNEL, VertexId};
 
 use crate::baked::baked_mesh;
 pub use crate::ops::boolean::{BooleanMethod, BooleanOptions, CsgNode};
-use crate::placement::{is_relative_rigid, local_to_world, relative_affine, relative_rigid};
+use crate::placement::{is_relative_rigid, relative_affine, relative_rigid};
 use crate::{MeshId, MeshOptions, Placement, Result, Scene};
 
 /// Which boolean to compute.
@@ -227,6 +227,9 @@ impl Scene {
     ///
     /// Supports both [`BooleanMethod::Manifold`] (with optional seam sliver snapping and
     /// `max_triangles` simplification) and volumetric fallbacks (`BvhSdf`, `FhEdt`).
+    ///
+    /// It runs in `a`'s local space: the tolerance and the voxel pitch are lengths there, before
+    /// `a`'s scale, and voxels lie along its own axes. ([`Scene::boolean_batch`] runs in the world.)
     pub fn boolean_with_options(
         &mut self,
         a: MeshId,
@@ -423,13 +426,12 @@ impl Scene {
                 let Some(b) = entry.bvh.root_bounds().filter(|b| !b.is_empty()) else {
                     return Ok(());
                 };
-                let o = entry.mesh.origin();
                 for corner in 0..8 {
                     let p = std::array::from_fn(|k| {
                         let end = if corner >> k & 1 == 1 { b.max } else { b.min };
                         f64::from(end[k])
                     });
-                    let w = local_to_world(&entry.placement, o, p);
+                    let w = entry.local_to_world(p);
                     for (k, &c) in w.iter().enumerate() {
                         bounds.0[k] = bounds.0[k].min(c);
                         bounds.1[k] = bounds.1[k].max(c);

@@ -1,5 +1,6 @@
 //! The shared undo history: steps of edits, placement changes and undoable
-//! adds and removals across meshes, limited by a memory budget.
+//! adds and removals across meshes, and of entries of the application's own,
+//! limited by a memory budget.
 
 use std::collections::VecDeque;
 use std::mem::size_of;
@@ -12,6 +13,105 @@ use crate::{MeshId, Placement, Result, SceneError};
 
 /// Bytes a placement entry counts against the budget: its old and new value.
 pub(crate) const PLACEMENT_BYTES: usize = 2 * size_of::<Placement>();
+
+/// What can no longer be done with a [`PermanentStep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorySide {
+    /// The step was just made (or redone), and cannot be undone.
+    Undo,
+    /// The step was just undone, and cannot be redone.
+    Redo,
+}
+
+/// A step the history let go of as it was made, undone or redone, since it is
+/// larger than the budget (see
+/// [`Scene::take_permanent`](crate::Scene::take_permanent)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermanentStep {
+    /// What can no longer be done with it.
+    pub lost: HistorySide,
+    /// The meshes it edited, moved, added or removed, each once, in recording
+    /// order. Those in `gone` no longer match.
+    pub meshes: Vec<MeshId>,
+    /// Of those, the meshes that are out of the scene with nothing left to
+    /// bring them back.
+    pub gone: Vec<MeshId>,
+    /// The bytes it counted, against
+    /// [`Scene::history_budget`](crate::Scene::history_budget).
+    pub bytes: u64,
+}
+
+/// The most [`PermanentStep`]s kept for `take_permanent`: the latest.
+const MAX_PERMANENT: usize = 256;
+
+/// An entry of the application's own in the history, for
+/// [`Scene::record_entry`](crate::Scene::record_entry). The scene knows
+/// nothing of what it stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HistoryEntry {
+    /// The application's name for it, given back by the [`EntryEvent`]s.
+    /// Should be unused by any entry not dropped yet.
+    pub id: u64,
+    /// The bytes the application keeps for it, counted against the history
+    /// budget (at most 1 TiB each) with what the entry itself takes here.
+    pub bytes: u64,
+    /// In an open step, an entry recorded right after one with the same key
+    /// merges with it (`None`: never), as consecutive placement changes do.
+    pub merge: Option<u64>,
+}
+
+/// What happened to an application's entry; see
+/// [`Scene::take_entry_events`](crate::Scene::take_entry_events).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryEvent {
+    /// Undone, or reverted with a cancelled step. Of merged entries, the
+    /// first: it stands for all of them.
+    Undone(u64),
+    /// Redone. Of merged entries, the last: it stands for all of them.
+    Redone(u64),
+    /// Let go of: it is not undone or redone any more, and has no more
+    /// events. Once per entry.
+    Dropped(u64),
+}
+
+/// What an entry of the application counts beside its own bytes: the change
+/// it is recorded as, so that entries without any of their own cannot pile up
+/// without limit.
+pub(crate) const ENTRY_BYTES: u64 = size_of::<Change>() as u64;
+/// The most of its own bytes an entry counts: no sum of them overflows.
+const MAX_ENTRY_BYTES: u64 = 1 << 40;
+
+/// One entry of the application, as it is counted.
+#[derive(Clone, Copy)]
+pub(crate) struct AppEntry {
+    id: u64,
+    bytes: u64,
+}
+
+/// Application entries merged into one change; usually a single one.
+pub(crate) struct AppRun {
+    /// Undone for all of them.
+    first: AppEntry,
+    /// Redone for all of them; `None` when it is `first`. Those in between
+    /// were dropped as they were merged.
+    last: Option<AppEntry>,
+    key: Option<u64>,
+}
+
+impl AppRun {
+    fn bytes(&self) -> u64 {
+        self.first.bytes + self.last.map_or(0, |e| e.bytes)
+    }
+
+    /// The event of an undo (or of a redo: `forward`).
+    fn event(&self, forward: bool) -> EntryEvent {
+        if forward {
+            EntryEvent::Redone(self.last.unwrap_or(self.first).id)
+        } else {
+            EntryEvent::Undone(self.first.id)
+        }
+    }
+}
 
 /// One recorded change of a step.
 ///
@@ -36,15 +136,19 @@ pub(crate) enum Change {
     /// An undoable removal: the mesh is parked, undo restores it and redo
     /// parks it again. `bytes` is what the mesh held when it was last parked.
     Remove { id: MeshId, bytes: usize },
+    /// Entries of the application. Running it changes nothing here and cannot
+    /// fail; the application is told once the whole step has run.
+    App(AppRun),
 }
 
 impl Change {
-    fn mesh(&self) -> MeshId {
+    fn mesh(&self) -> Option<MeshId> {
         match self {
             Change::Edit(id, _)
             | Change::Placement { id, .. }
             | Change::Add { id, .. }
-            | Change::Remove { id, .. } => *id,
+            | Change::Remove { id, .. } => Some(*id),
+            Change::App(_) => None,
         }
     }
 
@@ -52,20 +156,23 @@ impl Change {
     /// restored by holds it: its removal on the undo side, its add on the
     /// redo side. On the other side the mesh is live, or held by another
     /// entry.
-    fn bytes(&self, side: PatchSide) -> usize {
-        match self {
+    fn bytes(&self, side: PatchSide) -> u64 {
+        let bytes = match self {
             Change::Edit(_, p) => p.byte_size(),
             Change::Placement { .. } => PLACEMENT_BYTES,
             Change::Add { bytes, .. } if side == PatchSide::Redoable => *bytes,
             Change::Remove { bytes, .. } if side == PatchSide::Undoable => *bytes,
             Change::Add { .. } | Change::Remove { .. } => 0,
-        }
+            Change::App(run) => return run.bytes(),
+        };
+        bytes as u64
     }
 }
 
 /// Releases what `change` holds once the history drops it from `side`: the
 /// slots its patch reserves (on its mesh, live or parked), or the parked mesh
-/// it was the last way back to. Call once, when the change is discarded.
+/// it was the last way back to; the application's entries are noted as
+/// dropped in `events`. Call once, when the change is discarded.
 ///
 /// An add dropped from the redo side, or a removal dropped from the undo
 /// side, frees its parked mesh: the id never matches again. An add dropped
@@ -75,7 +182,12 @@ impl Change {
 /// Every change in the history belongs to a live or a parked mesh, or to one
 /// another change of the same batch just freed: `remove_mesh` drops a live
 /// mesh's changes before the mesh goes, and a parked mesh is freed only here.
-fn release_in(change: &Change, entries: &mut SlotMap<Entry>, side: PatchSide) {
+fn release_in(
+    change: &Change,
+    entries: &mut SlotMap<Entry>,
+    side: PatchSide,
+    events: &mut VecDeque<EntryEvent>,
+) {
     match change {
         Change::Edit(id, p) => {
             if let Some(e) = entries.get_any_mut(*id) {
@@ -93,6 +205,10 @@ fn release_in(change: &Change, entries: &mut SlotMap<Entry>, side: PatchSide) {
                 drop(entries.release_parked(*id));
             }
         }
+        Change::App(run) => {
+            events.push_back(EntryEvent::Dropped(run.first.id));
+            events.extend(run.last.map(|e| EntryEvent::Dropped(e.id)));
+        }
     }
 }
 
@@ -101,7 +217,7 @@ fn release_in(change: &Change, entries: &mut SlotMap<Entry>, side: PatchSide) {
 pub(crate) struct Step {
     changes: Vec<Change>,
     /// What the changes hold on the stack the step is on.
-    bytes: usize,
+    bytes: u64,
 }
 
 impl Step {
@@ -116,6 +232,34 @@ impl Step {
             }
         }
         self.bytes = self.changes.iter().map(|c| c.bytes(side)).sum();
+    }
+
+    /// The report that the step cannot be undone, or redone, any more.
+    fn permanent(&self, lost: HistorySide) -> PermanentStep {
+        let mut meshes = Vec::new();
+        let mut gone = Vec::new();
+        for c in &self.changes {
+            let Some(id) = c.mesh() else {
+                continue;
+            };
+            if !meshes.contains(&id) {
+                meshes.push(id);
+            }
+            let out = match c {
+                Change::Remove { .. } => lost == HistorySide::Undo,
+                Change::Add { .. } => lost == HistorySide::Redo,
+                Change::Edit(..) | Change::Placement { .. } | Change::App(_) => false,
+            };
+            if out && !gone.contains(&id) {
+                gone.push(id);
+            }
+        }
+        PermanentStep {
+            lost,
+            meshes,
+            gone,
+            bytes: self.bytes,
+        }
     }
 }
 
@@ -139,7 +283,8 @@ pub(crate) enum Done {
 /// step larger than the whole budget is dropped as soon as it closes. An
 /// undo or a redo always happens, and then meets the budget, which it
 /// exceeds only when it undid a non-empty open step or parked meshes (see
-/// `trim_undone` and `trim_redone`).
+/// `trim_undone` and `trim_redone`). A step dropped as it closes, is undone
+/// or is redone is noted in `permanent`.
 pub(crate) struct History {
     undo: VecDeque<Step>,
     redo: Vec<Step>,
@@ -147,7 +292,11 @@ pub(crate) struct History {
     /// Nesting depth of `begin_step`; 0 when no step is open.
     depth: u32,
     budget: usize,
-    bytes: usize,
+    bytes: u64,
+    /// Steps dropped as they were made, undone or redone, not taken yet.
+    permanent: VecDeque<PermanentStep>,
+    /// What happened to entries of the application, not taken yet.
+    events: VecDeque<EntryEvent>,
 }
 
 impl History {
@@ -159,7 +308,61 @@ impl History {
             depth: 0,
             budget,
             bytes: 0,
+            permanent: VecDeque::new(),
+            events: VecDeque::new(),
         }
+    }
+
+    /// Takes the next thing that happened to an entry of the application.
+    pub(crate) fn next_event(&mut self) -> Option<EntryEvent> {
+        self.events.pop_front()
+    }
+
+    /// Most bytes the steps may hold.
+    pub(crate) fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// Changes the budget and meets it: the oldest undo steps go first, then
+    /// the furthest redo steps. An open step is kept, and meets it once
+    /// closed.
+    pub(crate) fn set_budget(&mut self, entries: &mut SlotMap<Entry>, budget: usize) {
+        self.budget = budget;
+        self.evict(entries);
+        self.evict_redo(entries, 0);
+    }
+
+    /// Bytes held by every step.
+    pub(crate) fn held(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Whether the steps hold more than the budget.
+    fn over(&self) -> bool {
+        self.bytes > self.budget as u64
+    }
+
+    /// Takes the steps noted as permanent since the last call.
+    pub(crate) fn take_permanent(&mut self) -> Vec<PermanentStep> {
+        std::mem::take(&mut self.permanent).into()
+    }
+
+    /// Whether `take_permanent` would return any.
+    pub(crate) fn has_permanent(&self) -> bool {
+        !self.permanent.is_empty()
+    }
+
+    /// Notes the step just made, undone or redone as permanent: `dropped`,
+    /// the last of those dropped to meet the budget, is it once `left` (what
+    /// is left of the stack it was on) is empty.
+    fn note_permanent(&mut self, dropped: Option<Step>, left: usize, lost: HistorySide) {
+        let Some(step) = dropped.filter(|_| left == 0) else {
+            return;
+        };
+        if self.permanent.len() == MAX_PERMANENT {
+            self.permanent.pop_front();
+        }
+        self.permanent.push_back(step.permanent(lost));
     }
 
     pub(crate) fn begin(&mut self) {
@@ -186,7 +389,8 @@ impl History {
         }
         // `reserve` made room for this push when the first change was recorded.
         self.undo.push_back(std::mem::take(&mut self.open));
-        self.evict(entries);
+        let dropped = self.evict(entries);
+        self.note_permanent(dropped, self.undo.len(), HistorySide::Undo);
     }
 
     /// Makes room for one more change, so that `record` (and the `close`
@@ -196,7 +400,13 @@ impl History {
         #[cfg(test)]
         crate::scene::fault::before_reserve()?;
         let oom = |_| SceneError::Store(StoreError::OutOfMemory);
-        self.open.changes.try_reserve(1).map_err(oom)?;
+        let changes = &mut self.open.changes;
+        if changes.is_empty() {
+            // Most steps have one change, and a change is large.
+            changes.try_reserve_exact(1).map_err(oom)?;
+        } else {
+            changes.try_reserve(1).map_err(oom)?;
+        }
         self.undo.try_reserve(1).map_err(oom)
     }
 
@@ -248,54 +458,108 @@ impl History {
         self.record(entries, Change::Placement { id, old, new });
     }
 
+    /// Records an entry of the application like `record`, except that it
+    /// merges into the open step's last change when that is one with the same
+    /// key: the merged change is undone by its first entry and redone by this
+    /// one, and what was its last until now is dropped. Any other change in
+    /// between breaks the run. `reserve` must have succeeded since the last
+    /// `record`.
+    pub(crate) fn record_app(&mut self, entries: &mut SlotMap<Entry>, entry: HistoryEntry) {
+        let HistoryEntry { id, bytes, merge } = entry;
+        let new = AppEntry {
+            id,
+            bytes: bytes.min(MAX_ENTRY_BYTES) + ENTRY_BYTES,
+        };
+        if self.depth > 0
+            && merge.is_some()
+            && let Some(Change::App(run)) = self.open.changes.last_mut()
+            && run.key == merge
+        {
+            let old = run.last.replace(new);
+            self.open.bytes += new.bytes;
+            self.bytes += new.bytes;
+            if let Some(old) = old {
+                self.open.bytes -= old.bytes;
+                self.bytes -= old.bytes;
+                self.events.push_back(EntryEvent::Dropped(old.id));
+            }
+            // Recording the run's first entry dropped the redo stack already.
+            debug_assert!(self.redo.is_empty(), "redo steps beside an open step");
+            self.evict(entries);
+            return;
+        }
+        let run = AppRun {
+            first: new,
+            last: None,
+            key: merge,
+        };
+        self.record(entries, Change::App(run));
+    }
+
     fn drop_redo(&mut self, entries: &mut SlotMap<Entry>) {
         for step in self.redo.drain(..) {
             self.bytes -= step.bytes;
             for c in &step.changes {
-                release_in(c, entries, PatchSide::Redoable);
+                release_in(c, entries, PatchSide::Redoable, &mut self.events);
             }
         }
     }
 
-    fn evict(&mut self, entries: &mut SlotMap<Entry>) {
-        while self.bytes > self.budget && self.evict_one(entries) {}
+    /// Drops the oldest undo steps until the budget is met, or none are left.
+    /// Returns the last one dropped.
+    fn evict(&mut self, entries: &mut SlotMap<Entry>) -> Option<Step> {
+        let mut last = None;
+        while self.over() {
+            let Some(step) = self.evict_one(entries) else {
+                break;
+            };
+            last = Some(step);
+        }
+        last
     }
 
-    /// Drops the oldest undo step; false when there is none.
-    fn evict_one(&mut self, entries: &mut SlotMap<Entry>) -> bool {
-        let Some(step) = self.undo.pop_front() else {
-            return false;
-        };
+    /// Drops the oldest undo step and returns it, its changes released.
+    fn evict_one(&mut self, entries: &mut SlotMap<Entry>) -> Option<Step> {
+        let step = self.undo.pop_front()?;
         self.bytes -= step.bytes;
         for c in &step.changes {
-            release_in(c, entries, PatchSide::Undoable);
+            release_in(c, entries, PatchSide::Undoable, &mut self.events);
         }
-        true
+        Some(step)
     }
 
     /// Closes the open step, then drops every step, releasing their slots.
     pub(crate) fn clear(&mut self, entries: &mut SlotMap<Entry>) {
-        self.close(entries);
-        for step in self.undo.drain(..) {
+        self.depth = 0;
+        let open = std::mem::take(&mut self.open);
+        for step in self.undo.drain(..).chain([open]) {
             for c in &step.changes {
-                release_in(c, entries, PatchSide::Undoable);
+                release_in(c, entries, PatchSide::Undoable, &mut self.events);
             }
         }
         self.drop_redo(entries);
         self.bytes = 0;
     }
 
-    /// Drops the oldest redo steps until the budget is met, keeping the last
-    /// `keep`. Only needed after an undo or a redo (see `trim_undone` and
-    /// `trim_redone`).
-    fn evict_redo(&mut self, entries: &mut SlotMap<Entry>, keep: usize) {
-        while self.bytes > self.budget && self.redo.len() > keep {
-            let step = self.redo.remove(0);
-            self.bytes -= step.bytes;
-            for c in &step.changes {
-                release_in(c, entries, PatchSide::Redoable);
-            }
+    /// Drops the furthest redo steps until the budget is met, keeping the
+    /// last `keep`. Returns the last one dropped. Only needed after an undo,
+    /// a redo (see `trim_undone` and `trim_redone`) or a smaller budget.
+    fn evict_redo(&mut self, entries: &mut SlotMap<Entry>, keep: usize) -> Option<Step> {
+        let mut bytes = self.bytes;
+        let mut n = 0;
+        while bytes > self.budget as u64 && self.redo.len() - n > keep {
+            bytes -= self.redo[n].bytes;
+            n += 1;
         }
+        self.bytes = bytes;
+        let mut last = None;
+        for step in self.redo.drain(..n) {
+            for c in &step.changes {
+                release_in(c, entries, PatchSide::Redoable, &mut self.events);
+            }
+            last = Some(step);
+        }
+        last
     }
 
     /// True if an interactive step is currently open.
@@ -337,7 +601,7 @@ impl History {
             // Recording an entry dropped the redo stack, and nothing can
             // fill it while the step stays open.
             debug_assert!(self.redo.is_empty(), "redo steps beside an open step");
-            let done = match run_step(&self.open, entries, false) {
+            let done = match run_step(&self.open, entries, false, &mut self.events) {
                 Ok(done) => done,
                 Err(e) => {
                     if e == SceneError::Corrupted {
@@ -355,7 +619,7 @@ impl History {
             return Ok(Some(done));
         }
         let mut step = self.undo.pop_back().ok_or(SceneError::Corrupted)?;
-        match run_step(&step, entries, false) {
+        match run_step(&step, entries, false, &mut self.events) {
             Ok(done) => {
                 self.depth = 0;
                 self.bytes -= step.bytes;
@@ -395,7 +659,7 @@ impl History {
             .try_reserve(1)
             .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
         let mut step = self.redo.pop().ok_or(SceneError::Corrupted)?;
-        match run_step(&step, entries, true) {
+        match run_step(&step, entries, true, &mut self.events) {
             Ok(done) => {
                 self.depth = 0;
                 self.bytes -= step.bytes;
@@ -422,15 +686,17 @@ impl History {
     pub(crate) fn trim_undone(&mut self, entries: &mut SlotMap<Entry>) {
         self.evict_redo(entries, 1);
         let adds = |s: &Step| s.changes.iter().any(|c| matches!(c, Change::Add { .. }));
+        let mut dropped = None;
         if self
             .redo
             .last()
-            .is_some_and(|s| s.bytes > self.budget && adds(s))
+            .is_some_and(|s| s.bytes > self.budget as u64 && adds(s))
         {
-            self.evict_redo(entries, 0);
+            dropped = self.evict_redo(entries, 0);
         }
         self.evict(entries);
-        self.evict_redo(entries, 0);
+        let dropped = self.evict_redo(entries, 0).or(dropped);
+        self.note_permanent(dropped, self.redo.len(), HistorySide::Redo);
     }
 
     /// Meets the budget after `redo`, which exceeds it only when it parked
@@ -438,11 +704,12 @@ impl History {
     /// then, if that is not enough, the step itself (its removals are then
     /// permanent).
     pub(crate) fn trim_redone(&mut self, entries: &mut SlotMap<Entry>) {
-        while self.bytes > self.budget && self.undo.len() > 1 {
+        while self.over() && self.undo.len() > 1 {
             self.evict_one(entries);
         }
         self.evict_redo(entries, 0);
-        self.evict(entries);
+        let dropped = self.evict(entries);
+        self.note_permanent(dropped, self.undo.len(), HistorySide::Undo);
     }
 
     /// Reverts the open step's changes and takes the step out, for the caller
@@ -453,7 +720,7 @@ impl History {
         if self.depth == 0 {
             return Err(SceneError::StepNotOpen);
         }
-        let done = match run_step(&self.open, entries, false) {
+        let done = match run_step(&self.open, entries, false, &mut self.events) {
             Ok(done) => done,
             Err(e) => {
                 if e == SceneError::Corrupted {
@@ -469,10 +736,10 @@ impl History {
     }
 
     /// Releases what a step reverted by `cancel` holds: the slots its patches
-    /// created, and the meshes it added.
-    pub(crate) fn discard(step: &Step, entries: &mut SlotMap<Entry>) {
+    /// created, the meshes it added, and its entries of the application.
+    pub(crate) fn discard(&mut self, step: &Step, entries: &mut SlotMap<Entry>) {
         for c in &step.changes {
-            release_in(c, entries, PatchSide::Redoable);
+            release_in(c, entries, PatchSide::Redoable, &mut self.events);
         }
     }
 
@@ -497,7 +764,7 @@ impl History {
     pub(crate) fn forget(&mut self, id: MeshId, mut mesh: Option<&mut Mesh>) {
         let mut drop_from = |step: &mut Step, side: PatchSide| {
             step.changes.retain(|c| {
-                if c.mesh() != id {
+                if c.mesh() != Some(id) {
                     return true;
                 }
                 match mesh.as_deref_mut() {
@@ -522,8 +789,8 @@ impl History {
         drop_from(&mut self.open, PatchSide::Undoable);
         self.undo.retain(|s| !s.changes.is_empty());
         self.redo.retain(|s| !s.changes.is_empty());
-        self.bytes = self.undo.iter().map(|s| s.bytes).sum::<usize>()
-            + self.redo.iter().map(|s| s.bytes).sum::<usize>()
+        self.bytes = self.undo.iter().map(|s| s.bytes).sum::<u64>()
+            + self.redo.iter().map(|s| s.bytes).sum::<u64>()
             + self.open.bytes;
     }
 
@@ -542,13 +809,13 @@ impl History {
     /// Bytes of each undo step, oldest first.
     #[cfg(test)]
     pub(crate) fn undo_step_bytes(&self) -> impl Iterator<Item = usize> + '_ {
-        self.undo.iter().map(|s| s.bytes)
+        self.undo.iter().map(|s| s.bytes as usize)
     }
 
     /// Bytes held by every step.
     #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
-        self.bytes
+        self.bytes as usize
     }
 }
 
@@ -570,10 +837,23 @@ impl History {
 /// cannot fail, so they always recover. The scene's registries follow once
 /// the whole step has run (`Scene::settle_presence`), and a step that fails
 /// never touches them.
-fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<Vec<Done>> {
+///
+/// Entries of the application go to `events`, in the order they run, once
+/// the whole step has run: a step that fails does not touch them, except that
+/// one the caller drops has them dropped.
+fn run_step(
+    step: &Step,
+    entries: &mut SlotMap<Entry>,
+    forward: bool,
+    events: &mut VecDeque<EntryEvent>,
+) -> Result<Vec<Done>> {
+    let oom = |_| SceneError::Store(StoreError::OutOfMemory);
     let mut done: Vec<Done> = Vec::new();
-    done.try_reserve_exact(step.changes.len())
-        .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
+    done.try_reserve_exact(step.changes.len()).map_err(oom)?;
+    let apps = |c: &&Change| matches!(c, Change::App(_));
+    events
+        .try_reserve(step.changes.iter().filter(apps).count())
+        .map_err(oom)?;
     let order = |i: usize| {
         if forward {
             i
@@ -583,7 +863,7 @@ fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<
     };
     for i in 0..step.changes.len() {
         match run_change(&step.changes[order(i)], entries, forward) {
-            Ok(d) => done.push(d),
+            Ok(d) => done.extend(d),
             Err(e) => {
                 for j in (0..i).rev() {
                     if run_change(&step.changes[order(j)], entries, !forward).is_err() {
@@ -593,7 +873,7 @@ fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<
                             run_presence(&step.changes[order(k)], entries, !forward);
                         }
                         mark_corrupted(step, entries);
-                        release_partial(step, entries, forward, i, j);
+                        release_partial(step, entries, forward, (i, j), events);
                         return Err(SceneError::Corrupted);
                     }
                 }
@@ -601,10 +881,15 @@ fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<
                     // The step names a mesh that is gone (defensive: removal
                     // drops its changes), but recovery restored everything,
                     // so every patch is back at a known state.
-                    release_recovered(step, entries, forward);
+                    release_recovered(step, entries, forward, events);
                 }
                 return Err(e);
             }
+        }
+    }
+    for i in 0..step.changes.len() {
+        if let Change::App(run) = &step.changes[order(i)] {
+            events.push_back(run.event(forward));
         }
     }
     Ok(done)
@@ -616,7 +901,13 @@ fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<
 /// Changes run and recovered, or never run, are at the step's far state
 /// (after it for undo, before it for redo), and so is every add and removal;
 /// edits run and never recovered are at the run's end state.
-fn release_partial(step: &Step, entries: &mut SlotMap<Entry>, forward: bool, i: usize, j: usize) {
+fn release_partial(
+    step: &Step,
+    entries: &mut SlotMap<Entry>,
+    forward: bool,
+    (i, j): (usize, usize),
+    events: &mut VecDeque<EntryEvent>,
+) {
     let order = |k: usize| {
         if forward {
             k
@@ -638,26 +929,31 @@ fn release_partial(step: &Step, entries: &mut SlotMap<Entry>, forward: bool, i: 
         PatchSide::Redoable
     };
     for k in (j + 1..i).chain(i + 1..step.changes.len()) {
-        release_in(&step.changes[order(k)], entries, far);
+        release_in(&step.changes[order(k)], entries, far, events);
     }
     for k in 0..j {
         let c = &step.changes[order(k)];
         let presence = matches!(c, Change::Add { .. } | Change::Remove { .. });
-        release_in(c, entries, if presence { far } else { end });
+        release_in(c, entries, if presence { far } else { end }, events);
     }
 }
 
 /// Releases every patch of a step dropped after [`SceneError::Corrupted`]
 /// whose recovery still restored everything: all are at the step's far
 /// state.
-fn release_recovered(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) {
+fn release_recovered(
+    step: &Step,
+    entries: &mut SlotMap<Entry>,
+    forward: bool,
+    events: &mut VecDeque<EntryEvent>,
+) {
     let far = if forward {
         PatchSide::Redoable
     } else {
         PatchSide::Undoable
     };
     for c in &step.changes {
-        release_in(c, entries, far);
+        release_in(c, entries, far, events);
     }
 }
 
@@ -670,13 +966,13 @@ fn release_recovered(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) {
 /// allocation, which matters on a path reached through out-of-memory errors.
 fn mark_corrupted(step: &Step, entries: &mut SlotMap<Entry>) {
     for c in &step.changes {
-        let Some(e) = entries.get_mut(c.mesh()) else {
+        let Some(e) = c.mesh().and_then(|id| entries.get_mut(id)) else {
             continue;
         };
         match c {
             Change::Edit(..) => e.flag_unknown(),
             Change::Placement { .. } => e.report_placement(),
-            Change::Add { .. } | Change::Remove { .. } => {}
+            Change::Add { .. } | Change::Remove { .. } | Change::App(_) => {}
         }
     }
     for c in &step.changes {
@@ -688,9 +984,14 @@ fn mark_corrupted(step: &Step, entries: &mut SlotMap<Entry>) {
     }
 }
 
-/// Applies (`forward`) or reverts one change. On error the mesh is unchanged.
-fn run_change(change: &Change, entries: &mut SlotMap<Entry>, forward: bool) -> Result<Done> {
-    match change {
+/// Applies (`forward`) or reverts one change; `None` for one that did nothing
+/// here. On error the mesh is unchanged.
+fn run_change(
+    change: &Change,
+    entries: &mut SlotMap<Entry>,
+    forward: bool,
+) -> Result<Option<Done>> {
+    let done = match change {
         Change::Edit(id, patch) => {
             let entry = entries.get_mut(*id).ok_or(SceneError::Corrupted)?;
             #[cfg(test)]
@@ -700,22 +1001,23 @@ fn run_change(change: &Change, entries: &mut SlotMap<Entry>, forward: bool) -> R
             } else {
                 patch.revert(&mut entry.mesh)?
             };
-            Ok(Done::Edit(*id, changes))
+            Done::Edit(*id, changes)
         }
         Change::Placement { id, old, new } => {
             let entry = entries.get_mut(*id).ok_or(SceneError::Corrupted)?;
             entry.placement = if forward { *new } else { *old };
-            Ok(Done::Placement(*id))
+            Done::Placement(*id)
         }
         Change::Add { id, .. } | Change::Remove { id, .. } => {
-            if run_presence(change, entries, forward) {
-                Ok(Done::Presence(*id))
-            } else {
+            if !run_presence(change, entries, forward) {
                 // Defensive: the mesh is not where the change expects it.
-                Err(SceneError::Corrupted)
+                return Err(SceneError::Corrupted);
             }
+            Done::Presence(*id)
         }
-    }
+        Change::App(_) => return Ok(None),
+    };
+    Ok(Some(done))
 }
 
 /// Parks or restores the mesh of an add or a removal: redoing an add, or
@@ -727,6 +1029,6 @@ fn run_presence(change: &Change, entries: &mut SlotMap<Entry>, forward: bool) ->
         Change::Add { id, .. } => entries.park(*id),
         Change::Remove { id, .. } if forward => entries.park(*id),
         Change::Remove { id, .. } => entries.unpark(*id),
-        Change::Edit(..) | Change::Placement { .. } => false,
+        Change::Edit(..) | Change::Placement { .. } | Change::App(_) => false,
     }
 }

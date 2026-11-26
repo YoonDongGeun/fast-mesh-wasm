@@ -13,6 +13,13 @@ export const ISOLATION = {
   "Cross-Origin-Embedder-Policy": "require-corp",
 };
 
+/**
+ * The showcase is up, with every panel in place: their code comes in chunks of
+ * its own, after the first render (#285).
+ */
+export const SHOWCASE_READY = `window.__showcase !== undefined && document.querySelector("[data-inspector-slot]") !== null
+  && document.querySelector("[data-lazy-panel]") === null`;
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Chrome or Chromium: `CHROME_PATH`, else the usual install places. */

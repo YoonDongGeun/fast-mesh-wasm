@@ -6,7 +6,7 @@
 import { useSyncExternalStore } from "react";
 import type { Vec3 } from "../../../io/mesh-data";
 import { createDialogOf } from "../../home/ux/create-dialog-state";
-import type { ReliefFiles } from "./relief";
+import type { ReliefFiles } from "./relief-files";
 import { textDialogOf } from "./text-dialog-state";
 
 /** What the viewport previews: a coarse relief at the dialog's centre and rotation. */

@@ -10,10 +10,10 @@ import { createPrimitiveCommands } from "../../features/home/ux/create-commands"
 import { reliefCommands } from "../../features/mesh-edit/ux/relief-commands";
 import { textCommands } from "../../features/mesh-edit/ux/text-commands";
 import { polylineCommands } from "../../features/polylines/ux/polyline-commands";
-import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
+import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup-commands";
 import { sculptBrush, type SculptTool } from "../../features/sculpt/ux/sculpt";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
-import { ALIGN_COMMANDS } from "../../features/transform/ux/align-tools";
+import { ALIGN_COMMANDS } from "../../features/transform/ux/align-state";
 import { focusElement, triggerClick } from "./panel-triggers";
 import type { GizmoMode } from "../../viewport/ui/Viewport";
 

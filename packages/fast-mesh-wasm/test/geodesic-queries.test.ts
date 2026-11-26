@@ -340,6 +340,62 @@ describe("a Worker scene", () => {
     expect(await s.inspect.geodesicDistances(m, 0, HEAT)).toEqual(local.inspect.geodesicDistances(lm, 0, HEAT));
   });
 
+  it("gives distances over the faces on stretched triangles and fans (#279)", async () => {
+    // A sphere drawn out along Y, from its tip: along the meridians.
+    const { positions, indices } = sphere(4);
+    for (let i = 1; i < positions.length; i += 3) {
+      positions[i] *= 20;
+    }
+    let tip = 0;
+    for (let v = 0; v < positions.length / 3; v++) {
+      if (positions[3 * v + 1] > positions[3 * tip + 1]) tip = v;
+    }
+    const meridian = (v: number) => {
+      const to = Math.atan2(Math.hypot(positions[3 * v], positions[3 * v + 2]), positions[3 * v + 1] / 20);
+      const steps = 2000;
+      let length = 0;
+      for (let k = 0; k < steps; k++) {
+        const t = ((k + 0.5) / steps) * to;
+        length += (Math.hypot(Math.cos(t), 20 * Math.sin(t)) * to) / steps;
+      }
+      return length;
+    };
+    // A flat disc that is one fan, from its rim: straight.
+    const rim = 200;
+    const disc = [0, 0, 0];
+    const fan: number[] = [];
+    for (let k = 0; k < rim; k++) {
+      const a = (k / rim) * 2 * Math.PI;
+      disc.push(Math.cos(a), Math.sin(a), 0);
+      fan.push(0, 1 + k, 1 + ((k + 1) % rim));
+    }
+    const straight = (v: number) => Math.hypot(disc[3 * v] - 1, disc[3 * v + 1]);
+
+    using local = new Scene();
+    const { s } = await open(1);
+    for (const [p, i, source, exact] of [
+      [positions, indices, tip, meridian],
+      [new Float32Array(disc), new Uint32Array(fan), 1, straight],
+    ] as const) {
+      const lm = local.addMesh(p, i);
+      const m = s.addMesh(p, i);
+      const d = local.inspect.geodesicDistances(lm, source, HEAT);
+      expect(await s.inspect.geodesicDistances(m, source, HEAT)).toEqual(d);
+      const want = Array.from(d, (_, v) => exact(v));
+      const far = Math.max(...want);
+      let sum = 0;
+      let count = 0;
+      want.forEach((w, v) => {
+        expect(Math.abs(d[v] - w)).toBeLessThan(0.04 * far);
+        if (w > 0.1 * far) {
+          sum += Math.abs(d[v] - w) / w;
+          count++;
+        }
+      });
+      expect(sum / count).toBeLessThan(0.03);
+    }
+  });
+
   it("rejects with the signal's reason and never sends a query aborted before", async () => {
     const { s, m } = await open(2);
     const before = sentQueries();

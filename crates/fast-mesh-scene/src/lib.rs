@@ -16,7 +16,11 @@
 //!   placement is validated (a proper rotation, a finite positive scale)
 //!   and stored exactly as given. World queries, fields and sections all
 //!   follow the scale; pair queries run on copies baked into one mesh's
-//!   local space (or into the world) when a scale is involved.
+//!   local space (or into the world around a point near it) when a scale is
+//!   involved. The answers are those of the world's shapes, to the `f32`
+//!   rounding of the meshes' local positions, whatever mix of a mesh's `f64`
+//!   origin, pose and scale puts them there and however far from the world
+//!   origin that is.
 //! - Editing: [`Scene::edit`] runs a store transaction on one mesh and
 //!   records its patch. All-or-nothing: a failed edit changes nothing.
 //!   The closure may fail with any error that converts into
@@ -55,7 +59,10 @@
 //!   [`Scene::begin_step`] / [`Scene::end_step`] group edits and placement
 //!   changes (otherwise each is its own step); [`Scene::undo`],
 //!   [`Scene::redo`] and [`Scene::cancel_step`] are all-or-nothing per step.
-//!   [`SceneOptions::history_budget`] evicts the oldest steps.
+//!   [`SceneOptions::history_budget`] evicts the oldest steps;
+//!   [`Scene::take_permanent`] reports the steps larger than it.
+//!   [`Scene::record_entry`] puts entries of the application's own in it, in
+//!   order with the rest.
 //! - BVH state: each mesh's [`UpdateMode`] says when its BVH follows the
 //!   mesh; [`Scene::set_mode`], [`Scene::update`], [`Scene::flush`] and
 //!   [`Scene::is_current`].
@@ -81,6 +88,7 @@
 //!   `f32` and results filtered against the exact bound. Queries over all
 //!   meshes update every Lazy BVH and fail with [`SceneError::StaleBvh`] on
 //!   a stale Manual one; queries naming meshes touch only those.
+//! - Measures: [`Scene::measure_placed`], the area and volume in the world.
 //! - Height maps: [`Scene::height_map_frame`] fits an orthographic image
 //!   ([`HeightMapFrame`]) to meshes along a direction, [`Scene::height_map`]
 //!   samples the heights of its pixels, and [`Scene::add_heightfield`] adds a
@@ -127,6 +135,8 @@ mod fields;
 mod geodesic;
 mod height_map;
 mod history;
+#[cfg(test)]
+mod history_tests;
 mod hull;
 mod id;
 mod join;
@@ -174,13 +184,14 @@ pub use fields::{
 };
 pub use geodesic::GeodesicJob;
 pub use height_map::{HeightMapFrame, HeightMapOptions, HeightfieldReport, MAX_HEIGHT_MAP_PIXELS};
+pub use history::{EntryEvent, HistoryEntry, HistorySide, PermanentStep};
 pub use hull::ConvexHullReport;
 pub use id::MeshId;
 pub use join::{JoinOptions, JoinReport};
 pub use placement::Placement;
 pub use query::{
     SceneClosestHit, SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions,
-    SurfacePathPoint,
+    SceneSurfacePathPoint,
 };
 pub use register::{
     CoarseAlignMethod, DEFAULT_MAX_RMSE_FRACTION, IcpObjective, LandmarkAlignment, LandmarkPair,
@@ -192,5 +203,5 @@ pub use report::{FieldId, MeshChanges, SubscriberId};
 pub use scene::{MeshBuild, MeshOptions, Scene, SceneOptions, UpdateMode};
 pub use sculpt::{Dab, DabReport};
 pub use sections::{Gap, SectionContour, SectionDesc, SectionResult, SectionStatus};
-pub use wave6_ops::Vec3;
+pub use wave6_ops::{ScreenCamera, Vec3};
 pub use wrap::SceneWrapReport;

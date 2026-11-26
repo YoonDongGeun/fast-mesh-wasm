@@ -73,7 +73,7 @@ describe("healer-overlays (#235)", () => {
       1, 3, 2,
     ]);
     const analysis = makeAnalysis({
-      components: [{ triangles: new Uint32Array([0, 1, 2, 3]), area: 1, closed: true }],
+      components: [{ triangles: new Uint32Array([0, 1, 2, 3]), area: 1, closed: true, cavity: false }],
     });
     const inv = detectInvertedClosedComponents(analysis, positions, inward);
     expect(Array.from(inv)).toEqual([0, 1, 2, 3]);
@@ -86,6 +86,10 @@ describe("healer-overlays (#235)", () => {
       1, 2, 3,
     ]);
     expect(detectInvertedClosedComponents(analysis, positions, outward).length).toBe(0);
+
+    // A cavity faces inward rightly.
+    const hollow = makeAnalysis({ components: [{ ...analysis.components[0]!, cavity: true }] });
+    expect(detectInvertedClosedComponents(hollow, positions, inward).length).toBe(0);
   });
 
   it("detects vertex-disjoint crossing triangles and builds + disposes overlay group", () => {
@@ -180,6 +184,7 @@ describe("healer-overlays (#235)", () => {
       nonManifoldVertices: 0,
       pinchVertices: 0,
       degenerate: 3,
+      cavities: 0,
       duplicate: 1,
       clean: false,
     };
@@ -192,6 +197,7 @@ describe("healer-overlays (#235)", () => {
       nonManifoldVertices: 0,
       pinchVertices: 0,
       degenerate: 0,
+      cavities: 0,
       duplicate: 0,
       clean: true,
     };

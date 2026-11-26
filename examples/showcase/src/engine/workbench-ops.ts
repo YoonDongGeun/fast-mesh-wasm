@@ -879,10 +879,8 @@ export async function runIcpAlign(params: {
     ...(maxDistance !== undefined && maxDistance > 0 ? { maxDistance } : {}),
     apply: false,
   });
-  store.setPlacement(moving, {
-    rotation: [...result.placement.rotation],
-    translation: [result.placement.translation[0], result.placement.translation[1], result.placement.translation[2]],
-  });
+  // Its scale is not solved for, and stays.
+  applyPlacementToStore(store, moving, result.placement);
   return { ...result, applied: true, notApplied: null };
 }
 

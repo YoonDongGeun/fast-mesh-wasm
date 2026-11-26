@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use fast_mesh_ops::repair::{FillContinuity, FillHolesOptions, FillStats, PartialBridgeOptions};
 use fast_mesh_ops::sculpt::{DyntopoMode, DyntopoOptions, DyntopoPatch};
-use fast_mesh_ops::{AnalyzeOptions, IcpOptions, IcpStatus, VolumeReason, analyze, measure_placed};
+use fast_mesh_ops::{AnalyzeOptions, IcpOptions, IcpStatus, VolumeReason, analyze};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
     BooleanMethod, BooleanOp, BooleanOptions, CoarseAlignMethod, ColorRule, Coloring, Colormap,
@@ -45,6 +45,7 @@ mod denoise;
 mod extrude;
 mod geodesic;
 mod height_map;
+mod history;
 mod hull;
 mod lattice;
 mod wrap;
@@ -1001,8 +1002,8 @@ impl WasmScene {
     }
 
     /// A read-only report of the mesh's defects, laid out as in
-    /// [`crate::edit::encode_analysis`]. `weld_tolerance` (local units,
-    /// equal to world units) groups coincident vertices; lists with a count
+    /// [`crate::edit::encode_analysis`]. `weld_tolerance` (local units, before
+    /// the placement's scale) groups coincident vertices; lists with a count
     /// keep their first `max_listed` entries. `self_intersection` checks
     /// for self-intersection with the mesh's BVH, which is brought up to
     /// date first unless the mesh is Manual (then `STALE_BVH` when stale).
@@ -1043,11 +1044,7 @@ impl WasmScene {
     /// inconsistent winding only flags `orientation conflicts` without
     /// failing.
     pub fn measure(&self, index: u32, generation: u32) -> Result<Vec<f64>, Error> {
-        let id = self.id(index, generation)?;
-        let mesh = self.scene.mesh(id)?;
-        let placement = self.scene.placement(id)?;
-        let origin = mesh.origin();
-        let m = measure_placed(mesh, origin, |p| placement.apply(p)).map_err(SceneError::from)?;
+        let m = self.scene.measure_placed(self.id(index, generation)?)?;
         let reason = match m.volume_reason {
             None => 0.0,
             Some(VolumeReason::Open) => 1.0,
@@ -1075,8 +1072,8 @@ impl WasmScene {
     /// undo step, and nothing changes when an operation fails. `ops` (`f64`)
     /// and `loops` (`u32`, loop ids for fill holes) are laid out as in
     /// [`crate::edit`]; returns the reports concatenated in op order.
-    /// Lengths and areas in the options are in local units, equal to world
-    /// units.
+    /// Lengths and areas in the options are in local units, before the
+    /// placement's scale.
     pub fn repair(
         &mut self,
         index: u32,
@@ -1720,9 +1717,7 @@ impl WasmScene {
             .shortest_surface_path(id, distances, sources, target_vertex, &mut path)?;
         let mut out = Vec::with_capacity(path.len() * 7);
         for pt in path {
-            out.push(f64::from(pt.position[0]));
-            out.push(f64::from(pt.position[1]));
-            out.push(f64::from(pt.position[2]));
+            out.extend(pt.position);
             out.push(f64::from(pt.triangle));
             out.push(f64::from(pt.barycentric[0]));
             out.push(f64::from(pt.barycentric[1]));
@@ -2514,7 +2509,7 @@ impl WasmScene {
     ) -> Result<Vec<u32>, Error> {
         let id = self.id(index, generation)?;
         let shape = crate::wave6::parse_screen_shape(shape_kind, shape_data)?;
-        let opts = crate::wave6::parse_screen_options(
+        let (camera, opts) = crate::wave6::parse_screen_options(
             view_proj16,
             camera_origin3,
             camera_forward3,
@@ -2523,7 +2518,9 @@ impl WasmScene {
             reject_backfaces,
             include_touching,
         )?;
-        Ok(self.scene.select_faces_screen(id, &shape, &opts)?)
+        Ok(self
+            .scene
+            .select_faces_screen_from(id, &shape, &camera, &opts)?)
     }
 
     pub fn select_faces_in_sphere(
@@ -3102,7 +3099,10 @@ impl WasmScene {
     }
 
     /// Reconstructs a surface from a packed cloud as a new mesh, one undo step
-    /// (undo removes it). Returns `[index, generation]`.
+    /// (undo removes it). The cloud's positions are relative to `origin` (a
+    /// world point, zero by default), which is the mesh's origin. Returns
+    /// `[index, generation]`.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconstruct_point_cloud(
         &mut self,
         packed_cloud: &[f32],
@@ -3111,11 +3111,18 @@ impl WasmScene {
         ball_radius: f64,
         k_neighbors: f64,
         normals: bool,
+        origin: Option<Vec<f64>>,
     ) -> Result<Vec<u32>, Error> {
         let cloud = crate::wave6::decode_point_cloud_f32(packed_cloud)?;
         let opts =
             crate::wave6::parse_reconstruct_options(method, voxel_size, ball_radius, k_neighbors)?;
-        let id = self.scene.reconstruct_point_cloud(&cloud, &opts)?;
+        let origin = match origin {
+            Some(o) => crate::wave6::vec3_f64(&o, "origin")?,
+            None => [0.0; 3],
+        };
+        let id = self
+            .scene
+            .reconstruct_point_cloud_at(&cloud, origin, &opts)?;
         self.added(id, normals)
     }
 
@@ -3197,7 +3204,9 @@ impl WasmScene {
     }
 
     /// Places a stamp on the target, one undo step: kept separate, it is added
-    /// as a new mesh, which undo removes.
+    /// as a new mesh, which undo removes. `stamp_anchor` is the point of the
+    /// stamp, in its own coordinates, that goes to the hit point; without it
+    /// see `Scene::place_mesh_world`.
     #[allow(clippy::too_many_arguments)]
     pub fn place_mesh(
         &mut self,
@@ -3215,6 +3224,7 @@ impl WasmScene {
         conform_to_surface: bool,
         boolean_method: u8,
         normals: bool,
+        stamp_anchor: Option<Vec<f64>>,
     ) -> Result<Vec<f64>, Error> {
         let target = self.id(target_index, target_generation)?;
         let stamp = self.id(stamp_index, stamp_generation)?;
@@ -3229,9 +3239,16 @@ impl WasmScene {
             conform_to_surface,
             boolean_method,
         )?;
-        let (rep, added) = self
-            .scene
-            .place_mesh_world(target, stamp, hp, hn, &params)?;
+        let (rep, added) = match stamp_anchor {
+            Some(a) => {
+                let anchor = crate::wave6::vec3_f64(&a, "stampAnchor")?;
+                self.scene
+                    .place_mesh_anchored(target, stamp, anchor, hp, hn, &params)?
+            }
+            None => self
+                .scene
+                .place_mesh_world(target, stamp, hp, hn, &params)?,
+        };
         let added_pair = match added {
             Some(new_id) => {
                 let pair = self.added(new_id, normals)?;

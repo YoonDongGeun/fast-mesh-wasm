@@ -79,9 +79,17 @@ export type ScreenSelectionShape =
 
 /** World-space camera and visibility options for {@link Scene.selectFacesScreen}. */
 export interface ScreenSelectOptions {
-  /** Column-major 4×4 view-projection matrix (16 finite numbers). */
+  /**
+   * Column-major 4×4 view-projection matrix (16 finite numbers), of world points.
+   *
+   * It is taken in `f64`. Give it so (an array of numbers or a `Float64Array`, multiplied in `f64`)
+   * for a camera far from the world origin: a `Float32Array` holds it only to the steps of `f32`
+   * there (0.008 at 1e5).
+   */
   viewProj: ReadonlyArray<number> | Float32Array | Float64Array;
+  /** Where the camera is in the world. */
   cameraOrigin: Readonly<Vec3>;
+  /** Where it looks in the world, of any length. */
   cameraForward: Readonly<Vec3>;
   isOrthographic?: boolean;
   visibleOnly?: boolean;
@@ -222,14 +230,14 @@ export type ArapWeights = "cotangent" | "uniform";
 export type ArapSolver = "auto" | "direct" | "pcg";
 export type KelvinletScale = "single" | "bi" | "tri";
 
-/** World-space oriented box frame for an FFD lattice. */
+/** Oriented box frame for an FFD lattice, in local mesh coordinates, as in `views(mesh).positions()`. */
 export interface FfdFrameData {
   center: Vec3;
   axes: [Vec3, Vec3, Vec3];
   halfExtents: Vec3;
 }
 
-/** 3D Free-Form Deformation control lattice and control-point offsets. */
+/** 3D Free-Form Deformation control lattice and control-point offsets, in local mesh coordinates. */
 export interface FfdLatticeData {
   dims: [number, number, number];
   basis: FfdBasis;
@@ -251,7 +259,12 @@ export interface FreeformProtection {
   weights?: Float32Array | ArrayLike<number>;
 }
 
-/** Optional spatial region, vertex subset, and protection filter shared across freeform deformers. */
+/**
+ * Optional spatial region, vertex subset, and protection filter shared across freeform deformers.
+ *
+ * Every point, vector and length the deformers take or report is in local mesh coordinates, as in
+ * `views(mesh).positions()`: relative to the mesh's origin, before its placement.
+ */
 export interface FreeformScope {
   region?: { center: Readonly<Vec3>; radius: number };
   vertices?: Indices;
@@ -318,7 +331,7 @@ export interface XpbdHandleInput {
   compliance?: number;
 }
 
-/** Options for {@link Scene.applyXpbd}. */
+/** Options for {@link Scene.applyXpbd}, in local mesh coordinates and units (see {@link FreeformScope}). */
 export interface XpbdOptions {
   substeps?: number;
   iterations?: number;
@@ -987,11 +1000,24 @@ export interface ContourLoop {
   centroid3d: Vec3;
   minCaliperDiameter: number;
   maxCaliperDiameter: number;
+  /** The points in the plane, `u, v` each: around the slice's `planeOrigin`, along its axes. */
   points2d: Float64Array;
+  /**
+   * The points in world coordinates, `x, y, z` each, rounded to `f32`: far
+   * from the world origin that is by up to half of its steps there (0.004 at
+   * 1e5). `points3d64` has them as precise as the mesh.
+   */
   points3d: Float32Array;
+  /**
+   * The points in world coordinates, `x, y, z` each, as precise as the mesh
+   * wherever it is. Every slice the SDK returns has them; without them in a
+   * loop of yours, an export takes `points3d`.
+   */
+  points3d64?: Float64Array;
 }
 
 export interface ContourSlice {
+  /** The plane's point in world coordinates: the one asked for, to a few `f32` steps of the mesh's local positions. */
   planeOrigin: Vec3;
   planeNormal: Vec3;
   uAxis: Vec3;
@@ -1001,12 +1027,35 @@ export interface ContourSlice {
   loops: ContourLoop[];
 }
 
-/** Packed WebAssembly-ready point cloud buffer (`[count, hasNormals, hasColors, ...positions, ...normals, ...colors]`). */
+/**
+ * Packed WebAssembly-ready point cloud buffer (`[count, hasNormals, hasColors, ...positions, ...normals, ...colors]`).
+ *
+ * The positions are `f32`, which far from zero holds them only to its steps
+ * there (0.008 at 1e5). Keep a cloud there around an `origin` near it:
+ * {@link packPointCloud} takes one, and {@link parsePointCloudText} and
+ * {@link parsePointCloudBytes} find one with `center: true`.
+ */
 export interface PackedPointCloud {
   readonly data: Float32Array;
   readonly count: number;
   readonly hasNormals: boolean;
   readonly hasColors: boolean;
+  /**
+   * The world point the positions are relative to (`f64` numbers). Zero when
+   * left out: they are then world positions. Everything that takes a cloud
+   * counts it in, and what makes one of another keeps it.
+   */
+  readonly origin?: Readonly<Vec3>;
+}
+
+/** Options of {@link parsePointCloudText} and {@link parsePointCloudBytes}. */
+export interface ParsePointCloudOptions {
+  /**
+   * Read the positions in `f64` and keep them around the centre of their
+   * bounds, which is the cloud's `origin`, so that points far from zero keep
+   * their digits. Defaults to `false`: `f32` world positions.
+   */
+  center?: boolean;
 }
 
 export interface OutlierReport {
@@ -1202,7 +1251,8 @@ export function decodeContourSlices(raw: Float64Array): ContourSlice[] {
       cur += 11;
       const points2d = Float64Array.from(raw.subarray(cur, cur + npts * 2));
       cur += npts * 2;
-      const points3d = Float32Array.from(raw.subarray(cur, cur + npts * 3));
+      const points3d64 = raw.slice(cur, cur + npts * 3);
+      const points3d = Float32Array.from(points3d64);
       cur += npts * 3;
       loops.push({
         closed,
@@ -1214,6 +1264,7 @@ export function decodeContourSlices(raw: Float64Array): ContourSlice[] {
         maxCaliperDiameter,
         points2d,
         points3d,
+        points3d64,
       });
     }
     slices.push({
@@ -1242,7 +1293,8 @@ export function encodeContourSlices(slices: readonly ContourSlice[]): Float64Arr
       s.loops.length,
     );
     for (const l of s.loops) {
-      const npts = Math.min(Math.floor(l.points2d.length / 2), Math.floor(l.points3d.length / 3));
+      const points3d = l.points3d64 ?? l.points3d;
+      const npts = Math.min(Math.floor(l.points2d.length / 2), Math.floor(points3d.length / 3));
       out.push(
         l.closed ? 1 : 0,
         l.perimeter,
@@ -1258,14 +1310,14 @@ export function encodeContourSlices(slices: readonly ContourSlice[]): Float64Arr
         out.push(l.points2d[i]);
       }
       for (let i = 0; i < npts * 3; i++) {
-        out.push(l.points3d[i]);
+        out.push(points3d[i]);
       }
     }
   }
   return Float64Array.from(out);
 }
 
-export function wrapPackedPointCloud(data: Float32Array): PackedPointCloud {
+export function wrapPackedPointCloud(data: Float32Array, origin?: Readonly<Vec3>): PackedPointCloud {
   if (data.length < 3) {
     throw invalid("packed point cloud header must have at least 3 elements");
   }
@@ -1276,7 +1328,13 @@ export function wrapPackedPointCloud(data: Float32Array): PackedPointCloud {
   if (!Number.isInteger(count) || count < 0 || data.length !== expected) {
     throw invalid("packed point cloud buffer length mismatch");
   }
-  return { data, count, hasNormals, hasColors };
+  return { data, count, hasNormals, hasColors, ...(origin === undefined ? {} : { origin }) };
+}
+
+/** The checked `origin` of a cloud, when it has one (a bare buffer has none). */
+export function cloudOrigin(cloud: PackedPointCloud | Float32Array): Vec3 | undefined {
+  const origin = cloud instanceof Float32Array ? undefined : cloud?.origin;
+  return origin === undefined ? undefined : normalizeVec3(origin, "cloud.origin");
 }
 
 export function cloudBuffer(cloud: PackedPointCloud | Float32Array): Float32Array {
@@ -1289,13 +1347,30 @@ export function cloudBuffer(cloud: PackedPointCloud | Float32Array): Float32Arra
   return wrapPackedPointCloud(cloud.data).data;
 }
 
-/** Packs position (and optional normal/color) buffers into a {@link PackedPointCloud}. */
+/** World positions as `f32` offsets from `origin`, taken in `f64`. */
+function offsetsFrom(positions: Positions, origin: Readonly<Vec3>): Float32Array {
+  const out = new Float32Array(positions.length);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = positions[i] - origin[i % 3];
+  }
+  return out;
+}
+
+/**
+ * Packs position (and optional normal/color) buffers into a {@link PackedPointCloud}.
+ *
+ * With `origin`, the positions (world coordinates, in a `Float64Array` or an
+ * array to have more than `f32`) are stored relative to it, and it becomes the
+ * cloud's `origin`: give a point near a cloud that is far from zero.
+ */
 export function packPointCloud(
   positions: Positions,
   normals?: Positions,
   colors?: Positions,
+  origin?: Readonly<Vec3>,
 ): PackedPointCloud {
-  const pos = toF32Array(positions, "positions");
+  const at = origin === undefined ? undefined : normalizeVec3(origin, "origin");
+  const pos = toF32Array(at === undefined ? positions : offsetsFrom(positions, at), "positions");
   if (pos.length % 3 !== 0) {
     throw invalid("positions length must be a multiple of 3");
   }
@@ -1313,25 +1388,33 @@ export function packPointCloud(
   data[0] = n;
   data[1] = norm ? 1 : 0;
   data[2] = col ? 1 : 0;
-  let at = 3;
-  data.set(pos, at);
-  at += pos.length;
+  let offset = 3;
+  data.set(pos, offset);
+  offset += pos.length;
   if (norm) {
-    data.set(norm, at);
-    at += norm.length;
+    data.set(norm, offset);
+    offset += norm.length;
   }
   if (col) {
-    data.set(col, at);
+    data.set(col, offset);
   }
-  return { data, count: n, hasNormals: norm !== undefined, hasColors: col !== undefined };
+  return {
+    data,
+    count: n,
+    hasNormals: norm !== undefined,
+    hasColors: col !== undefined,
+    ...(at === undefined ? {} : { origin: at }),
+  };
 }
 
-/** Unpacks a {@link PackedPointCloud} into separate typed arrays. */
+/** Unpacks a {@link PackedPointCloud} into separate typed arrays. The positions are relative to `origin`. */
 export function unpackPointCloud(cloud: PackedPointCloud | Float32Array): {
   count: number;
   positions: Float32Array;
   normals: Float32Array | null;
   colors: Float32Array | null;
+  /** The cloud's `origin`: `[0, 0, 0]` for world positions. */
+  origin: Vec3;
 } {
   const buf = cloudBuffer(cloud);
   const meta = wrapPackedPointCloud(buf);
@@ -1343,7 +1426,7 @@ export function unpackPointCloud(cloud: PackedPointCloud | Float32Array): {
     at += meta.count * 3;
   }
   const colors = meta.hasColors ? Float32Array.from(buf.subarray(at, at + meta.count * 3)) : null;
-  return { count: meta.count, positions, normals, colors };
+  return { count: meta.count, positions, normals, colors, origin: cloudOrigin(cloud) ?? [0, 0, 0] };
 }
 
 export function checkPositiveArg(value: number, what: string): number {
@@ -1379,6 +1462,7 @@ export type HollowBackend = "bvhSdf" | "fhEdt";
 export type PlaceUpAxis = "negZ" | "posZ" | "posY" | "negY";
 export type PlaceMode = "keepSeparate" | "appendShell" | "embedUnion" | "engraveSubtract";
 
+/** Options for {@link Scene.hollowMesh}; lengths and volumes in the mesh's own units, before its placement's scale. */
 export interface HollowOptions {
   wallThickness: number;
   backend?: HollowBackend;
@@ -1434,6 +1518,15 @@ export interface PlaceTransform {
 export interface PlaceMeshOptions {
   hitPoint: Readonly<Vec3>;
   hitNormal: Readonly<Vec3>;
+  /**
+   * The point of the stamp that goes to the hit point, in the stamp's own
+   * coordinates: those it was added with, before its placement (of which only
+   * the scale counts). Defaults to their zero; for a stamp more than 1024
+   * times its size away from that, such as one modelled far from the world
+   * origin, to the middle of its underside (the side of its bounds away from
+   * `upAxis`).
+   */
+  stampAnchor?: Readonly<Vec3>;
   upAxis?: PlaceUpAxis;
   twistAngleRad?: number;
   uniformScale?: number;
@@ -1445,6 +1538,7 @@ export interface PlaceMeshOptions {
 }
 
 export interface PlaceMeshReport {
+  /** Takes the stamp's own coordinates, times its placement's scale, to the world: scaled, then turned, then moved. */
   transform: PlaceTransform;
   keptTriangles: number;
   usedFallback: boolean;
@@ -1587,6 +1681,7 @@ export interface NormalizedPlaceMeshArgs {
   conformToSurface: boolean;
   booleanMethod: number;
   normals?: boolean;
+  stampAnchor: Float64Array | undefined;
 }
 
 export function normalizePlaceMeshArgs(options: PlaceMeshOptions): NormalizedPlaceMeshArgs {
@@ -1604,6 +1699,10 @@ export function normalizePlaceMeshArgs(options: PlaceMeshOptions): NormalizedPla
     conformToSurface: checkBoolean(options.conformToSurface, false, "conformToSurface"),
     booleanMethod: codeIn(BOOLEAN_METHOD_CODES, options.booleanMethod ?? "manifold", "booleanMethod"),
     ...(options.normals === undefined ? {} : { normals: checkBoolean(options.normals, true, "normals") }),
+    stampAnchor:
+      options.stampAnchor === undefined
+        ? undefined
+        : Float64Array.from(normalizeVec3(options.stampAnchor, "stampAnchor")),
   };
 }
 

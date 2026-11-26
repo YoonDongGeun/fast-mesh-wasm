@@ -7,6 +7,7 @@
 use fast_mesh_store::{Mesh, Transaction, TriangleId, VertexId};
 
 use crate::analyze::{AREA_EPSILON, duplicate_triangles, is_degenerate};
+use crate::nesting::Nesting;
 use crate::topology::{Component, EdgeMap, UnionFind, components};
 use crate::weld::{weld_roots, weld_roots_keeping_seams};
 use crate::{OpsError, Result, filled, push, reserve};
@@ -192,6 +193,9 @@ pub struct ComponentOptions {
     /// means most area; ties go to the most triangles, then the smallest
     /// triangle id. Default `true`.
     pub keep_largest: bool,
+    /// Keep the cavities of the components that stay, however small they are:
+    /// removing one would fill a void of a hollow solid. Default `true`.
+    pub keep_cavities: bool,
 }
 
 impl Default for ComponentOptions {
@@ -200,6 +204,7 @@ impl Default for ComponentOptions {
             min_triangles: None,
             min_area: None,
             keep_largest: true,
+            keep_cavities: true,
         }
     }
 }
@@ -237,6 +242,12 @@ impl ComponentOptionsBuilder {
         self
     }
 
+    /// Keep the cavities of the components that stay.
+    pub fn keep_cavities(mut self, keep_cavities: bool) -> Self {
+        self.options.keep_cavities = keep_cavities;
+        self
+    }
+
     /// The options as set.
     pub fn build(self) -> ComponentOptions {
         self.options
@@ -260,6 +271,12 @@ pub struct RemoveReport {
 ///
 /// On a mesh with UVs, an edge also joins across a seam (coincident corners,
 /// compared exactly), so the UV islands of one surface count as one component.
+///
+/// With [`keep_cavities`](ComponentOptions::keep_cavities), a cavity (a closed
+/// component wound inward, inside the material of another closed one) shares
+/// the fate of the solid it is in: it stays while that stays, and goes with it
+/// whatever its size. A piece floating inside a cavity is a piece like any
+/// other.
 ///
 /// # Errors
 /// [`OpsError::InvalidInput`] when no bound is set or `min_area` is negative,
@@ -298,19 +315,32 @@ pub fn remove_small_components(
             largest = Some(i);
         }
     }
-    let mut doomed: Vec<TriangleId> = Vec::new();
-    let mut removed_components = 0;
+    let mut kept = filled(comps.len(), true)?;
     for (i, c) in comps.iter().enumerate() {
-        if options.keep_largest && largest == Some(i) {
-            continue;
-        }
         let small = options.min_triangles.is_some_and(|n| c.triangles.len() < n)
             || options.min_area.is_some_and(|a| c.area < a);
-        if small {
-            removed_components += 1;
-            reserve(&mut doomed, c.triangles.len())?;
-            doomed.extend_from_slice(&c.triangles);
+        kept[i] = !small || (options.keep_largest && largest == Some(i));
+    }
+    if options.keep_cavities && kept.contains(&false) {
+        let nesting = Nesting::of_inward(mesh, &comps)?;
+        let mut cavities: Vec<usize> = Vec::new();
+        for i in 0..comps.len() {
+            if nesting.is_cavity(i) && !(options.keep_largest && largest == Some(i)) {
+                push(&mut cavities, i)?;
+            }
         }
+        // What encloses a cavity is decided before the cavity is.
+        cavities.sort_by_key(|&i| nesting.depth(i));
+        for i in cavities {
+            kept[i] = nesting.layers(i, |j| kept[j]) >= 1;
+        }
+    }
+    let mut doomed: Vec<TriangleId> = Vec::new();
+    let mut removed_components = 0;
+    for (c, _) in comps.iter().zip(&kept).filter(|&(_, &kept)| !kept) {
+        removed_components += 1;
+        reserve(&mut doomed, c.triangles.len())?;
+        doomed.extend_from_slice(&c.triangles);
     }
     doomed.sort_unstable();
     let unused = unused_vertices(mesh, &doomed, &[], &[])?;
@@ -325,8 +355,8 @@ pub fn remove_small_components(
 }
 
 /// `comps` (sorted by smallest triangle id) with those sharing an edge at
-/// coincident positions merged, in the same order. Such a merged component
-/// counts as closed only if each part is; nothing here reads that.
+/// coincident positions merged, in the same order. A component is closed when
+/// every one of its edges, taken at its positions, has two triangles.
 fn joined_across_seams(
     mesh: &Mesh,
     edges: &EdgeMap,
@@ -339,12 +369,14 @@ fn joined_across_seams(
             owner[t as usize] = i as u32;
         }
     }
-    // Every edge at its welded corners, with the component using it.
-    let mut keyed: Vec<((VertexId, VertexId), u32)> = Vec::new();
+    // Every edge at its welded corners, with the component using it and how
+    // many triangles do.
+    let mut keyed: Vec<((VertexId, VertexId), u32, usize)> = Vec::new();
     reserve(&mut keyed, edges.len())?;
     for ((a, b), tris) in edges.edges() {
         let (ra, rb) = (roots[a as usize], roots[b as usize]);
-        keyed.push(((ra.min(rb), ra.max(rb)), owner[tris[0] as usize]));
+        let key = (ra.min(rb), ra.max(rb));
+        keyed.push((key, owner[tris[0] as usize], tris.len()));
     }
     keyed.sort_unstable();
     let mut uf = UnionFind::new();
@@ -352,6 +384,12 @@ fn joined_across_seams(
     for w in keyed.windows(2) {
         if w[0].0 == w[1].0 {
             uf.union(w[0].1, w[1].1);
+        }
+    }
+    let mut open = filled(comps.len(), false)?;
+    for run in keyed.chunk_by(|a, b| a.0 == b.0) {
+        if run.iter().map(|e| e.2).sum::<usize>() != 2 {
+            open[run[0].1 as usize] = true;
         }
     }
     // A root is its set's smallest index, so parts arrive in order.
@@ -367,11 +405,15 @@ fn joined_across_seams(
             reserve(&mut m.triangles, c.triangles.len())?;
             m.triangles.extend_from_slice(&c.triangles);
             m.area += c.area;
-            m.closed &= c.closed;
         }
     }
     for m in &mut merged {
         m.triangles.sort_unstable();
+        m.closed = true;
+    }
+    for i in (0..open.len()).filter(|&i| open[i]) {
+        let root = uf.find(i as u32) as usize;
+        merged[slot[root] as usize].closed = false;
     }
     Ok(merged)
 }
@@ -438,11 +480,13 @@ mod tests {
                 .min_triangles(10)
                 .min_area(2.0)
                 .keep_largest(false)
+                .keep_cavities(false)
                 .build(),
             ComponentOptions {
                 min_triangles: Some(10),
                 min_area: Some(2.0),
                 keep_largest: false,
+                keep_cavities: false,
             }
         );
         assert_eq!(

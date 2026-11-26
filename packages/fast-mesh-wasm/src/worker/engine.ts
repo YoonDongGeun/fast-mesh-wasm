@@ -36,7 +36,7 @@ import {
   type SectionPlane,
 } from "../scene.js";
 import type { MeshViews } from "../views.js";
-import type { CollisionStepReport } from "../wave6.js";
+import { type CollisionStepReport, wrapPackedPointCloud } from "../wave6.js";
 import {
   type ClientId,
   type ColorRuleWire,
@@ -48,6 +48,7 @@ import {
   isLastWins,
   keyOf,
   type MeshChangeWire,
+  type PermanentStepWire,
   type PlaceMeshReportWire,
   type QueryMap,
   type Request,
@@ -58,6 +59,7 @@ import {
 } from "./protocol.js";
 
 import type { WorkerSceneOptions } from "./client.js";
+import type { EntryEvent } from "../history.js";
 import { PoolStartError } from "./load.js";
 
 // The artifact selection, for the Node `worker_threads` harness (dist/worker-engine.js),
@@ -172,6 +174,11 @@ export interface EngineOptions {
    * them.
    */
   keepCopies?: boolean;
+  /**
+   * The history budget in bytes (`SceneOptions.historyBudget`). The init
+   * message's overrides it in {@link serveEngine}.
+   */
+  historyBudget?: number;
 }
 
 /** The default {@link EngineOptions.yieldMs}. */
@@ -324,9 +331,12 @@ export function serveEngine(
       // Only the first starts the engine (and its thread pool, once per Worker).
       if (!started && typeof ready === "function") {
         started = true;
-        if (data.backgroundAddTriangles !== undefined) {
-          engineOptions = { ...options, backgroundAddTriangles: data.backgroundAddTriangles };
-        }
+        const { backgroundAddTriangles, historyBudget } = data;
+        engineOptions = {
+          ...options,
+          ...(backgroundAddTriangles === undefined ? {} : { backgroundAddTriangles }),
+          ...(historyBudget === undefined ? {} : { historyBudget }),
+        };
         serve(new Promise<Started>((resolve) => resolve(ready(data))));
       }
     } else if (giveBack) {
@@ -584,6 +594,12 @@ class Engine {
   readonly #fieldTargets = new Map<ClientId, ClientId[] | null>();
   /** The sections those moves took meshes from (see `Result.sectionMeshes`). */
   readonly #sectionsLost = new Set<ClientId>();
+  /** What happened to the client's entries, for the next result. */
+  readonly #entryEvents: NonNullable<Result["entries"]> = [];
+  /** The revision of the request being run. */
+  #rev = 0;
+  /** The steps the history could not keep, for the next result. */
+  readonly #permanent: PermanentStepWire[] = [];
   /** The active drag, by the dragged mesh's client id. */
   #drag: { id: ClientId; session: ReturnType<Scene["drag"]>; collisionActive: boolean } | undefined;
   /** Meshes whose authoritative placement must be emitted in the next result even if delta is 0. */
@@ -637,6 +653,14 @@ class Engine {
     this.#keepCopies = options.keepCopies ?? false;
     // Field updates wait for the end of the batch, to be stepped there.
     this.#steps.setDefer(true);
+    if (options.historyBudget !== undefined) {
+      this.#scene.setHistoryBudget(options.historyBudget);
+    }
+    // Client ids now: a mesh that is gone loses its own with the next result.
+    const ids = (meshes: readonly MeshHandle[]) => meshes.flatMap((h) => this.#meshIds.get(h) ?? []);
+    this.#scene.onPermanent(({ lost, meshes, gone, bytes }) => {
+      this.#permanent.push({ lost, meshes: ids(meshes), gone: ids(gone), bytes });
+    });
   }
 
   /**
@@ -774,6 +798,7 @@ class Engine {
   async #step(req: Request): Promise<boolean> {
     const b = this.#batch;
     b.rev = Math.max(b.rev, req.rev);
+    this.#rev = req.rev;
     const key = keyOf(req);
     if (this.#superseded(req, key) || this.#abandoned(req, key)) {
       return true;
@@ -2183,7 +2208,7 @@ class Engine {
       }
       case "reconstructPointCloud": {
         this.#ensureUnused(req.addedId);
-        const added = s.reconstructPointCloud(req.cloud, req.options);
+        const added = s.reconstructPointCloud(wrapPackedPointCloud(req.cloud, req.origin), req.options);
         this.#bindAdded(req.addedId, added);
         b.replies.push({ qid: req.qid, ok: true, value: undefined });
         return;
@@ -2346,6 +2371,24 @@ class Engine {
         s.clearHistory();
         this.#stepDepth = 0;
         return;
+      case "historyBudget":
+        s.setHistoryBudget(req.bytes);
+        return;
+      case "entry": {
+        const { id, bytes, coalesce } = req;
+        const note = (what: EntryEvent) => () => {
+          this.#entryEvents.push({ id, what, rev: this.#rev });
+        };
+        const entry = { undo: note("undo"), redo: note("redo"), drop: note("drop"), bytes, coalesce };
+        try {
+          s.recordEntry(entry);
+        } catch (e) {
+          // Not in the history: the client lets go of it.
+          entry.drop();
+          throw e;
+        }
+        return;
+      }
       case "step":
         switch (req.phase) {
           case "begin":
@@ -2432,12 +2475,14 @@ class Engine {
           for (const loop of (value as QueryMap["sliceContours"]["value"]).loops) {
             pushOwned(loop.points2d);
             pushOwned(loop.points3d);
+            pushOwned(loop.points3d64);
           }
         } else if (req.name === "sliceContourStack") {
           for (const slice of value as QueryMap["sliceContourStack"]["value"]) {
             for (const loop of slice.loops) {
               pushOwned(loop.points2d);
               pushOwned(loop.points3d);
+              pushOwned(loop.points3d64);
             }
           }
         } else if (req.name === "overhangs") {
@@ -2622,6 +2667,8 @@ class Engine {
         const a = args as QueryMap["wrapPlan"]["args"];
         return s.wrapPlan(this.#meshList(a.meshes), a.options);
       }
+      case "removalBytes":
+        return s.removalBytes(this.#mesh((args as QueryMap["removalBytes"]["args"]).mesh));
       case "latticePlan": {
         const a = args as QueryMap["latticePlan"]["args"];
         return s.latticePlan(this.#mesh(a.mesh), a.options);
@@ -2819,11 +2866,18 @@ class Engine {
         const section = this.#sectionIds.get(sh) as ClientId;
         const result = this.#sectionResult(sh, c.mesh);
         if (result !== null) {
-          for (const contour of result.contours) {
-            b.transfer.push(contour.points.buffer);
+          for (const { points, points64 } of result.contours) {
+            b.transfer.push(points.buffer);
+            if (points64 !== undefined) {
+              b.transfer.push(points64.buffer);
+            }
           }
           if (result.fill !== undefined) {
-            b.transfer.push(result.fill.positions.buffer, result.fill.indices.buffer);
+            const { positions, positions64, indices } = result.fill;
+            b.transfer.push(positions.buffer, indices.buffer);
+            if (positions64 !== undefined) {
+              b.transfer.push(positions64.buffer);
+            }
           }
         }
         sections.push({ section, mesh: id, result });
@@ -2861,6 +2915,9 @@ class Engine {
     });
     this.#sectionsLost.clear();
     const history = { canUndo: s.canUndo(), canRedo: s.canRedo() };
+    // The frame's commit had the scene report the last of them.
+    const entries = this.#entryEvents.splice(0);
+    const permanent = this.#permanent.splice(0);
     // Every landed add's record is in this frame.
     this.#packed.clear();
     // Every removal is in this frame, or was never reported (added and
@@ -2880,9 +2937,12 @@ class Engine {
       placements,
       sections,
       history,
+      historyBytes: s.historyBytes(),
       ...(presence.length === 0 ? {} : { presence }),
       ...(fieldTargets.length === 0 ? {} : { fieldTargets }),
       ...(sectionMeshes.length === 0 ? {} : { sectionMeshes }),
+      ...(entries.length === 0 ? {} : { entries }),
+      ...(permanent.length === 0 ? {} : { permanent }),
       status: b.status,
       replies: b.replies,
       colorings: b.colorings,

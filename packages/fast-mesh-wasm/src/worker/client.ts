@@ -45,6 +45,16 @@ import {
   hullNormals,
   hullPointsBuffer,
 } from "../hull.js";
+import {
+  checkHistoryBudget,
+  checkHistoryEntry,
+  DEFAULT_HISTORY_BUDGET,
+  EntryBook,
+  type HistoryEntry,
+  type PermanentListener,
+  type PermanentStep,
+  tellPermanent,
+} from "../history.js";
 import { checkRegisterOptions } from "../register.js";
 import {
   checkLatticeOptions,
@@ -189,6 +199,7 @@ import {
   checkPositiveArg,
   checkU32Arg,
   cloudBuffer,
+  cloudOrigin,
   type CollisionRule,
   type CollisionRuleInput,
   type CollisionStepReport,
@@ -310,6 +321,22 @@ export interface WorkerSceneOptions {
    * batch's result. A number, 0 or more.
    */
   backgroundAddTriangles?: number;
+  /**
+   * The most bytes the undo history may hold, as `Scene`'s `historyBudget`:
+   * 256 MiB by default. Change it later with
+   * {@link WorkerScene.setHistoryBudget}.
+   *
+   * @example
+   * ```ts
+   * const scene = await createWorkerScene({ historyBudget: 1024 ** 3 });
+   * scene.onPermanent(({ lost }) => {
+   *   if (lost === "undo") {
+   *     notify("That cannot be undone.");
+   *   }
+   * });
+   * ```
+   */
+  historyBudget?: number;
 }
 
 /** The state of a request key, from {@link WorkerScene.status}. */
@@ -339,6 +366,7 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
   if (background !== undefined && (typeof background !== "number" || Number.isNaN(background) || background < 0)) {
     throw invalid(`backgroundAddTriangles must be a number, 0 or more (got ${String(background)})`);
   }
+  const budget = options.historyBudget === undefined ? undefined : checkHistoryBudget(options.historyBudget);
   // Called again by `restart()`.
   const make = (): WorkerLike =>
     options.createWorker?.() ??
@@ -356,6 +384,7 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
       threads: skipped ? 1 : threads,
       debug,
       ...(background === undefined ? {} : { backgroundAddTriangles: background }),
+      ...(budget === undefined ? {} : { historyBudget: budget }),
     },
   });
   try {
@@ -673,7 +702,9 @@ function sortOf(req: Request): Sorted {
     req.kind === "drag" ||
     req.kind === "coloring" ||
     req.kind === "field" ||
-    req.kind === "section"
+    req.kind === "section" ||
+    // The init message has the latest budget.
+    req.kind === "historyBudget"
   ) {
     return { ...base, kind: "declarative", covers: coversOf(req) };
   }
@@ -844,6 +875,7 @@ export class WorkerScene implements SceneLike {
   readonly #optimistic = new Set<MeshState>();
   readonly #listeners = new Set<(changes: MeshChange[]) => void>();
   readonly #statusListeners = new Set<() => void>();
+  readonly #permanentListeners = new Set<PermanentListener>();
   readonly #status = new Map<string, KeyStatus>();
   /** Called with each key whose status is set or forgotten, at once (see {@link watchStatusKeys}). */
   readonly #statusSinks = new Set<(key: string) => void>();
@@ -851,6 +883,9 @@ export class WorkerScene implements SceneLike {
   readonly #latest = new Map<string, number>();
   #statusScheduled = false;
   #history = { canUndo: false, canRedo: false };
+  #historyBytes = 0;
+  /** The application's entries in the history, or on their way to it. */
+  readonly #entries = new EntryBook();
   /** See {@link presenceVersion}. */
   #presenceVersion = 0;
   /** The values mirror is on (a `values()` read asked for it). */
@@ -1384,6 +1419,10 @@ export class WorkerScene implements SceneLike {
       if (log) {
         this.#logFailed(req);
       }
+      if (req.kind === "entry") {
+        // It never got to the history.
+        this.#entries.tell(req.id, "drop");
+      }
       const key = keyOf(req);
       if (key !== undefined && this.#latest.get(key) === req.rev) {
         this.#setStatus(key, { status: "error", revision: req.rev, error });
@@ -1445,6 +1484,7 @@ export class WorkerScene implements SceneLike {
       this.#batchDone.delete(batch);
     }
     this.#releaseHolds();
+    this.#entries.dropAll();
     this.#statusChanged();
   }
 
@@ -1502,6 +1542,8 @@ export class WorkerScene implements SceneLike {
         this.#logFailed(req);
       }
       this.#releaseHolds();
+      // The history is gone with the engine.
+      this.#entries.dropAll();
       this.#applyStatus(r);
       this.#applyReplies(r);
       // Any promise of the batch still pending fails the same way.
@@ -1533,6 +1575,8 @@ export class WorkerScene implements SceneLike {
     for (const c of r.changes) {
       this.#applyChange(c);
     }
+    // Their handles now: a mesh that is gone may be forgotten next.
+    const permanent = this.#permanentSteps(r);
     this.#applyPresence(r);
     // No colours: no colouring (its field removed, or the mesh).
     for (const st of this.#meshes.values()) {
@@ -1589,8 +1633,45 @@ export class WorkerScene implements SceneLike {
       this.#history = { ...r.history };
       this.#statusChanged();
     }
+    this.#historyBytes = r.historyBytes ?? 0;
     this.#applyStatus(r);
+    this.#applyEntries(r);
+    tellPermanent(this.#permanentListeners, permanent);
     this.#applyReplies(r);
+  }
+
+  /**
+   * Calls the application's entries the result undid, redid or dropped. An
+   * entry recorded here since the request that undid (or redid) them was made
+   * comes after it in the history, but its change is made already: it steps
+   * back first and forward again after, so that the callbacks run in the
+   * history's order.
+   */
+  #applyEntries(r: Result): void {
+    const events = r.entries ?? [];
+    for (let k = 0; k < events.length; ) {
+      const { id, what, rev } = events[k];
+      if (what === "drop") {
+        this.#entries.tell(id, what);
+        k++;
+        continue;
+      }
+      const later = this.#entries.after(rev);
+      for (const l of [...later].reverse()) {
+        this.#entries.tell(l, "undo");
+      }
+      for (; k < events.length && events[k].rev === rev && events[k].what !== "drop"; k++) {
+        this.#entries.tell(events[k].id, events[k].what);
+      }
+      for (const l of later) {
+        this.#entries.tell(l, "redo");
+      }
+    }
+  }
+
+  #permanentSteps(r: Result): PermanentStep[] {
+    const handles = (ids: ClientId[]) => ids.flatMap((id) => this.#meshes.get(id)?.handle ?? []);
+    return (r.permanent ?? []).map((p) => ({ ...p, meshes: handles(p.meshes), gone: handles(p.gone) }));
   }
 
   #applyStatus(r: Result): void {
@@ -2037,7 +2118,9 @@ export class WorkerScene implements SceneLike {
    * With `undoable` the removal is an undo step (or part of the open one):
    * {@link WorkerScene.undo} brings the mesh back with the same handle, as
    * `Scene.removeMesh` does. A {@link WorkerScene.restart} clears the history,
-   * so it makes the removal permanent.
+   * so it makes the removal permanent, and so does one larger than the
+   * history budget: {@link WorkerScene.onPermanent} tells once the result is
+   * in, and {@link WorkerScene.removalBytes} before.
    */
   removeMesh(mesh: MeshHandle, options: RemoveMeshOptions = {}): void {
     const st = this.#live(mesh);
@@ -2070,6 +2153,15 @@ export class WorkerScene implements SceneLike {
     }
     const st = this.#state(mesh);
     return st.removed && st.parked;
+  }
+
+  /** About the bytes of history an undoable removal of `mesh` takes; see `Scene.removalBytes`. */
+  removalBytes(mesh: MeshHandle): Promise<number> {
+    return this.#query(
+      "removalBytes",
+      () => ({ mesh: this.#live(mesh).id }),
+      (v) => v,
+    );
   }
 
   /**
@@ -3495,14 +3587,16 @@ export class WorkerScene implements SceneLike {
       (rev, qid) => {
         this.#alive();
         const buf = cloudBuffer(cloud).slice();
+        const origin = cloudOrigin(cloud);
         normalizeReconstructArgs(options);
         const normals = checkBooleanArg(options?.normals, true, "options.normals");
-        added = this.#allocMeshState([0, 0, 0], normals);
+        added = this.#allocMeshState(origin ?? [0, 0, 0], normals);
         return {
           kind: "reconstructPointCloud",
           rev,
           addedId: added.id,
           cloud: buf,
+          ...(origin === undefined ? {} : { origin }),
           options: copyInput(options, "options"),
           qid,
         };
@@ -3683,6 +3777,72 @@ export class WorkerScene implements SceneLike {
     this.#forgetRequested();
     this.#push({ kind: "clearHistory", rev: ++this.#rev });
     this.#scheduleFlush();
+  }
+
+  /**
+   * Records an entry of the application's own in the history, after the
+   * requests before it; see `Scene.recordEntry`. Its functions run here, on
+   * this thread, as the result that undid, redid or dropped it is applied:
+   * after the mirrors and before the promises the result settles and the
+   * change records of the next {@link WorkerScene.commitFrame}.
+   *
+   * The history's order is that of the calls, whatever is in flight: an
+   * `undo()` undoes what was recorded last when it was called, and the engine
+   * says what that was. An entry recorded while an `undo()` or `redo()` is in
+   * flight comes after it, and the undone entries' functions then run around
+   * it (its `undo` before them, its `redo` after), so that every function
+   * finds the application as the history has it. An entry that could not be
+   * recorded is dropped, and so is every entry by a
+   * {@link WorkerScene.restart}, which clears the history.
+   *
+   * @throws `INVALID_ARGUMENT` for an entry without `undo` and `redo`, or with
+   * bytes below 0.
+   */
+  recordEntry(entry: HistoryEntry): void {
+    this.#alive();
+    const { bytes, coalesce } = checkHistoryEntry(entry);
+    const rev = ++this.#rev;
+    const id = this.#entries.add(entry, rev);
+    this.#push({ kind: "entry", rev, id, bytes, ...(coalesce === undefined ? {} : { coalesce }) });
+    this.#scheduleFlush();
+  }
+
+  /** The most bytes the history may hold, as last set here. */
+  get historyBudget(): number {
+    return this.#init.historyBudget ?? DEFAULT_HISTORY_BUDGET;
+  }
+
+  /**
+   * Changes the most bytes the history may hold, after the requests before
+   * it; see `Scene.setHistoryBudget`. A {@link WorkerScene.restart} keeps it.
+   *
+   * @throws `INVALID_ARGUMENT` for anything but a number, 0 or more.
+   */
+  setHistoryBudget(bytes: number): void {
+    this.#alive();
+    const budget = checkHistoryBudget(bytes);
+    // For later Workers; the current one gets the request.
+    this.#init = { ...this.#init, historyBudget: budget };
+    this.#push({ kind: "historyBudget", rev: ++this.#rev, bytes: budget });
+    this.#scheduleFlush();
+  }
+
+  /** The bytes the history holds, as of the latest result. */
+  get historyBytes(): number {
+    return this.#historyBytes;
+  }
+
+  /**
+   * Registers a listener called with each step the history could not keep
+   * (an action that is permanent, or one that cannot be redone), as its
+   * result is applied, before the promises it settles; see
+   * `Scene.onPermanent`. Returns the function that removes it.
+   */
+  onPermanent(listener: PermanentListener): () => void {
+    this.#permanentListeners.add(listener);
+    return () => {
+      this.#permanentListeners.delete(listener);
+    };
   }
 
   /**
@@ -4501,6 +4661,8 @@ export class WorkerScene implements SceneLike {
     this.#failed.length = 0;
     this.#failedDropped = 0;
     this.#history = { canUndo: false, canRedo: false };
+    this.#historyBytes = 0;
+    this.#entries.dropAll();
     this.#statusChanged();
 
     // The replay, in dependency order: meshes, placements, fields,
@@ -4715,6 +4877,7 @@ export class WorkerScene implements SceneLike {
     this.#batchDone.clear();
     this.#queue = [];
     this.#inflight.length = 0;
+    this.#entries.dropAll();
   }
 
   static {
@@ -4728,6 +4891,7 @@ export class WorkerScene implements SceneLike {
       status: scene.#status.size,
       latest: scene.#latest.size,
       prunes: scene.#prunes.length,
+      entries: scene.#entries.size,
     });
     createScene = (make, options) => {
       const scene = new WorkerScene(make, options);

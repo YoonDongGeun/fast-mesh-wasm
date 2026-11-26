@@ -6,9 +6,8 @@
 
 use fast_mesh_store::{Mesh, Transaction, TriangleId, VertexId};
 
-use crate::topology::{
-    EdgeMap, components, cross, dot, point, proper_triangle, sub, triangle_area,
-};
+use crate::nesting::{containers, signed_volume};
+use crate::topology::{Component, EdgeMap, components, proper_triangle, triangle_area};
 use crate::{Result, filled, push, reserve};
 
 const NONE: u32 = u32::MAX;
@@ -22,7 +21,8 @@ pub struct OrientReport {
     pub patches: usize,
     /// Patches that admit no consistent winding, left unchanged.
     pub non_orientable_patches: usize,
-    /// Closed components turned to face outward.
+    /// Closed components reversed whole: turned to face outward or, for the
+    /// cavities of a hollow solid that was inside out, inward.
     pub flipped_outward_components: usize,
 }
 
@@ -51,7 +51,10 @@ struct Patch {
 ///   other. On a tie the winding of the patch's smallest triangle id wins.
 /// - Then each closed component (no boundary and no non-manifold edge) whose
 ///   signed volume, with the planned flips, is negative is reversed whole,
-///   so that it faces outward.
+///   so that it faces outward. A closed component inside another that faces
+///   the other way is a cavity of a hollow solid (or an island in a cavity):
+///   it keeps facing the other way, so an inside-out hollow solid is turned
+///   as a whole and a sound one is left alone.
 ///
 /// Triangles with a repeated vertex id are skipped: never flipped, never
 /// part of a patch. A consistent mesh is left without a write.
@@ -131,14 +134,24 @@ pub fn orient(tx: &mut Transaction) -> Result<OrientReport> {
         non_orientable_patches: patches.iter().filter(|p| !p.orientable).count(),
         ..OrientReport::default()
     };
-    for c in components(mesh, &edges)? {
-        // A closed component is a single patch, but a non-orientable one
-        // (a Klein bottle) has no outside.
+    let comps = components(mesh, &edges)?;
+    // The winding each solid component has with the planned flips; `0` for
+    // the others. A closed component is a single patch, but a non-orientable
+    // one (a Klein bottle) has no outside.
+    let mut signs = filled(comps.len(), 0i8)?;
+    for (s, c) in signs.iter_mut().zip(&comps) {
         let orientable = c
             .triangles
             .iter()
             .all(|&t| patches[patch_of[t as usize] as usize].orientable);
-        if c.closed && orientable && signed_volume(mesh, &c.triangles, &flip) < 0.0 {
+        if c.closed && orientable {
+            let inward = signed_volume(mesh, &c.triangles, Some(&flip)) < 0.0;
+            *s = if inward { -1 } else { 1 };
+        }
+    }
+    let want = outward_signs(mesh, &comps, &signs)?;
+    for (i, c) in comps.iter().enumerate() {
+        if want[i] != signs[i] {
             for &t in &c.triangles {
                 flip[t as usize] = !flip[t as usize];
             }
@@ -162,30 +175,43 @@ pub fn orient(tx: &mut Transaction) -> Result<OrientReport> {
     Ok(report)
 }
 
+/// The winding each component should get, from the one it has in `signs`
+/// (`0` is not a solid and stays). A component faces outward, unless it lies
+/// inside another and faces the other way from it: then it is a cavity, or an
+/// island in one, and keeps facing the other way.
+fn outward_signs(mesh: &Mesh, comps: &[Component], signs: &[i8]) -> Result<Vec<i8>> {
+    let mut want = filled(signs.len(), 0i8)?;
+    for (w, &s) in want.iter_mut().zip(signs) {
+        *w = s.abs();
+    }
+    // Where all face the same way, none is a cavity.
+    if !(signs.contains(&-1) && signs.contains(&1)) {
+        return Ok(want);
+    }
+    let solid = |i: usize| signs[i] != 0;
+    let inside = containers(mesh, comps, solid, solid)?;
+    // The innermost of the components around one is the one with the most
+    // around itself, and is decided first.
+    let depth = |i: usize| inside[i].len();
+    let mut order: Vec<usize> = Vec::new();
+    reserve(&mut order, signs.len())?;
+    order.extend((0..signs.len()).filter(|&i| solid(i)));
+    order.sort_by_key(|&i| depth(i));
+    for i in order {
+        let parent = inside[i].iter().max_by_key(|&&j| depth(j as usize));
+        if let Some(&p) = parent
+            && signs[p as usize] != signs[i]
+        {
+            want[i] = -want[p as usize];
+        }
+    }
+    Ok(want)
+}
+
 /// Whether triangle `t` runs along its edge `a`-`b` from `a` to `b`.
 fn runs_forward(mesh: &Mesh, t: TriangleId, a: VertexId, b: VertexId) -> bool {
     let [x, y, z] = mesh.triangles()[t as usize];
     (x, y) == (a, b) || (y, z) == (a, b) || (z, x) == (a, b)
-}
-
-/// Six times the signed volume enclosed by `triangles` once those marked in
-/// `flip` are reversed, taken about the first triangle's first vertex so
-/// that large coordinates do not swamp it.
-fn signed_volume(mesh: &Mesh, triangles: &[TriangleId], flip: &[bool]) -> f64 {
-    let Some(&first) = triangles.first() else {
-        return 0.0;
-    };
-    let o = point(mesh, mesh.triangles()[first as usize][0]);
-    let mut sum = 0.0;
-    for &t in triangles {
-        let [a, mut b, mut c] = mesh.triangles()[t as usize];
-        if flip[t as usize] {
-            std::mem::swap(&mut b, &mut c);
-        }
-        let [pa, pb, pc] = [a, b, c].map(|v| sub(point(mesh, v), o));
-        sum += dot(pa, cross(pb, pc));
-    }
-    sum
 }
 
 #[cfg(test)]

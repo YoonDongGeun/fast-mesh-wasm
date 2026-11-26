@@ -10,8 +10,7 @@ import { parseStl } from "./stl";
 import { parse3mf } from "./threemf";
 import { checkMesh } from "./mesh-data";
 
-/** The extensions the app reads, for the file picker's `accept`. */
-export const MESH_EXTENSIONS = [".stl", ".obj", ".ply", ".3mf", ".gltf", ".glb", ".drc", ".dcm", ".dicom"];
+export { MESH_EXTENSIONS } from "./mesh-extensions";
 
 /** @throws for an unknown extension or a file its parser rejects. */
 export function parseMeshFile(name: string, buffer: ArrayBuffer): MeshData {

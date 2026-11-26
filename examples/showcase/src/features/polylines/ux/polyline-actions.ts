@@ -30,13 +30,7 @@ import type { SolidMesh } from "./solid";
 import { resampleCurve, type ResampleOptions } from "./spline";
 import { buildTube, tubeProblem, tubeTriangles } from "./tube";
 
-/** The polylines the tools work on: the selected ones, else the only one. */
-export function activePolylines(s: Pick<AppSnapshot, "polylines" | "polylineSelection">): readonly Polyline[] {
-  if (s.polylineSelection.length > 0) {
-    return s.polylines.filter((p) => s.polylineSelection.includes(p.id));
-  }
-  return s.polylines.length === 1 ? s.polylines : [];
-}
+export { activePolylines, removePolylines } from "./polyline-list";
 
 /** The palette colour fewest of `polylines` have (the first of equals). */
 export function nextColor(polylines: readonly Pick<Polyline, "color">[]): number {
@@ -108,15 +102,6 @@ export function keepSectionText(...args: Parameters<typeof keepSection>): { text
     return { text: describeKept(keepSection(...args)), error: false };
   } catch (e) {
     return { text: e instanceof Error ? e.message : String(e), error: true };
-  }
-}
-
-/** Removes polylines, as one undo step. */
-export function removePolylines(app: AppState, store: SceneStore, ids: readonly number[]): void {
-  const { polylines } = app.getSnapshot();
-  const left = polylines.filter((p) => !ids.includes(p.id));
-  if (left.length < polylines.length) {
-    app.editPolylines(store, left);
   }
 }
 

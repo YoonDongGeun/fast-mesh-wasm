@@ -33,7 +33,8 @@
 //!
 //! - `0` weld: `tolerance`.
 //! - `1` remove degenerate: `area_epsilon, remove_unused_vertices`.
-//! - `2` remove small components: `min_triangles, min_area, keep_largest`.
+//! - `2` remove small components: `min_triangles, min_area, keep_largest,
+//!   keep_cavities`.
 //! - `3` orient.
 //! - `4` fill holes: `max_edges, max_perimeter, max_area, loop_count,
 //!   allow_unclean, fair, dp_limit, max_dihedral, max_refine_vertices`;
@@ -906,11 +907,13 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
             o.remove_unused_vertices = flag(unused)?;
             RepairOp::Degenerate(o)
         } else if code == 2.0 {
-            let [min_t, min_a, keep] = words.take(3)?.try_into().map_err(|_| malformed(WHAT))?;
+            let [min_t, min_a, keep, cavities] =
+                words.take(4)?.try_into().map_err(|_| malformed(WHAT))?;
             RepairOp::Components(ComponentOptions {
                 min_triangles: count_opt(min_t, "minTriangles")?,
                 min_area: bound(min_a),
                 keep_largest: flag(keep)?,
+                keep_cavities: flag(cavities)?,
             })
         } else if code == 3.0 {
             RepairOp::Orient
@@ -1987,7 +1990,7 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
 /// 4. `non_manifold_edges, listed_n, (a, b) × listed_n`.
 /// 5. `n, non-manifold vertices...`; `n, pinch vertices...`.
 /// 6. `component_n`, then per component `triangle_n, triangles..., area,
-///    closed`.
+///    closed, cavity`.
 /// 7. `orientation_conflicts, self_intersects` (-1 not checked, 0, 1).
 pub(crate) fn encode_analysis(a: &Analysis) -> Result<Vec<f64>, StoreError> {
     let mut out = Vec::new();
@@ -2039,7 +2042,8 @@ pub(crate) fn encode_analysis(a: &Analysis) -> Result<Vec<f64>, StoreError> {
     for c in &a.components {
         put(&mut out, &[count(c.triangles.len())])?;
         put_ids(&mut out, &c.triangles)?;
-        put(&mut out, &[c.area, f64::from(u8::from(c.closed))])?;
+        let flags = [c.closed, c.cavity].map(|f| f64::from(u8::from(f)));
+        put(&mut out, &[c.area, flags[0], flags[1]])?;
     }
     let self_intersects = match a.self_intersects {
         None => -1.0,
@@ -2183,7 +2187,7 @@ mod tests {
         let ops = [
             0., 0.5, //
             1., nan, 1., //
-            2., 10., nan, 0., //
+            2., 10., nan, 0., 1., //
             3., //
             4., nan, 2., nan, 1., 0., 1., nan, 0.5, 100.,
         ];
@@ -2197,6 +2201,7 @@ mod tests {
                 min_triangles: Some(10),
                 min_area: None,
                 keep_largest: false,
+                keep_cavities: true,
             })
         );
         assert_eq!(d[3], RepairOp::Orient);

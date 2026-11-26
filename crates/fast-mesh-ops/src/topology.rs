@@ -242,10 +242,14 @@ pub struct Component {
     pub area: f64,
     /// `true` when the component has no boundary and no non-manifold edge.
     pub closed: bool,
+    /// `true` when the component is a cavity of a hollow solid: closed, wound
+    /// inward, and inside the material of the components around it.
+    pub cavity: bool,
 }
 
 /// The connected components of the proper triangles, sorted by their
-/// smallest triangle id.
+/// smallest triangle id. Cavities are not marked, as by
+/// [`components_with_cavities`](crate::nesting::components_with_cavities).
 pub(crate) fn components(mesh: &Mesh, edges: &EdgeMap) -> Result<Vec<Component>> {
     let slots = mesh.triangle_slots();
     let mut uf = UnionFind::new();
@@ -272,6 +276,7 @@ pub(crate) fn components(mesh: &Mesh, edges: &EdgeMap) -> Result<Vec<Component>>
                     triangles: Vec::new(),
                     area: 0.0,
                     closed: true,
+                    cavity: false,
                 },
             )?;
         }

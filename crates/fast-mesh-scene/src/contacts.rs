@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fast_mesh_bvh::{BuildOptions, Bvh};
+use fast_mesh_bvh::{Aabb, BuildOptions, Bvh};
 use fast_mesh_fields::{
     DEFAULT_MAX_VOXELS, GridSpec, SignData, SignMode, fh_signed_grid, signed_distances,
 };
@@ -12,7 +12,7 @@ use fast_mesh_query::{
 };
 use fast_mesh_store::{Mesh, StoreError, TriangleId, VertexId};
 
-use crate::baked::baked_mesh;
+use crate::baked::{baked_mesh, baked_pose, world_base};
 use crate::placement::{
     interpolate, is_relative_rigid, local_to_world, relative_affine, relative_rigid, world_to_local,
 };
@@ -599,7 +599,8 @@ enum SdfEvaluator<'a> {
         placement: &'a Placement,
         origin: [f64; 3],
         center_local: [f64; 3],
-        mean_scale: f64,
+        /// The placement's, which is uniform.
+        scale: f64,
     },
 }
 
@@ -645,31 +646,24 @@ fn vec_normalize(a: [f64; 3], fallback: [f64; 3]) -> [f64; 3] {
 }
 
 fn placement_world_box(entry: &Entry, placement: &Placement) -> Aabb64 {
-    let Some(lb) = entry.bvh.root_bounds().filter(|b| !b.is_empty()) else {
-        return Aabb64::EMPTY;
-    };
-    let o = entry.mesh.origin();
-    let xs = [o[0] + f64::from(lb.min[0]), o[0] + f64::from(lb.max[0])];
-    let ys = [o[1] + f64::from(lb.min[1]), o[1] + f64::from(lb.max[1])];
-    let zs = [o[2] + f64::from(lb.min[2]), o[2] + f64::from(lb.max[2])];
+    match entry.bvh.root_bounds().filter(|b| !b.is_empty()) {
+        Some(b) => box_to_world(&b, placement, entry.mesh.origin()),
+        None => Aabb64::EMPTY,
+    }
+}
+
+/// The world box of a box in a mesh's stored local coordinates.
+fn box_to_world(b: &Aabb, placement: &Placement, origin: [f64; 3]) -> Aabb64 {
     let mut out = Aabb64::EMPTY;
-    for &x in &xs {
-        for &y in &ys {
-            for &z in &zs {
-                let w = placement.apply([x, y, z]);
-                out = Aabb64 {
-                    min: [
-                        out.min[0].min(w[0]),
-                        out.min[1].min(w[1]),
-                        out.min[2].min(w[2]),
-                    ],
-                    max: [
-                        out.max[0].max(w[0]),
-                        out.max[1].max(w[1]),
-                        out.max[2].max(w[2]),
-                    ],
-                };
-            }
+    for corner in 0..8 {
+        let p = std::array::from_fn(|k| {
+            let end = if corner >> k & 1 == 1 { b.max } else { b.min };
+            f64::from(end[k])
+        });
+        let w = local_to_world(placement, origin, p);
+        for (k, &c) in w.iter().enumerate() {
+            out.min[k] = out.min[k].min(c);
+            out.max[k] = out.max[k].max(c);
         }
     }
     out
@@ -725,30 +719,9 @@ fn pair_intersects_with_placements(
             &Rigid::IDENTITY,
         )?);
     }
-    let oa = ea.mesh.origin();
-    let ob = eb.mesh.origin();
-    let (ta, ba) = baked_mesh(
-        &ea.mesh,
-        |l| {
-            pa.apply([
-                oa[0] + f64::from(l[0]),
-                oa[1] + f64::from(l[1]),
-                oa[2] + f64::from(l[2]),
-            ])
-        },
-        ea.bvh.options(),
-    )?;
-    let (tb, bb) = baked_mesh(
-        &eb.mesh,
-        |l| {
-            pb.apply([
-                ob[0] + f64::from(l[0]),
-                ob[1] + f64::from(l[1]),
-                ob[2] + f64::from(l[2]),
-            ])
-        },
-        eb.bvh.options(),
-    )?;
+    let base = world_base(&ea.mesh, pa);
+    let (ta, ba) = baked_pose(ea, pa, base)?;
+    let (tb, bb) = baked_pose(eb, pb, base)?;
     Ok(fast_mesh_query::intersects(
         &ta,
         &ba,
@@ -825,36 +798,15 @@ fn pair_distance_with_placements(
             triangle_b: d.triangle_b,
         }));
     }
-    let oa = ea.mesh.origin();
-    let ob = eb.mesh.origin();
-    let (ta, ba) = baked_mesh(
-        &ea.mesh,
-        |l| {
-            pa.apply([
-                oa[0] + f64::from(l[0]),
-                oa[1] + f64::from(l[1]),
-                oa[2] + f64::from(l[2]),
-            ])
-        },
-        ea.bvh.options(),
-    )?;
-    let (tb, bb) = baked_mesh(
-        &eb.mesh,
-        |l| {
-            pb.apply([
-                ob[0] + f64::from(l[0]),
-                ob[1] + f64::from(l[1]),
-                ob[2] + f64::from(l[2]),
-            ])
-        },
-        eb.bvh.options(),
-    )?;
+    let base = world_base(&ea.mesh, pa);
+    let (ta, ba) = baked_pose(ea, pa, base)?;
+    let (tb, bb) = baked_pose(eb, pb, base)?;
     let found =
         fast_mesh_query::mesh_distance(&ta, &ba, &tb, &bb, &Rigid::IDENTITY, f32::INFINITY)?;
     Ok(found.map(|d| PairSurfaceDistance {
         distance: f64::from(d.distance),
-        point_a: d.point_a.map(f64::from),
-        point_b: d.point_b.map(f64::from),
+        point_a: vec_add(base, d.point_a.map(f64::from)),
+        point_b: vec_add(base, d.point_b.map(f64::from)),
         triangle_b: d.triangle_b,
     }))
 }
@@ -1217,7 +1169,7 @@ impl Scene {
             for v in 0..ei.mesh.vertex_slots() as u32 {
                 if ei.mesh.is_vertex_alive(v) {
                     let p = ei.mesh.positions()[v as usize].map(f64::from);
-                    found = Some(local_to_world(&ei.placement, ei.mesh.origin(), p));
+                    found = Some(ei.local_to_world(p));
                     break;
                 }
             }
@@ -1226,14 +1178,11 @@ impl Scene {
             };
             w
         };
-        let (pl, origin, has_tris) = {
-            let eo = self.entry(outer)?;
-            (eo.placement, eo.mesh.origin(), eo.mesh.triangle_count() > 0)
-        };
-        if !has_tris {
+        let eo = self.entry(outer)?;
+        if eo.mesh.triangle_count() == 0 {
             return Ok(false);
         }
-        let local64 = world_to_local(&pl, origin, sample_world);
+        let local64 = eo.world_to_local(sample_world);
         let sample_local = [local64[0] as f32, local64[1] as f32, local64[2] as f32];
         if !sample_local.iter().all(|c| c.is_finite()) {
             return Ok(false);
@@ -1930,7 +1879,13 @@ impl Scene {
                     f64::from(new_local[1]) - f64::from(old_local[1]),
                     f64::from(new_local[2]) - f64::from(old_local[2]),
                 ];
-                if vec_norm(d_local) > 1e-6 {
+                // A world length, as every other here.
+                let d = if pc.is_scaled() {
+                    pc.apply_direction(d_local)
+                } else {
+                    d_local
+                };
+                if vec_norm(d) > 1e-6 {
                     changed_ids.push(vid);
                     changed_positions.push(new_local);
                     if contacts[i].penetrating || (penetrating_count > 0 && !exact_rest_snap[i]) {
@@ -1974,7 +1929,7 @@ impl Scene {
                 continue;
             }
             let p = ec.mesh.positions()[v as usize].map(f64::from);
-            world_pts.push(local_to_world(&ec.placement, ec.mesh.origin(), p));
+            world_pts.push(ec.local_to_world(p));
         }
         self.evaluate_world_points_against_indenter(indenter, rule, &world_pts, push_fraction)
     }
@@ -1991,73 +1946,105 @@ impl Scene {
         }
         let pad_margin = rule.contact_margin.max(0.0);
 
-        match rule.distance_backend {
-            CollisionDistanceBackend::BvhSdf => {
-                let (i_world_box, placement, origin) = {
-                    let ei = self.entry(indenter)?;
-                    if ei.bvh.root_bounds().filter(|b| !b.is_empty()).is_none() {
-                        return Ok(vec![VertexContact::default(); world_pts.len()]);
-                    }
-                    (
-                        placement_world_box(ei, &ei.placement),
-                        ei.placement,
-                        ei.mesh.origin(),
-                    )
-                };
+        // A non-uniform scale distorts distances, and which point is nearest
+        // with them: the indenter is then a copy of it as placed, in the world
+        // around its own origin.
+        let baked = {
+            let ei = self.entry(indenter)?;
+            match ei.placement.uniform_scale() {
+                Some(_) => None,
+                None => {
+                    let base = world_base(&ei.mesh, &ei.placement);
+                    Some(baked_pose(ei, &ei.placement, base)?)
+                }
+            }
+        };
+        match baked {
+            Some((mut mesh, bvh)) => {
+                let origin = mesh.origin();
+                let at = (&Placement::IDENTITY, origin);
+                evaluate_indenter(
+                    &mut mesh,
+                    &bvh,
+                    at,
+                    rule,
+                    world_pts,
+                    push_fraction,
+                    pad_margin,
+                )
+            }
+            None => {
                 let ei = self.entry_mut(indenter)?;
-                let sign = SignData::build(&mut ei.mesh, &ei.bvh, SignMode::Auto)?;
-                let eval = SdfEvaluator::Bvh {
-                    mesh: &ei.mesh,
-                    bvh: &ei.bvh,
-                    sign: &sign,
-                    placement: &placement,
-                    origin,
-                    world_box: pad_box(&i_world_box, pad_margin + 1e-4),
-                };
-                evaluate_sdf_bvh(eval, world_pts, pad_margin, push_fraction)
+                let (placement, origin) = (ei.placement, ei.mesh.origin());
+                let at = (&placement, origin);
+                let (mesh, bvh) = (&mut ei.mesh, &ei.bvh);
+                evaluate_indenter(mesh, bvh, at, rule, world_pts, push_fraction, pad_margin)
             }
-            CollisionDistanceBackend::FhEdt => {
-                let ei = self.entry(indenter)?;
-                let Some(ib_local) = ei.bvh.root_bounds().filter(|b| !b.is_empty()) else {
-                    return Ok(vec![VertexContact::default(); world_pts.len()]);
-                };
-                let ext = [
-                    f64::from(ib_local.max[0] - ib_local.min[0]),
-                    f64::from(ib_local.max[1] - ib_local.min[1]),
-                    f64::from(ib_local.max[2] - ib_local.min[2]),
-                ];
-                let max_ext = ext[0].max(ext[1]).max(ext[2]).max(1e-3);
-                let voxel_size = ((max_ext / 32.0) as f32).max(1e-4);
-                let min_s = ei.placement.scale[0]
-                    .min(ei.placement.scale[1])
-                    .min(ei.placement.scale[2])
-                    .max(1e-6);
-                let local_margin = (pad_margin / min_s) as f32 + 2.0 * voxel_size;
-                let spec = GridSpec::around_bounds(
-                    ib_local.min,
-                    ib_local.max,
-                    voxel_size,
-                    local_margin,
-                    4,
-                    DEFAULT_MAX_VOXELS,
-                )?;
-                let grid = fh_signed_grid(&ei.mesh, spec, DEFAULT_MAX_VOXELS)?;
-                let center_local = [
-                    0.5 * f64::from(ib_local.min[0] + ib_local.max[0]),
-                    0.5 * f64::from(ib_local.min[1] + ib_local.max[1]),
-                    0.5 * f64::from(ib_local.min[2] + ib_local.max[2]),
-                ];
-                let mean_scale =
-                    (ei.placement.scale[0] + ei.placement.scale[1] + ei.placement.scale[2]) / 3.0;
-                let eval = SdfEvaluator::FhEdt {
-                    grid: &grid,
-                    placement: &ei.placement,
-                    origin: ei.mesh.origin(),
-                    center_local,
-                    mean_scale,
-                };
-                evaluate_sdf_fhedt(eval, world_pts, pad_margin, push_fraction)
-            }
+        }
+    }
+}
+
+/// Where each world point is to an indenter of a uniform scale: `mesh` as
+/// placed by `at`, its placement and origin.
+fn evaluate_indenter(
+    mesh: &mut Mesh,
+    bvh: &Bvh,
+    at: (&Placement, [f64; 3]),
+    rule: &CollisionRule,
+    world_pts: &[[f64; 3]],
+    push_fraction: f64,
+    pad_margin: f64,
+) -> Result<Vec<VertexContact>> {
+    let (placement, origin) = at;
+    let Some(ib_local) = bvh.root_bounds().filter(|b| !b.is_empty()) else {
+        return Ok(vec![VertexContact::default(); world_pts.len()]);
+    };
+    match rule.distance_backend {
+        CollisionDistanceBackend::BvhSdf => {
+            let i_world_box = box_to_world(&ib_local, placement, origin);
+            let sign = SignData::build(mesh, bvh, SignMode::Auto)?;
+            let eval = SdfEvaluator::Bvh {
+                mesh,
+                bvh,
+                sign: &sign,
+                placement,
+                origin,
+                world_box: pad_box(&i_world_box, pad_margin + 1e-4),
+            };
+            evaluate_sdf_bvh(eval, world_pts, pad_margin, push_fraction)
+        }
+        CollisionDistanceBackend::FhEdt => {
+            let ext = [
+                f64::from(ib_local.max[0] - ib_local.min[0]),
+                f64::from(ib_local.max[1] - ib_local.min[1]),
+                f64::from(ib_local.max[2] - ib_local.min[2]),
+            ];
+            let max_ext = ext[0].max(ext[1]).max(ext[2]).max(1e-3);
+            let voxel_size = ((max_ext / 32.0) as f32).max(1e-4);
+            let scale = placement.max_scale();
+            let local_margin = (pad_margin / scale.max(1e-6)) as f32 + 2.0 * voxel_size;
+            let spec = GridSpec::around_bounds(
+                ib_local.min,
+                ib_local.max,
+                voxel_size,
+                local_margin,
+                4,
+                DEFAULT_MAX_VOXELS,
+            )?;
+            let grid = fh_signed_grid(mesh, spec, DEFAULT_MAX_VOXELS)?;
+            let center_local = [
+                0.5 * f64::from(ib_local.min[0] + ib_local.max[0]),
+                0.5 * f64::from(ib_local.min[1] + ib_local.max[1]),
+                0.5 * f64::from(ib_local.min[2] + ib_local.max[2]),
+            ];
+            let eval = SdfEvaluator::FhEdt {
+                grid: &grid,
+                placement,
+                origin,
+                center_local,
+                scale,
+            };
+            evaluate_sdf_fhedt(eval, world_pts, pad_margin, push_fraction)
         }
     }
 }
@@ -2188,14 +2175,14 @@ fn evaluate_sdf_fhedt(
         placement,
         origin,
         center_local,
-        mean_scale,
+        scale,
     } = eval
     else {
         return Ok(vec![VertexContact::default(); world_pts.len()]);
     };
 
     let mut out = vec![VertexContact::default(); world_pts.len()];
-    let margin_local = margin / mean_scale.max(1e-6);
+    let margin_local = margin / scale.max(1e-6);
 
     for (idx, &pw) in world_pts.iter().enumerate() {
         let p_loc64 = world_to_local(placement, origin, pw);
@@ -2233,12 +2220,12 @@ fn evaluate_sdf_fhedt(
             let target = vec_add(pw, vec_scale(vec_sub(surf_world, pw), push_fraction));
             out[idx] = VertexContact {
                 penetrating: true,
-                signed_dist_world: sd_l * mean_scale,
+                signed_dist_world: sd_l * scale,
                 outward_world: n_world,
                 target_world: target,
             };
         } else {
-            out[idx].signed_dist_world = sd_l * mean_scale;
+            out[idx].signed_dist_world = sd_l * scale;
         }
     }
 

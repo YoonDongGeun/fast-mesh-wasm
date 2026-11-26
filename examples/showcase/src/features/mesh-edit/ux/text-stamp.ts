@@ -2,13 +2,14 @@
 // stamp, standing on its base at z = 0 and centred on the picked point, so
 // Embed & Union raises it out of the surface and Engrave cuts it in, as
 // one undoable edit of the target (the Place Mesh op). This module builds
-// that stamp, says in words what the settings will do, and arms the
-// viewport tool with the text.
-import type { AppState } from "../../../app/state/app-state";
+// that stamp and says in words what the settings will do; text-stamp-arm.ts
+// arms the viewport tool with the text.
 import type { Wave6PrintPrepState } from "../../../app/state/wave6-state";
 import { formatLength, type LengthUnit } from "../../../shared/ux/units";
 import { loadTextFont } from "./text-font";
 import { buildTextMesh, FOLLOW_EDGES_PER_LETTER, refineAcross, type TextParams, textParamsProblem } from "./text-mesh";
+
+export { armTextStamp, type TextStampMode } from "./text-stamp-arm";
 
 /**
  * The stamp Place Mesh puts down for `params`: the closed text mesh with
@@ -31,9 +32,6 @@ export async function textStampGeometry(
   const stamp = options.follow === true ? refineAcross(mesh, params.size / FOLLOW_EDGES_PER_LETTER) : mesh;
   return { positions: Float64Array.from(stamp.positions), indices: stamp.indices };
 }
-
-/** The two ways text goes onto a surface. */
-export type TextStampMode = "embedUnion" | "engraveSubtract";
 
 /**
  * What a text stamp will do with `place`'s settings, in words: how far
@@ -60,25 +58,4 @@ export function textStampEffect(
       : { text: "The text lies under the surface: make Depth larger than Embed.", problem: true };
   }
   return null;
-}
-
-/**
- * Arms Place Mesh with `text` as its stamp, in `mode`, conforming to the
- * surface (so a long line follows a curve), with every other viewport tool
- * off, and shows the Mesh Edit panel that holds its settings.
- */
-export function armTextStamp(app: AppState, text: TextParams, mode: TextStampMode): void {
-  app.setSculpt(null);
-  app.setMaskPaint(false);
-  app.updateWave6((prev) => ({
-    ...prev,
-    select: { ...prev.select, activeTool: null },
-    deform: { ...prev.deform, activeTool: null },
-    printPrep: {
-      ...prev.printPrep,
-      activeTool: "placeStamp",
-      placeParams: { ...prev.printPrep.placeParams, stampSource: "text", text: { ...text }, mode, conformToSurface: true },
-    },
-  }));
-  app.setActiveTab("edit");
 }

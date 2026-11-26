@@ -29,15 +29,22 @@ export default defineConfig({
   // resolved against it.
   base: process.env.SHOWCASE_BASE ?? "/",
   plugins: [react(), crossOriginIsolation()],
-  // Top-level await in src/main.tsx needs a modern target, in the page and in
-  // the parser Worker. three.js is one stable vendor chunk (the main view
-  // and the lazy volume panel share it); React Three Fiber stays in index.
+  // A modern target: browsers with wasm threads take it. three.js is one stable vendor
+  // chunk (the page and the feature chunks share it). Everything else the page
+  // imports statically, React Three Fiber included, is the one index chunk, so
+  // what it shares with the feature chunks (src/app/ux/feature-chunks.ts) is not
+  // split into many small ones. A build warns when index passes 1,000 kB.
   build: {
     target: "es2022",
-    chunkSizeWarningLimit: 1600,
+    chunkSizeWarningLimit: 1000,
     rollupOptions: {
       output: {
-        manualChunks: (id) => (id.includes("node_modules/three/") ? "three" : undefined),
+        codeSplitting: {
+          groups: [
+            { name: "three", test: /node_modules[\\/]three[\\/]/, priority: 2 },
+            { name: "index", tags: ["$initial"], priority: 1 },
+          ],
+        },
       },
     },
   },

@@ -12,7 +12,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchChrome, startServer } from "./chrome-cdp.mjs";
+import { launchChrome, SHOWCASE_READY, startServer } from "./chrome-cdp.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const example = join(root, "examples", "showcase");
@@ -192,7 +192,7 @@ async function upload(paths) {
 async function warmUpShaders() {
   // Compile Three.js / FastMesh unselected-mesh WebGLProgram once in the Chrome
   // GPU process before timed loads (Windows ANGLE D3D11 FXC compiles on first draw).
-  await browser.goto(`${baseUrl}/?decimate-target=100000`, "window.__showcase !== undefined");
+  await browser.goto(`${baseUrl}/?decimate-target=100000`, SHOWCASE_READY);
   await waitFor(
     '__showcase.items().length > 0 && __showcase.items().every((i) => i.drawn) && __showcase.jobs().every((j) => j.phase === "done")',
     30_000,
@@ -206,7 +206,7 @@ async function warmUpShaders() {
 }
 
 async function prepareCleanPage(query) {
-  await browser.goto(`${baseUrl}/${query}`, "window.__showcase !== undefined");
+  await browser.goto(`${baseUrl}/${query}`, SHOWCASE_READY);
   await waitFor(
     '__showcase.items().length > 0 && __showcase.items().every((i) => i.drawn) && __showcase.jobs().every((j) => j.phase === "done") && __showcase.selection() !== null && document.querySelector(".meshes li button.danger") !== null',
     30_000,

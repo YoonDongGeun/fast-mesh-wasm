@@ -9,9 +9,14 @@ use crate::align::jacobi_eigen_3x3;
 use crate::error::{OpsError, Result};
 use crate::icp::{add, cross, dot, norm, sub, unit};
 use crate::marching_cubes::marching_cubes_raw;
-use crate::{allocation_allowed, reserve};
+use crate::{allocation_allowed, push, reserve};
 
 /// Point cloud container storing 3D coordinates with optional normals and RGB colors.
+///
+/// Positions are `f32`, which far from zero holds them only to its steps there (0.008 at 1e5).
+/// For a cloud there, keep them relative to an `f64` point near them, as
+/// [`PointCloud::parse_xyz_centered`] and its like return it, and give that point to the mesh
+/// made of them ([`Mesh::with_origin`]).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PointCloud {
     /// 3D point coordinates.
@@ -45,6 +50,48 @@ impl PointCloud {
     /// Parse an ASCII or binary `.ply` vertex cloud.
     pub fn parse_ply_points(bytes: &[u8]) -> Result<Self> {
         parse_ply_points(bytes)
+    }
+
+    /// [`PointCloud::parse_xyz`] with the positions relative to the centre of their bounds, which
+    /// comes with them, in `f64`: read as `f64`, they keep their precision far from zero.
+    pub fn parse_xyz_centered(input: &str) -> Result<(Self, [f64; 3])> {
+        let mut exact = Vec::new();
+        let cloud = parse_xyz_rows(input, Some(&mut exact))?;
+        Ok(cloud.centered(&exact))
+    }
+
+    /// [`PointCloud::parse_pcd_ascii`] as [`PointCloud::parse_xyz_centered`] reads positions.
+    pub fn parse_pcd_ascii_centered(input: &str) -> Result<(Self, [f64; 3])> {
+        let mut exact = Vec::new();
+        let cloud = parse_pcd_rows(input, Some(&mut exact))?;
+        Ok(cloud.centered(&exact))
+    }
+
+    /// [`PointCloud::parse_ply_points`] as [`PointCloud::parse_xyz_centered`] reads positions.
+    pub fn parse_ply_points_centered(bytes: &[u8]) -> Result<(Self, [f64; 3])> {
+        let mut exact = Vec::new();
+        let cloud = parse_ply_rows(bytes, Some(&mut exact))?;
+        Ok(cloud.centered(&exact))
+    }
+
+    /// The cloud with the positions `exact`, and the centre of their bounds, around which they are.
+    fn centered(mut self, exact: &[[f64; 3]]) -> (Self, [f64; 3]) {
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for p in exact {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        let center = if exact.is_empty() {
+            [0.0; 3]
+        } else {
+            std::array::from_fn(|k| 0.5 * lo[k] + 0.5 * hi[k])
+        };
+        for (p, q) in self.positions.iter_mut().zip(exact) {
+            *p = std::array::from_fn(|k| (q[k] - center[k]) as f32);
+        }
+        (self, center)
     }
 
     /// Number of points in the cloud.
@@ -112,6 +159,11 @@ impl Default for SurfaceReconstructOptions {
 
 /// Parse an ASCII `.xyz` / `.xyzn` / `.xyzrgb` string into a [`PointCloud`].
 pub fn parse_xyz(input: &str) -> Result<PointCloud> {
+    parse_xyz_rows(input, None)
+}
+
+/// [`parse_xyz`], with the positions as `f64` in `exact`.
+fn parse_xyz_rows(input: &str, mut exact: Option<&mut Vec<[f64; 3]>>) -> Result<PointCloud> {
     allocation_allowed()?;
     let mut rows: Vec<Vec<f32>> = Vec::new();
     let mut expected_cols: Option<usize> = None;
@@ -135,6 +187,10 @@ pub fn parse_xyz(input: &str) -> Result<PointCloud> {
             return Err(OpsError::InvalidInput(
                 "xyz row must contain at least 3 coordinates",
             ));
+        }
+        if let Some(exact) = exact.as_deref_mut() {
+            let toks: Vec<&str> = trimmed.split_whitespace().take(3).collect();
+            push(exact, parse_f64_point([toks[0], toks[1], toks[2]])?)?;
         }
         match expected_cols {
             Some(c) if c != vals.len() => {
@@ -223,6 +279,11 @@ fn normalize_rgb_rows(rows: &[Vec<f32>], offset: usize) -> Vec<[f32; 3]> {
 
 /// Parse an ASCII `.pcd` (`DATA ascii`) string into a [`PointCloud`].
 pub fn parse_pcd_ascii(input: &str) -> Result<PointCloud> {
+    parse_pcd_rows(input, None)
+}
+
+/// [`parse_pcd_ascii`], with the positions as `f64` in `exact`.
+fn parse_pcd_rows(input: &str, mut exact: Option<&mut Vec<[f64; 3]>>) -> Result<PointCloud> {
     allocation_allowed()?;
     let mut fields: Vec<String> = Vec::new();
     let mut types: Vec<char> = Vec::new();
@@ -362,6 +423,12 @@ pub fn parse_pcd_ascii(input: &str) -> Result<PointCloud> {
             parse_f32_finite(tokens[iz])?,
         ];
         positions.push(p);
+        if let Some(exact) = exact.as_deref_mut() {
+            push(
+                exact,
+                parse_f64_point([tokens[ix], tokens[iy], tokens[iz]])?,
+            )?;
+        }
 
         if let (Some((nx_i, ny_i, nz_i)), Some(nvec)) = (normal_cols, normals.as_mut()) {
             let n = [
@@ -427,6 +494,11 @@ pub fn parse_pcd_ascii(input: &str) -> Result<PointCloud> {
 
 /// Parse an ASCII or binary `.ply` vertex cloud into a [`PointCloud`].
 pub fn parse_ply_points(bytes: &[u8]) -> Result<PointCloud> {
+    parse_ply_rows(bytes, None)
+}
+
+/// [`parse_ply_points`], with the positions as `f64` in `exact`.
+fn parse_ply_rows(bytes: &[u8], mut exact: Option<&mut Vec<[f64; 3]>>) -> Result<PointCloud> {
     allocation_allowed()?;
     let header_end = find_ply_header_end(bytes)?;
     let header_str = std::str::from_utf8(&bytes[..header_end])
@@ -595,6 +667,9 @@ pub fn parse_ply_points(bytes: &[u8]) -> Result<PointCloud> {
                 parse_f32_finite(toks[iy])?,
                 parse_f32_finite(toks[iz])?,
             ]);
+            if let Some(exact) = exact.as_deref_mut() {
+                push(exact, parse_f64_point([toks[ix], toks[iy], toks[iz]])?)?;
+            }
             if let (Some((a, b, c)), Some(nvec)) = (nrm_idx, normals.as_mut()) {
                 nvec.push(normalize_or_default([
                     parse_f32_finite(toks[a])?,
@@ -640,7 +715,7 @@ pub fn parse_ply_points(bytes: &[u8]) -> Result<PointCloud> {
     }
 
     let le = fmt == PlyFormat::LittleEndian;
-    let read_val = |row: &[u8], prop_idx: usize| -> Result<f32> {
+    let read_f64 = |row: &[u8], prop_idx: usize| -> Result<f64> {
         let (_, ty, off) = vertex_props[prop_idx];
         let s = &row[off..off + ty.byte_len()];
         let v: f64 = match ty {
@@ -682,8 +757,10 @@ pub fn parse_ply_points(bytes: &[u8]) -> Result<PointCloud> {
         if !v.is_finite() {
             return Err(OpsError::InvalidInput("non-finite scalar in binary ply"));
         }
-        Ok(v as f32)
+        Ok(v)
     };
+    let read_val =
+        |row: &[u8], prop_idx: usize| -> Result<f32> { Ok(read_f64(row, prop_idx)? as f32) };
 
     let mut positions = Vec::with_capacity(v_count);
     let mut normals = if nrm_idx.is_some() {
@@ -700,6 +777,12 @@ pub fn parse_ply_points(bytes: &[u8]) -> Result<PointCloud> {
     for vi in 0..v_count {
         let row = &payload[vi * stride..(vi + 1) * stride];
         positions.push([read_val(row, ix)?, read_val(row, iy)?, read_val(row, iz)?]);
+        if let Some(exact) = exact.as_deref_mut() {
+            push(
+                exact,
+                [read_f64(row, ix)?, read_f64(row, iy)?, read_f64(row, iz)?],
+            )?;
+        }
         if let (Some((a, b, c)), Some(nvec)) = (nrm_idx, normals.as_mut()) {
             nvec.push(normalize_or_default([
                 read_val(row, a)?,
@@ -748,6 +831,19 @@ fn parse_f32_finite(tok: &str) -> Result<f32> {
         return Err(OpsError::InvalidInput("non-finite floating-point value"));
     }
     Ok(v)
+}
+
+fn parse_f64_point(toks: [&str; 3]) -> Result<[f64; 3]> {
+    let mut p = [0.0f64; 3];
+    for (c, tok) in p.iter_mut().zip(toks) {
+        *c = tok
+            .parse()
+            .map_err(|_| OpsError::InvalidInput("invalid floating-point token"))?;
+        if !c.is_finite() {
+            return Err(OpsError::InvalidInput("non-finite floating-point value"));
+        }
+    }
+    Ok(p)
 }
 
 // ============================================================================
@@ -1176,6 +1272,9 @@ pub fn estimate_normals(
 // ============================================================================
 
 /// Reconstruct a triangle mesh surface from a point cloud.
+///
+/// The mesh is in the cloud's coordinates: for a cloud kept relative to an `f64` point (see
+/// [`PointCloud`]), give it that point with [`Mesh::with_origin`].
 pub fn reconstruct_surface(
     cloud: &PointCloud,
     options: &SurfaceReconstructOptions,

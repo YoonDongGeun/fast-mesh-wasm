@@ -225,6 +225,36 @@ fn remove_small_components_counts_uv_islands_as_one_surface() {
     assert_eq!(m.triangle_count(), triangles);
 }
 
+#[test]
+fn remove_small_components_keeps_a_cavity_with_seams() {
+    // No two triangles share a vertex, so each is an island and every edge is
+    // a seam.
+    let soup = |m: &Mesh| {
+        let (p, t) = crate::test_util::parts(m);
+        t.iter()
+            .flatten()
+            .flat_map(|&v| p[3 * v as usize..][..3].to_vec())
+            .collect::<Vec<f32>>()
+    };
+    let cavity = crate::test_util::box_mesh([1.0; 3], [3.0; 3]);
+    let cavity = crate::test_util::flip(&cavity, &(0..12).collect::<Vec<u32>>());
+    let mut positions = soup(&crate::test_util::uv_sphere(20, 20, 10.0));
+    positions.extend(soup(&cavity));
+    positions.extend(soup(&crate::test_util::box_mesh([20.0; 3], [21.0; 3])));
+    let corners = (positions.len() / 3) as u32;
+    let triangles: Vec<[u32; 3]> = (0..corners / 3)
+        .map(|t| [3 * t, 3 * t + 1, 3 * t + 2])
+        .collect();
+    let mut m = mesh_of(&positions, &triangles);
+    m.add_uvs(&vec![0.5; 2 * corners as usize]).unwrap();
+    let options = ComponentOptions {
+        min_triangles: Some(100),
+        ..Default::default()
+    };
+    let (r, _) = edit(&mut m, |tx| remove_small_components(tx, &options));
+    assert_eq!((r.removed_components, r.removed_triangles), (1, 12));
+}
+
 // ---- auto_repair
 
 /// A flat `8 x 4` sheet of two charts split along `x = 4` with a UV seam, the

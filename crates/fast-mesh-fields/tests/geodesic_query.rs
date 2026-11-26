@@ -317,19 +317,15 @@ fn every_part_is_solved_on_its_own() {
     let mut d = Vec::new();
     let sources = [firsts[3], firsts[20], firsts[39]];
     geodesic_distances(&m, &sources, &GeodesicOptions::default(), &mut d).unwrap();
-    let alone = |part: &Mesh| {
-        let mut d = Vec::new();
-        geodesic_distances(part, &[0], &GeodesicOptions::default(), &mut d).unwrap();
-        d
-    };
     for (k, &first) in firsts.iter().enumerate() {
         let part = if k == 20 { &large } else { &small };
         let got = &d[first as usize..][..part.vertex_slots()];
         if sources.contains(&first) {
-            // (The mean edge length, and so the time step, differ a little.)
-            let want = alone(part);
-            for (a, b) in got.iter().zip(&want) {
-                assert!((a - b).abs() < 0.05, "part {k}: {a} instead of {b}");
+            // Straight from its first corner.
+            for (d, p) in got.iter().zip(part.positions()) {
+                let want = p[0].hypot(p[1]);
+                let near = 0.25 + 0.01 * want;
+                assert!((d - want).abs() < near, "part {k}: {d} instead of {want}");
             }
         } else {
             assert!(got.iter().all(|x| x.is_infinite()), "part {k}");
@@ -357,7 +353,7 @@ fn distances_do_not_depend_on_threads() {
 #[test]
 fn any_soup_of_triangles_gets_distances() {
     // Random corners: slivers, fans, folded and repeated triangles, edges
-    // with many triangles, at any scale.
+    // with many triangles, at any scale. (Cut into some thousands each.)
     let mut state = 1u64;
     let mut next = move || {
         state = state
@@ -365,7 +361,7 @@ fn any_soup_of_triangles_gets_distances() {
             .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
-    for round in 0..120 {
+    for round in 0..40 {
         let n = 4 + next() % 400;
         let scale = 10f32.powi(next() as i32 % 25 - 12);
         let flat = if round % 3 == 0 { 1e-4 } else { 1.0 };

@@ -2,7 +2,7 @@
 // height map's JSON if one is dropped along; every other file loads as before.
 import { useCallback } from "react";
 import type { AppState } from "../../../app/state/app-state";
-import { splitReliefFiles } from "./relief";
+import { splitReliefFiles } from "./relief-files";
 import { reliefDialogOf } from "./relief-dialog-state";
 
 export function useReliefDrop(

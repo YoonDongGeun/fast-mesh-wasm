@@ -38,9 +38,11 @@ function safeTriggerDownload(text: string, fileName: string, mime: string): void
   downloadReportText(text, fileName, mime);
 }
 
-/** Every loop of the slices, in order, as world curves. */
+/** Every loop of the slices, in order, as world curves (in `f64`, which keeps those of a far mesh exact). */
 export function sliceCurves(slices: readonly ContourSlice[]): ContourLike[] {
-  return slices.flatMap((slice) => slice.loops.map((loop) => ({ points: loop.points3d, closed: loop.closed })));
+  return slices.flatMap((slice) =>
+    slice.loops.map((loop) => ({ points: loop.points3d64 ?? loop.points3d, closed: loop.closed })),
+  );
 }
 
 /** Converts multi-slice Wave 6 contours into minimal R12 DXF entities. */

@@ -27,7 +27,8 @@ import {
   tubePolylines,
 } from "../src/features/polylines/ux/polyline-actions";
 import { polylinesFile } from "../src/features/polylines/ux/polyline-export";
-import { curveLength, makeCurve, pointCount, POLYLINE_PALETTE } from "../src/features/polylines/ux/polyline";
+import { applyEdit, editBytes } from "../src/features/polylines/ux/polyline-history";
+import { curveLength, makeCurve, pointCount, type Polyline, POLYLINE_PALETTE } from "../src/features/polylines/ux/polyline";
 import { defaultLengths, describeEdit } from "../src/features/polylines/ux/use-polyline-ops";
 import { blobbySphere } from "../src/io/demo";
 import { collectProject, parseProjectDoc, restoreProject } from "../src/io/project";
@@ -141,8 +142,9 @@ describe("keeping curves", () => {
     h.store.redo();
     h.store.redo();
     expect(names(h)).toEqual(["Cut", "Cut 1", "Cut 2"]);
-    // The markers that stand for the list's states are no meshes of the list.
+    // They are no meshes, of the list or of the scene.
     expect(items(h)).toEqual([]);
+    expect(h.store.getSnapshot().meshes.size).toBe(0);
   });
 
   it("refuses nothing and too much, and changes nothing then", async () => {
@@ -274,8 +276,8 @@ describe("editing polylines", () => {
     for (let k = 0; k < 20; k++) {
       keepCurves(h.app, h.store, [LINE], "Line");
     }
-    // One marker, however many edits.
-    expect(h.store.getSnapshot().meshes.size).toBe(before + 1);
+    // Edits are entries of the history: no mesh stands for them.
+    expect(h.store.getSnapshot().meshes.size).toBe(before);
     for (let k = 0; k < 20; k++) {
       h.store.undo();
     }
@@ -392,6 +394,181 @@ describe.each([
   });
 });
 
+describe("an edit's entry in the undo history", () => {
+  const line = (id: number, more: Partial<Polyline> = {}): Polyline => ({
+    id,
+    name: `P${id}`,
+    color: 0,
+    visible: true,
+    closed: false,
+    points: new Float64Array(6),
+    ...more,
+  });
+  const [a, b, c, d] = [1, 2, 3, 4].map((id) => line(id));
+  const ids = (list: readonly Polyline[]) => list.map((p) => p.id);
+
+  it("takes the list from one side of the edit to the other", () => {
+    const shaped = line(2, { points: new Float64Array(9), closed: true });
+    const edits: [Polyline[], Polyline[]][] = [
+      [[], [a]],
+      [[a], [a, b, c]],
+      [[a, b, c, d], [a, d]],
+      [[a, b, c, d], [c]],
+      [[a, b], []],
+      [[a, b, c], [a, shaped, c]],
+      [[a, b], [a, shaped, c]],
+    ];
+    for (const [from, to] of edits) {
+      expect(applyEdit(from, from, to)).toEqual(to);
+      expect(applyEdit(to, to, from)).toEqual(from);
+    }
+  });
+
+  it("leaves the display of those that stay, and every polyline it is not about", () => {
+    const shown = line(2, { name: "Renamed", color: 0xff, visible: false });
+    const shaped = line(2, { points: new Float64Array(9), closed: true });
+    expect(applyEdit([a, shown, d], [a, b], [a, shaped])).toEqual([
+      a,
+      { ...shown, points: shaped.points, closed: true },
+      d,
+    ]);
+    // On another list than it was made on.
+    expect(ids(applyEdit([d], [a, b], [a, b, c]))).toEqual([c.id, d.id]);
+    expect(ids(applyEdit([b, d], [a, b], [a, b, c]))).toEqual([b.id, c.id, d.id]);
+    expect(ids(applyEdit([d, c], [a, b, c], [a]))).toEqual([d.id]);
+    expect(ids(applyEdit([c], [a, b], [a, b, c]))).toEqual([c.id]);
+  });
+
+  it("counts the points it keeps alive", () => {
+    const long = line(2, { points: new Float64Array(300) });
+    expect(editBytes([], [])).toBe(0);
+    expect(editBytes([a], [a, long])).toBe(2400 + 8 * 3);
+    expect(editBytes([a, long], [a])).toBe(2400 + 8 * 3);
+    expect(editBytes([a, b], [a, long])).toBe(48 + 2400 + 8 * 4);
+    // A display change of the same curve costs no points.
+    expect(editBytes([long], [{ ...long, name: "Other" }])).toBe(16);
+  });
+});
+
+describe.each([
+  ["local", local],
+  ["worker", worker],
+] as const)("the undo history (%s)", (_mode, make) => {
+  it("has no mesh for polylines, and projects have none either", async () => {
+    const h = await make();
+    const ball = addBall(h);
+    keepCurves(h.app, h.store, [SQUARE, LINE], "Cut");
+    removePolylines(h.app, h.store, [h.app.getSnapshot().polylines[0].id]);
+    await h.settle();
+    h.store.undo();
+    await h.settle();
+    expect([...h.store.getSnapshot().meshes.keys()]).toEqual([ball.mesh]);
+    const doc = collectProject(h.store, h.app);
+    expect(doc.meshes.map((m) => m.name)).toEqual(["Ball"]);
+    expect(doc.polylines?.map((p) => p.name)).toEqual(["Cut 1", "Cut 2"]);
+  });
+
+  it("takes polylines back with a cancelled step", async () => {
+    const h = await make();
+    const [square] = keepCurves(h.app, h.store, [SQUARE], "Square");
+    await h.settle();
+    h.store.beginStep();
+    keepCurves(h.app, h.store, [LINE], "Line");
+    simplifyPolylines(h.app, h.store, [square], 100);
+    const ball = addBall(h);
+    h.app.removeMesh(h.store, ball);
+    h.store.cancelStep();
+    await h.settle();
+    expect(names(h)).toEqual(["Square"]);
+    expect(h.app.getSnapshot().polylines[0].points).toBe(square.points);
+    h.store.undo();
+    await h.settle();
+    expect([names(h), h.store.getSnapshot().history.canUndo]).toEqual([[], false]);
+  });
+
+  it("drops the oldest edits for its memory budget, and leaves the list as it is", async () => {
+    const h = await make();
+    const ring = Array.from({ length: 1000 }, (_, i) => [Math.cos(i / 100), Math.sin(i / 100), i]).flat();
+    h.store.setHistoryBudget(60_000);
+    for (const name of ["A", "B", "C", "D"]) {
+      keepCurves(h.app, h.store, [{ points: ring, closed: false }], name);
+    }
+    await h.settle();
+    // 24,000 bytes of points each: two fit.
+    for (const want of [["A", "B", "C"], ["A", "B"], ["A", "B"]]) {
+      h.store.undo();
+      await h.settle();
+      expect(names(h)).toEqual(want);
+    }
+    h.store.redo();
+    await h.settle();
+    expect(names(h)).toEqual(["A", "B", "C"]);
+    // An edit that does not fit is permanent, and the app says so.
+    h.store.setHistoryBudget(10_000);
+    keepCurves(h.app, h.store, [{ points: ring, closed: false }], "E");
+    await h.settle();
+    expect(names(h)).toEqual(["A", "B", "C", "E"]);
+    expect(h.app.getSnapshot().historyNotice?.text).toContain("The last change cannot be undone");
+    h.store.undo();
+    await h.settle();
+    expect(names(h)).toEqual(["A", "B", "C", "E"]);
+  });
+
+  it("follows an undo at once or late, whatever is done meanwhile", async () => {
+    const h = await make();
+    const ring = Array.from({ length: 400 }, (_, i) => {
+      const t = (2 * Math.PI * i) / 400;
+      return [10 * Math.cos(t), 10 * Math.sin(t), 1];
+    }).flat();
+    const [p] = keepCurves(h.app, h.store, [{ points: ring, closed: true }], "Ring");
+    simplifyPolylines(h.app, h.store, [p], 0.05);
+    h.store.undo(); // the simplification
+    // On a Worker the list still has the simplified ring here.
+    keepCurves(h.app, h.store, [LINE], "Line");
+    h.app.selectPolylines([p.id]);
+    resamplePolylines(h.app, h.store, active(h), { spacing: 1, smoothing: 0 });
+    h.app.setPolylineDisplay([p.id], { name: "Renamed" });
+    await h.settle();
+    expect(names(h)).toEqual(["Renamed", "Line"]);
+    expect(pointCount(h.app.getSnapshot().polylines[0])).toBe(63);
+    h.store.undo();
+    await h.settle();
+    // Back to the ring as it was kept: the simplification was undone.
+    expect(h.app.getSnapshot().polylines[0].points).toBe(p.points);
+    h.store.undo();
+    h.store.undo();
+    await h.settle();
+    expect([names(h), h.store.getSnapshot().history.canUndo]).toEqual([[], false]);
+    h.store.redo();
+    h.store.redo();
+    h.store.redo();
+    await h.settle();
+    expect(names(h)).toEqual(["Ring", "Line"]);
+    expect(pointCount(h.app.getSnapshot().polylines[0])).toBe(63);
+    expect(h.store.getSnapshot().history.canRedo).toBe(false);
+  });
+
+  it("does nothing to a project opened while an undo is on its way", async () => {
+    const h = await make();
+    addBall(h);
+    keepCurves(h.app, h.store, [SQUARE], "Old");
+    const doc = parseProjectDoc(JSON.stringify(collectProject(h.store, h.app)));
+    removePolylines(h.app, h.store, [h.app.getSnapshot().polylines[0].id]);
+    h.store.undo();
+    restoreProject(h.store, h.app, doc);
+    await h.settle();
+    expect(names(h)).toEqual(["Old"]);
+    expect(h.store.getSnapshot().history.canUndo).toBe(false);
+    h.store.undo();
+    await h.settle();
+    expect(names(h)).toEqual(["Old"]);
+    removePolylines(h.app, h.store, [h.app.getSnapshot().polylines[0].id]);
+    h.store.undo();
+    await h.settle();
+    expect(names(h)).toEqual(["Old"]);
+  });
+});
+
 describe("the engine's restart", () => {
   it("leaves the polylines, and edits after it are undoable", async () => {
     const h = await worker();
@@ -505,11 +682,30 @@ describe("projects", () => {
     expect(now.map((p) => [p.name, p.color, p.visible, p.closed])).toEqual(saved.map((p) => [p.name, p.color, p.visible, p.closed]));
     expect([...now[0].points]).toEqual([...saved[0].points]);
     expect(g.store.getSnapshot().history.canUndo).toBe(false);
-    // The marker of the old list is gone; new edits are undoable from here.
+    // Only the project's mesh; new edits are undoable from here.
     expect(g.store.getSnapshot().meshes.size).toBe(1);
     removePolylines(g.app, g.store, [now[0].id]);
     g.store.undo();
     expect(names(g)).toEqual(["Cut 1", "Edge"]);
+  });
+
+  it("open as saved when markers stood for polylines in the scene: files never had them", async () => {
+    // Saved by the app of that time, after two edits and an undo, with a marker mesh in its scene.
+    const old =
+      '{"version":1,"app":"fast-mesh-showcase","meshes":[{"name":"Tetra","color":14250847,"opacity":1,"visible":true,"positions":"AAAAAAAA4L8AAAAAAADgvwAAAAAAAOC/AAAAAAAA4D8AAAAAAADgvwAAAAAAAOC/AAAAAAAA4L8AAAAAAADgPwAAAAAAAOC/AAAAAAAA4L8AAAAAAADgvwAAAAAAAOA/","indices":"AAAAAAIAAAABAAAAAAAAAAEAAAADAAAAAAAAAAMAAAACAAAAAQAAAAIAAAADAAAA","origin":[0.5,0.5,0.5],"placement":{"rotation":[1,0,0,0,1,0,0,0,1],"translation":[0,0,0],"scale":[1,1,1]},"coloring":null}],"sections":[],"selection":null,"wireframe":false,"edgeSoftness":0,"units":"mm","polylines":[{"name":"Cut 1","color":16765286,"visible":true,"closed":true,"points":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEAAAAAAAAAkQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAkQAAAAAAAAAAA"},{"name":"Cut 2","color":16765286,"visible":true,"closed":false,"points":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAABRAAAAAAAAAEEAAAAAAAAAAAAAAAAAAABRA"}]}';
+    const doc = parseProjectDoc(old);
+    expect(doc.meshes.map((m) => m.name)).toEqual(["Tetra"]);
+    const h = await local();
+    restoreProject(h.store, h.app, doc);
+    expect(items(h)).toEqual(["Tetra"]);
+    expect([...h.store.getSnapshot().meshes.keys()]).toEqual(h.app.getSnapshot().items.map((i) => i.mesh));
+    expect(h.app.getSnapshot().polylines.map((p) => [p.name, p.closed, [...p.points]])).toEqual([
+      ["Cut 1", true, SQUARE.points],
+      ["Cut 2", false, [0, 0, 5, 4, 0, 5]],
+    ]);
+    expect(h.store.getSnapshot().history.canUndo).toBe(false);
+    // Saved again, the file is the same.
+    expect(JSON.stringify(collectProject(h.store, h.app))).toBe(old);
   });
 
   it("open without polylines, with unreadable ones, or with nothing else", async () => {

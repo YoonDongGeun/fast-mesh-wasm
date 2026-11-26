@@ -24,7 +24,8 @@ use fast_mesh_ops::repair::{
 };
 use fast_mesh_scene::{
     CollisionDistanceBackend, CollisionMode, CollisionRole, CollisionRule, CollisionStepReport,
-    CutTrigger, MaterialMemory, MeshId, Placement, Scene, SceneError, SoftDeformSolver,
+    CutTrigger, MaterialMemory, MeshId, Placement, Scene, SceneError, ScreenCamera,
+    SoftDeformSolver,
 };
 use fast_mesh_store::StoreError;
 use wasm_bindgen::prelude::*;
@@ -156,6 +157,8 @@ pub(crate) fn parse_screen_shape(kind: u8, data: &[f64]) -> Result<ScreenSelecti
     }
 }
 
+/// The camera, in `f64`, and the options of a screen selection, whose own
+/// camera is not used.
 pub(crate) fn parse_screen_options(
     view_proj16: &[f64],
     camera_origin3: &[f64],
@@ -164,27 +167,36 @@ pub(crate) fn parse_screen_options(
     visible_only: bool,
     reject_backfaces: bool,
     include_touching: bool,
-) -> Result<ScreenSelectOptions, Error> {
+) -> Result<(ScreenCamera, ScreenSelectOptions), Error> {
     if view_proj16.len() != 16 {
         return Err(Error::invalid(
             "viewProj must be a 16-element column-major 4x4 matrix",
         ));
     }
-    let mut view_proj = [[0.0_f32; 4]; 4];
+    let mut view_proj = [[0.0_f64; 4]; 4];
     for c in 0..4 {
         for r in 0..4 {
-            view_proj[c][r] = f64_to_f32(view_proj16[c * 4 + r], "viewProj")?;
+            let v = view_proj16[c * 4 + r];
+            // As the engine's own matrices, it must fit `f32`.
+            f64_to_f32(v, "viewProj")?;
+            view_proj[c][r] = v;
         }
     }
-    Ok(ScreenSelectOptions {
+    let camera = ScreenCamera {
         view_proj,
-        camera_origin: vec3_f32(camera_origin3, "cameraOrigin")?,
-        camera_forward: vec3_f32(camera_forward3, "cameraForward")?,
+        origin: vec3_f64(camera_origin3, "cameraOrigin")?,
+        forward: vec3_f64(camera_forward3, "cameraForward")?,
+    };
+    let options = ScreenSelectOptions {
+        view_proj: [[0.0; 4]; 4],
+        camera_origin: [0.0; 3],
+        camera_forward: [0.0, 0.0, -1.0],
         is_orthographic,
         visible_only,
         reject_backfaces,
         include_touching,
-    })
+    };
+    Ok((camera, options))
 }
 
 pub(crate) fn parse_adjacency(code: u8) -> Result<AdjacencyKind, Error> {
@@ -1020,9 +1032,9 @@ pub(crate) fn encode_contour_slices(slices: &[ContourSlice]) -> Result<Vec<f64>,
     out.push(count(slices.len()));
     for s in slices {
         out.extend_from_slice(&[
-            f64::from(s.plane_origin[0]),
-            f64::from(s.plane_origin[1]),
-            f64::from(s.plane_origin[2]),
+            s.plane_origin[0],
+            s.plane_origin[1],
+            s.plane_origin[2],
             f64::from(s.plane_normal[0]),
             f64::from(s.plane_normal[1]),
             f64::from(s.plane_normal[2]),
@@ -1056,7 +1068,7 @@ pub(crate) fn encode_contour_slices(slices: &[ContourSlice]) -> Result<Vec<f64>,
                 out.extend_from_slice(p2);
             }
             for p3 in l.points_3d.iter().take(npts) {
-                out.extend_from_slice(&[f64::from(p3[0]), f64::from(p3[1]), f64::from(p3[2])]);
+                out.extend_from_slice(p3);
             }
         }
     }
@@ -1094,7 +1106,7 @@ pub(crate) fn decode_contour_slices(flat: &[f64]) -> Result<Vec<ContourSlice>, E
     let mut slices = Vec::new();
     slices.try_reserve(slice_count).map_err(|_| oom())?;
     for _ in 0..slice_count {
-        let plane_origin = next3_f32(&mut cur, "planeOrigin")?;
+        let plane_origin = next3_f64(&mut cur, "planeOrigin")?;
         let plane_normal = next3_f32(&mut cur, "planeNormal")?;
         let u_axis = next3_f64(&mut cur, "uAxis")?;
         let v_axis = next3_f64(&mut cur, "vAxis")?;
@@ -1120,7 +1132,7 @@ pub(crate) fn decode_contour_slices(flat: &[f64]) -> Result<Vec<ContourSlice>, E
             let mut points_3d = Vec::new();
             points_3d.try_reserve(point_count).map_err(|_| oom())?;
             for _ in 0..point_count {
-                points_3d.push(next3_f32(&mut cur, "point3d")?);
+                points_3d.push(next3_f64(&mut cur, "point3d")?);
             }
             loops.push(ContourLoop {
                 points_3d,
@@ -1282,6 +1294,39 @@ pub fn parse_point_cloud_text(text: &str, format: u8) -> Result<Vec<f32>, Error>
 pub fn parse_point_cloud_bytes(bytes: &[u8]) -> Result<Vec<f32>, Error> {
     let cloud = parse_ply_points(bytes)?;
     encode_point_cloud_f32(&cloud)
+}
+
+/// [`parse_point_cloud_text`] with the positions relative to the centre of
+/// their bounds, in `f64`: `[center x, y, z, ...packedCloud]`.
+#[wasm_bindgen(js_name = parsePointCloudTextCentered)]
+pub fn parse_point_cloud_text_centered(text: &str, format: u8) -> Result<Vec<f64>, Error> {
+    let (cloud, center) = match format {
+        0 => PointCloud::parse_xyz_centered(text)?,
+        1 => PointCloud::parse_pcd_ascii_centered(text)?,
+        2 => PointCloud::parse_ply_points_centered(text.as_bytes())?,
+        _ => {
+            return Err(Error::invalid(
+                "point cloud text format must be 0 (xyz), 1 (pcd) or 2 (ply)",
+            ));
+        }
+    };
+    encode_centered_cloud(&cloud, center)
+}
+
+/// [`parse_point_cloud_bytes`] as [`parse_point_cloud_text_centered`].
+#[wasm_bindgen(js_name = parsePointCloudBytesCentered)]
+pub fn parse_point_cloud_bytes_centered(bytes: &[u8]) -> Result<Vec<f64>, Error> {
+    let (cloud, center) = PointCloud::parse_ply_points_centered(bytes)?;
+    encode_centered_cloud(&cloud, center)
+}
+
+fn encode_centered_cloud(cloud: &PointCloud, center: [f64; 3]) -> Result<Vec<f64>, Error> {
+    let packed = encode_point_cloud_f32(cloud)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(3 + packed.len()).map_err(|_| oom())?;
+    out.extend(center);
+    out.extend(packed.into_iter().map(f64::from));
+    Ok(out)
 }
 
 /// Runs Statistical Outlier Removal on a packed point cloud and returns
@@ -1895,9 +1940,22 @@ mod tests {
         let sor = point_cloud_sor(&pc_n, 3.0, 2.0).unwrap();
         assert_eq!(sor[0], 8.0);
         let recon = ws
-            .reconstruct_point_cloud(&pc_n, 0, 0.4, f64::NAN, 4.0, true)
+            .reconstruct_point_cloud(&pc_n, 0, 0.4, f64::NAN, 4.0, true, None)
             .unwrap();
         assert_eq!(recon.len(), 2);
+        // The same cloud around a far point of its own.
+        let centered = parse_point_cloud_text_centered(xyz, 0).unwrap();
+        assert_eq!(centered[..6], [0.5, 0.5, 0.5, 8.0, 0.0, 0.0]);
+        assert_eq!(centered[6..9], [-0.5, -0.5, -0.5]);
+        let origin = vec![1.0e5, -2.0e5, 3.0e5];
+        let far = ws
+            .reconstruct_point_cloud(&pc_n, 0, 0.4, f64::NAN, 4.0, true, Some(origin.clone()))
+            .unwrap();
+        assert_eq!(ws.origin(far[0], far[1]).unwrap(), origin);
+        assert!(
+            ws.reconstruct_point_cloud(&pc_n, 0, 0.4, f64::NAN, 4.0, true, Some(vec![1.0]))
+                .is_err()
+        );
 
         // 5. #236 Hollow, Drain Holes & Place Mesh
         let (sb_p, sb_i) = unit_box_at(10.0, 0.0, 0.0, 2.0);
@@ -1955,8 +2013,31 @@ mod tests {
                 false,
                 0,
                 true,
+                None,
             )
             .unwrap();
         assert!(pl[16] >= 0.0);
+        let by = |ws: &mut WasmScene, anchor: Vec<f64>| {
+            ws.place_mesh(
+                solid[0],
+                solid[1],
+                stamp[0],
+                stamp[1],
+                &[12.0, 0.0, 0.0],
+                &[0.0, 0.0, 1.0],
+                1,
+                0.0,
+                1.0,
+                0.0,
+                0,
+                false,
+                0,
+                true,
+                Some(anchor),
+            )
+        };
+        let pl = by(&mut ws, vec![0.0, 0.0, -0.4]).unwrap();
+        assert_eq!(pl[9..12], [12.0, 0.0, 0.4]);
+        assert!(by(&mut ws, vec![f64::NAN, 0.0, 0.0]).is_err());
     }
 }

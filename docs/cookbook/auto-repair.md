@@ -121,8 +121,8 @@ Op-by-op guide:
 | --- | --- |
 | `weld` | Stitch coincident vertices first — later ops assume a clean topology. |
 | `removeDegenerate` | Drop zero-area triangles (`areaEpsilon`, `removeUnusedVertices`). |
-| `removeSmallComponents` | Delete floaters (`minTriangles` / `minArea`, `keepLargest`). |
-| `orient` | Make winding consistent (`flippedTriangles`, `patches`). |
+| `removeSmallComponents` | Delete floaters (`minTriangles` / `minArea`, `keepLargest`). Cavities of hollow solids stay unless `keepCavities: false`. |
+| `orient` | Make winding consistent (`flippedTriangles`, `patches`). Cavities of hollow solids keep facing inward. |
 | `fillHoles` | Close boundary loops (`maxEdges`, `maxPerimeter`, `maxArea`, or explicit `loops` from `analyze(mesh).loops` — at least one bound or `loops` is required; `fair`, `allowUnclean`). |
 | `bridgeLoops` | Connect two specific loops instead of capping each. |
 

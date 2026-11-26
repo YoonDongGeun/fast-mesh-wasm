@@ -27,6 +27,12 @@
 //   at softness 0 (the exact path), within four with softness (the filter
 //   sums in f32 on the GPU).
 // - select: a click on A in the canvas selects it.
+// - face-select: through the Select tab's panel on A, a box drag selects some
+//   faces, a shell click all of them, grow and clear work.
+// - remove-last: on a fresh page, removing the only mesh (the boot head) enables
+//   Undo, and Undo brings it back.
+// - permanent: with 1 MiB of undo memory (?history=1), removing it is permanent,
+//   and the status bar says so.
 // - multiselect: shift-clicking B adds it (the primary stays A), and the
 //   Repair panel seeds its Join source from the queue.
 // - drag: dragging the gizmo's centre handle moves A (one undo step).
@@ -134,7 +140,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { launchChrome, startServer } from "./chrome-cdp.mjs";
+import { launchChrome, SHOWCASE_READY, startServer } from "./chrome-cdp.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const example = join(root, "examples", "showcase");
@@ -447,7 +453,7 @@ const q = JSON.stringify;
 
 try {
   const query = threads === undefined ? "" : `?threads=${threads}`;
-  await browser.goto(`http://127.0.0.1:${port}/${query}`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/${query}`, SHOWCASE_READY);
 
   // ---- page ----
   const info = await page(`({
@@ -559,6 +565,40 @@ try {
   await click(at.x, at.y);
   const selected = await waitFor(`__showcase.selected() === ${JSON.stringify(A)}`, 5000);
   verdict("select", selected === true, `clicked (${fmt(at.x)}, ${fmt(at.y)}); selected ${await hook("selected()")}`);
+
+  // ---- face-select: the face selection panel on A ----
+  const faces = () =>
+    page(`(() => { const el = document.querySelector("[data-select-readout]"); return el && [Number(el.dataset.selectCount), Number(el.dataset.selectTotal)]; })()`);
+  const facesWhen = async (extra) =>
+    (await waitFor(
+      `(() => { const el = document.querySelector("[data-select-readout]"); const n = Number(el.dataset.selectCount), total = Number(el.dataset.selectTotal); return ${extra} && [n, total]; })()`,
+      5000,
+    )) ?? (await faces());
+  await clickOn("[data-ribbon-tab=select]");
+  await clickOn("[data-select-tool=box]");
+  await mouse("mouseMoved", at.x - 30, at.y - 30, { button: "none" });
+  await mouse("mousePressed", at.x - 30, at.y - 30, { buttons: 1 });
+  for (let i = 1; i <= 6; i++) {
+    await mouse("mouseMoved", at.x - 30 + 10 * i, at.y - 30 + 10 * i, { buttons: 1 });
+    await sleep(16);
+  }
+  await mouse("mouseReleased", at.x + 30, at.y + 30, { buttons: 0 });
+  const boxed = await facesWhen("n > 0");
+  await clickOn("[data-select-action=grow]");
+  const grown = await facesWhen(`n > ${boxed[0]}`);
+  await clickOn("[data-select-action=clear]");
+  const cleared = await facesWhen("n === 0");
+  await clickOn("[data-select-tool=shell]");
+  await click(at.x, at.y);
+  const shell = await facesWhen("n === total && n > 0");
+  await clickOn("[data-select-action=clear]");
+  await clickOn("[data-select-tool=off]");
+  await clickOn("[data-ribbon-tab=home]");
+  verdict(
+    "face-select",
+    boxed[0] > 0 && boxed[0] < boxed[1] && grown[0] > boxed[0] && cleared[0] === 0 && shell[0] === shell[1] && shell[0] > 0,
+    `of ${boxed[1]} faces: box ${boxed[0]}, grown ${grown[0]}, cleared ${cleared[0]}, shell ${shell[0]}`,
+  );
 
   // ---- multiselect: shift-click B in the canvas ----
   const atB = await hook(`screenPoint(${JSON.stringify(B)})`);
@@ -1551,7 +1591,7 @@ try {
   // A fresh page: 1 in cubes loaded "as inches", a known gap, known area and
   // volume. Every expected string is written out: 1 in = 25.4 mm,
   // 1 in² = 645.16 mm², 1 in³ = 16387.064 mm³.
-  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/`, SHOWCASE_READY);
   const bootHead = await waitFor(`__showcase.items().find((m) => m.name.includes("headsq") && m.drawn)?.name`, 60_000);
   await clickOn(`[data-mesh=${q(bootHead)}] button.danger`);
   await waitFor(`__showcase.items().length === 0`, 10_000);
@@ -1774,7 +1814,7 @@ try {
   // The global default survives a reload; Reset settings restores mm.
   await useInches(); // the project's in -> mm, by hand
   await useInches(); // -> in, by hand: the default too
-  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/`, SHOWCASE_READY);
   const reloaded = await hook("units()");
   const buttonText = await textOf("[data-action=units]");
   await clickOn("[data-action=reset-settings]");
@@ -1790,7 +1830,7 @@ try {
 
   // ---- previews: each built-in model's picture, and the loaded meshes' ----
   {
-  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/`, SHOWCASE_READY);
   await waitFor(`__showcase.items().find((m) => m.name.includes("headsq") && m.drawn)`, 60_000);
   // Decoded to premultiplied RGBA at the picture's size, so empty pixels compare equal.
   await page(`(() => {
@@ -2005,8 +2045,29 @@ try {
   verdict("previews-empty", typeof emptied === "string" && backAgain === true, `emptied: ${q(emptied ?? null)}; back after Undo: ${backAgain === true}`);
   }
 
+  // ---- remove-last, permanent: the only mesh leaves ----
+  const boots = async (query) => {
+    await browser.goto(`http://127.0.0.1:${port}/${query}`, SHOWCASE_READY);
+    await waitFor(`__showcase.items().length === 1 && __showcase.status().status === "idle"`, 30_000);
+    await clickOn("button.danger[title='Remove the mesh']");
+    return waitFor("__showcase.items().length === 0", 5000);
+  };
+  const left = await boots("");
+  const undoable = await waitFor("__showcase.status().canUndo", 5000);
+  await clickOn("[data-action=undo]");
+  const returned = await waitFor("__showcase.items().length === 1", 10_000);
+  verdict("remove-last", left === true && undoable === true && returned === true, `removed ${left}, undo enabled ${undoable}, back ${returned}`);
+  const gone = await boots("?history=1");
+  const notice = await waitFor(`document.querySelector("[data-history-notice]")?.textContent`, 5000);
+  const undo = (await hook("status()")).canUndo;
+  verdict(
+    "permanent",
+    gone === true && typeof notice === "string" && notice.includes("cannot be undone") && undo === false,
+    `notice ${JSON.stringify(notice ?? null)}; canUndo ${undo}`,
+  );
+
   // ---- local: ?local, the synchronous Scene on the main thread ----
-  await browser.goto(`http://127.0.0.1:${port}/?local`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/?local`, SHOWCASE_READY);
   await waitFor(`document.querySelector("[data-action=demo-meshes]") !== null`, 10_000);
   await clickOn("[data-action=demo-meshes]");
   const localDemo = await waitFor(

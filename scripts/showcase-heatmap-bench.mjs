@@ -15,7 +15,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchChrome, startServer } from "./chrome-cdp.mjs";
+import { launchChrome, SHOWCASE_READY, startServer } from "./chrome-cdp.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const example = join(root, "examples", "showcase");
@@ -245,7 +245,7 @@ try {
     if (threads !== undefined) {
       search.set("threads", threads);
     }
-    await browser.goto(`http://127.0.0.1:${port}/?${search}`, "window.__showcase !== undefined");
+    await browser.goto(`http://127.0.0.1:${port}/?${search}`, SHOWCASE_READY);
     info ??= await page(`({
       threads: __showcase.threads(),
       cores: navigator.hardwareConcurrency,

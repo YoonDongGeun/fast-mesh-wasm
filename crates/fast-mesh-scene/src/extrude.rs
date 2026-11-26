@@ -1,7 +1,9 @@
 //! Extruding faces and bases of scene meshes, measured in the world.
 
-use fast_mesh_ops::{self as ops, BaseLevel, BaseLoops, ExtrudeDirection, ExtrudeFacesReport};
-use fast_mesh_store::TriangleId;
+use fast_mesh_ops::{
+    self as ops, BaseLevel, BaseLoops, BoundaryLoop, ExtrudeDirection, ExtrudeFacesReport,
+};
+use fast_mesh_store::{Mesh, TriangleId};
 
 use crate::{MeshId, Placement, Result, Scene, SceneError};
 
@@ -36,7 +38,7 @@ pub struct ExtrudeBaseOptions {
     pub direction: [f64; 3],
     /// Where the base plane is.
     pub plane: BasePlane,
-    /// Which boundary loops are extruded.
+    /// Which boundary loops are extruded; the largest is that in the world.
     pub loops: BaseLoops,
     /// Refine the cap to the density of its walls.
     pub refine: bool,
@@ -61,6 +63,41 @@ fn linear(p: &Placement) -> [[f64; 3]; 3] {
 
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// The length of a boundary loop of `mesh` with its axes scaled by `scale`.
+fn scaled_length(mesh: &Mesh, l: &BoundaryLoop, scale: [f64; 3]) -> f64 {
+    let n = l.vertices.len();
+    let at = |i: usize| mesh.positions()[l.vertices[i % n] as usize].map(f64::from);
+    let edges = if l.closed { n } else { n.saturating_sub(1) };
+    (0..edges)
+        .map(|i| {
+            let (a, b) = (at(i), at(i + 1));
+            let d = std::array::from_fn(|k| scale[k] * (b[k] - a[k]));
+            dot(d, d).sqrt()
+        })
+        .sum()
+}
+
+/// `loops`, with the largest the one that is in the world: under a scale that
+/// differs by axis it may be another than the mesh's own.
+fn world_loops(mesh: &Mesh, loops: &BaseLoops, placement: &Placement) -> Result<BaseLoops> {
+    if *loops != BaseLoops::Largest || placement.uniform_scale().is_some() {
+        return Ok(loops.clone());
+    }
+    let mut best: Option<(f64, &BoundaryLoop)> = None;
+    let all = ops::boundary_loops(mesh)?;
+    for l in &all {
+        let length = scaled_length(mesh, l, placement.scale);
+        // The first of equals.
+        if best.is_none_or(|(longest, _)| length > longest) {
+            best = Some((length, l));
+        }
+    }
+    Ok(match best {
+        Some((_, l)) => BaseLoops::Ids(vec![l.id]),
+        None => BaseLoops::Largest,
+    })
 }
 
 impl Scene {
@@ -119,9 +156,10 @@ impl Scene {
             ));
         }
         let d = d.map(|x| x / len);
-        let (placement, origin) = {
+        let (placement, origin, loops) = {
             let e = self.entry(id)?;
-            (e.placement, e.mesh.origin())
+            let loops = world_loops(&e.mesh, &options.loops, &e.placement)?;
+            (e.placement, e.mesh.origin(), loops)
         };
         // A stored point `p` sits at the world depth `dot(p, normal) + zero`
         // along `d`; its height is the opposite.
@@ -135,7 +173,7 @@ impl Scene {
                 BasePlane::Height(h) => BaseLevel::At(-h - zero),
                 BasePlane::Below(offset) => BaseLevel::Beyond(offset),
             },
-            loops: options.loops.clone(),
+            loops,
             refine: options.refine,
             check_self_intersections: options.check_self_intersections,
         };

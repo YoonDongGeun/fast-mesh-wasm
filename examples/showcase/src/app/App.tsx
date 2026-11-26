@@ -2,33 +2,20 @@
 // Repair and Collision panels on the right and the
 // status bar along the bottom. Files dropped anywhere on the page load.
 // What it does (loading, shortcuts, the drop target, the sidebars, the
-// tab auto-switching) lives in `ux/`; this file lays the shell out.
+// tab auto-switching) lives in `ux/`; this file lays the shell out. The
+// panels not needed at boot come in chunks of their own (`ui/feature-parts`).
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { Suspense, lazy, useCallback, useState, type RefObject } from "react";
+import { useCallback, useState, type RefObject } from "react";
 import type { Loader } from "../io/loader";
-import { BuildPlatePanel } from "../features/build-plate/ui/BuildPlatePanel";
-import { CollisionPanel } from "../features/collision/ui/CollisionPanel";
 import { CommandPalette } from "../shell/ui/CommandPalette";
-import { CreatePrimitiveDialog } from "../features/home/ui/CreatePrimitiveDialog";
-import { TextDialog } from "../features/mesh-edit/ui/TextDialog";
-import { ReliefDialog } from "../features/mesh-edit/ui/ReliefDialog";
 import { useReliefDrop } from "../features/mesh-edit/ux/use-relief-drop";
-import { DeformPanel } from "../features/sculpt/ui/DeformPanel";
-import { ExportPanel } from "../features/home/ui/ExportPanel";
 import { GroupsBar } from "../features/collision/ui/GroupsBar";
 import { HelpOverlay, TourCard } from "../shell/ui/Help";
-import { HoverTip } from "../features/collision/ui/HoverTip";
-import { AlignPanel } from "../features/transform/ui/AlignPanel";
-import { InspectPanel } from "../features/inspect/ui/InspectPanel";
 import { MeshList } from "../features/home/ui/MeshList";
 import { ObjectInfoBox } from "../features/inspect/ui/ObjectInfoBox";
-import { ModelingPanel } from "../features/mesh-edit/ui/ModelingPanel";
-import { PointsPanel } from "../features/points/ui/PointsPanel";
-import { PolylinePanel } from "../features/polylines/ui/PolylinePanel";
 import { ProjectPanel } from "../features/home/ui/ProjectPanel";
-import { RepairPanel } from "../features/mesh-repair/ui/RepairPanel";
 import {
   HomeOverviewCard,
   InspectorHeader,
@@ -36,21 +23,39 @@ import {
   VolumeFallbackCard,
   WorkbenchRibbon,
 } from "../shell/ui/Ribbon";
-import { SelectPanel } from "../features/select/ui/SelectPanel";
 import { TransformPanel } from "../features/transform/ui/TransformPanel";
 import { StatusBar } from "../shell/ui/StatusBar";
 import { useHelpAndTour } from "../shell/ux/use-help-tour";
 import { tabMatchesSlot } from "../shell/ux/workbench-tabs";
 import { type AppState, useApp, type WorkbenchTab } from "./state/app-state";
+import {
+  AlignPanel,
+  BuildPlatePanel,
+  CollisionPanel,
+  CreatePrimitiveDialog,
+  DeformPanel,
+  ExportPanel,
+  FaceSelectionMarquee,
+  HoverTip,
+  InspectPanel,
+  ModelingPanel,
+  PointsPanel,
+  PolylinePanel,
+  ReliefDialog,
+  RepairPanel,
+  SelectPanel,
+  TextDialog,
+  VolumePanel,
+} from "./ui/feature-parts";
 import { useCameraRequests } from "./ux/use-camera-requests";
 import { sidebarResizeHandlers, useDisplaySettings } from "./ux/use-display-settings";
+import { useFeatureChunks } from "./ux/feature-chunks";
 import { useFileDrop } from "./ux/use-file-drop";
 import { useKeyboardShortcuts } from "./ux/use-keyboard-shortcuts";
 import { useSceneLoading } from "./ux/use-scene-loading";
 import { useUndoRedo } from "./ux/use-undo-redo";
 import { useWorkspaceAutoSwitch } from "./ux/use-workspace-auto-switch";
 import { coarsePointer, viewportHint } from "./ux/viewport-hint";
-import { FaceSelectionMarquee } from "../features/select/ui/FaceSelectionLayer";
 import { ViewportNavigationHud } from "../features/view/ui/ViewCube";
 import { selectMesh } from "../features/select/ux/selection";
 import { VolumeOverlay } from "../features/ct/ui/VolumeOverlay";
@@ -66,9 +71,6 @@ export interface Engine {
   /** Whether the page is cross-origin isolated (needed for threads). */
   isolated: boolean;
 }
-
-/** The volume view loads on demand: vtk.js stays out of the main chunk. */
-const VolumePanel = lazy(() => import("../features/ct/ui/VolumePanel").then((m) => ({ default: m.VolumePanel })));
 
 /** A request to point the camera at a mesh; `n` makes a repeated request new. */
 export interface FocusRequest {
@@ -129,6 +131,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const { helpOpen, setHelpOpen, openHelp, closeHelp, tourStep, nextTour, backTour, endTour, startTourFromHelp } =
     useHelpAndTour();
   useWorkspaceAutoSwitch(app, { selection, selectedIsVolume, sculpt, maskPaint });
+  useFeatureChunks(app);
   useKeyboardShortcuts({
     app,
     select,
@@ -332,9 +335,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           onClickCapture={() => activateTabForSlot("volume")}
         >
           {!selectedIsVolume ? <VolumeFallbackCard app={app} /> : null}
-          <Suspense fallback={null}>
-            <VolumePanel app={app} loader={loader} />
-          </Suspense>
+          <VolumePanel app={app} loader={loader} />
         </div>
       </aside>
       <StatusBar engine={engine} app={app} />

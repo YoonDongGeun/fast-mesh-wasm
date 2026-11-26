@@ -177,17 +177,34 @@ export function buildTopology(indices: Uint32Array, slots: number): Topology {
   return { neighbors: sets.map((s) => [...s].sort((x, y) => x - y)), used, liveTriangles: Uint32Array.from(live) };
 }
 
-/** Every used vertex within `radius` of `center` (squared distances). */
-export function brushPick(positions: Float32Array, used: Uint8Array, center: Readonly<Vec3>, radius: number): number[] {
+/**
+ * Every used vertex within `radius` of `center` (squared distances), both in
+ * local coordinates. With `stretch`, a column-major 4x4 (a placement's
+ * `matrix4`), `radius` is a length after its linear part.
+ */
+export function brushPick(
+  positions: Float32Array,
+  used: Uint8Array,
+  center: Readonly<Vec3>,
+  radius: number,
+  stretch?: Float64Array,
+): number[] {
   const out: number[] = [];
   const r2 = radius * radius;
+  const m = stretch;
   for (let v = 0; v < used.length; v++) {
     if (used[v] === 0) {
       continue;
     }
-    const dx = positions[v * 3] - center[0];
-    const dy = positions[v * 3 + 1] - center[1];
-    const dz = positions[v * 3 + 2] - center[2];
+    let dx = positions[v * 3] - center[0];
+    let dy = positions[v * 3 + 1] - center[1];
+    let dz = positions[v * 3 + 2] - center[2];
+    if (m !== undefined) {
+      const [x, y, z] = [dx, dy, dz];
+      dx = m[0] * x + m[4] * y + m[8] * z;
+      dy = m[1] * x + m[5] * y + m[9] * z;
+      dz = m[2] * x + m[6] * y + m[10] * z;
+    }
     if (dx * dx + dy * dy + dz * dz <= r2) {
       out.push(v);
     }

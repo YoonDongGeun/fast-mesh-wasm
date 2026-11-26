@@ -3,6 +3,7 @@
 // entry never loads the WebAssembly glue; a Worker scene is told apart
 // structurally (`"status" in scene`), not with `instanceof`.
 import { FastMeshError } from "../core.js";
+import type { HistoryEntry, PermanentListener } from "../history.js";
 import type {
   AddMeshOptions,
   ColorRule,
@@ -67,6 +68,10 @@ export interface Host {
   cancelStep(): void;
   canUndo(): boolean;
   canRedo(): boolean;
+  recordEntry(entry: HistoryEntry): void;
+  historyBudget(): number;
+  setHistoryBudget(bytes: number): void;
+  onPermanent(listener: PermanentListener): () => void;
   /** The state of a request key (`mesh:<id>`, `display:<id>`, ...). */
   status(key: string): KeyStatus;
   /** Registers a listener for status (and undo/redo state) changes; returns its remover. */
@@ -206,6 +211,10 @@ export function localHost(scene: Scene): Host {
     cancelStep: () => scene.cancelStep(),
     canUndo: () => scene.canUndo(),
     canRedo: () => scene.canRedo(),
+    recordEntry: (entry) => scene.recordEntry(entry),
+    historyBudget: () => scene.historyBudget(),
+    setHistoryBudget: (bytes) => scene.setHistoryBudget(bytes),
+    onPermanent: (listener) => scene.onPermanent(listener),
     status: (key) => {
       const error = errors.get(key);
       return error === undefined ? { status: "ready", revision: rev } : { status: "error", revision: rev, error };
@@ -278,6 +287,10 @@ export function workerHost(scene: WorkerScene): Host {
     cancelStep: () => scene.cancelStep(),
     canUndo: () => scene.canUndo,
     canRedo: () => scene.canRedo,
+    recordEntry: (entry) => scene.recordEntry(entry),
+    historyBudget: () => scene.historyBudget,
+    setHistoryBudget: (bytes) => scene.setHistoryBudget(bytes),
+    onPermanent: (listener) => scene.onPermanent(listener),
     status: (key) => {
       const error = errors.get(key);
       const s = scene.status(key);

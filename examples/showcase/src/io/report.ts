@@ -132,9 +132,9 @@ export function contoursToDxf(contours: readonly ContourLike[], origin: Vec3, no
   return out.join("\n") + "\n";
 }
 
-/** Reads one mesh's section result into plain contours (copies the points). */
+/** Reads one mesh's section result into plain contours (copies the points, as precise as they are). */
 export function toContourLikes(result: { contours: readonly SectionContour[] }): ContourLike[] {
-  return result.contours.map((c) => ({ points: Float32Array.from(c.points), closed: c.closed }));
+  return result.contours.map((c) => ({ points: Float64Array.from(c.points64 ?? c.points), closed: c.closed }));
 }
 
 function escapeCsv(cell: string): string {

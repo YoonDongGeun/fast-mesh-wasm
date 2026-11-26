@@ -74,10 +74,10 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
     exporter, in their own plane or flattened onto a world one, in millimetres.
 
   The math is in `src/features/polylines/ux`, all on the main thread and linear or nearly so: a tube
-  along 50,000 points and the offset of a loop of 8,000 each take a fraction of a second. The engine's
-  history knows meshes only, so each state of the list has an empty mesh in the scene as its marker
-  (`polyline-history.ts`): an edit swaps markers undoably, and undo and redo swap them back in order
-  with every other edit. Display settings (name, colour, visibility) are not undo steps.
+  along 50,000 points and the offset of a loop of 8,000 each take a fraction of a second. An edit is
+  an application entry of the scene's undo history (`store.recordEntry`, in `polyline-history.ts`),
+  undone and redone in order with every other edit. Display settings (name, colour, visibility) are
+  not undo steps.
 - **Height maps and reliefs.** The export panel's *Height map* section (Home) makes an orthographic
   depth image of a mesh, or of every visible one, from a standard view or the current one: the
   pixels along its longer side, and the meshes' own height range or a typed one. It is sampled in
@@ -97,6 +97,8 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   They cover added and removed meshes too: undo takes a created mesh, hull, boolean result or copy off
   the list again, and brings a removed one back with its name, colour, place in the list and groups
   (`AppState.follow` keeps the list in step with the store). Opening files and projects is not undone.
+  An action larger than the whole undo memory (256 MiB; removing a mesh of about 4M triangles, say)
+  is permanent: the status bar says so as it happens (`store.onPermanent`), and Join's report too.
 - **Placement.** The Transform panel's helpers place the selected mesh in one click each, one undo
   step each: *Centre to Origin* and *Bottom to Origin* move its world bounding box centre (or the
   centre of its bottom) to the origin; *Lay Flat* takes a clicked face, turns the mesh about its box
@@ -106,7 +108,9 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   one for the origin (its plane becomes X = 0), and puts the datum origin where those planes meet at
   the world origin. *Up* picks the floor: Z = 0 (the default) or Y = 0. *Apply Transform* bakes
   the placement into the vertices (the world positions it gave them), so the placement becomes the
-  identity: the placement change and the vertex edit are one history step. The picks are engine
+  identity: the placement change and the vertex edit are one history step. Vertices are `f32` offsets
+  from the mesh's origin, which is for good: a mesh more than 1024 times its size from that keeps a
+  translation, so as not to lose its shape. The picks are engine
   raycasts on the selected mesh only; <kbd>Esc</kbd> cancels one. The math is in
   `src/features/transform/ux/placement-math.ts`.
 - **Build plate.** The Home tab's Build Plate panel (and shelf buttons) draws a grid rectangle on the
@@ -231,6 +235,7 @@ URL options:
 | `?local` | The synchronous `Scene` on the main thread instead of the Worker scene: queries, repairs and `analyze` (the repair panel's, and the collision warnings') then run on the main thread, so they block the page on a large mesh. The exact depth (the default) recomputes every coloured vertex on the main thread on every drag frame, so dragging large meshes stutters: use *Fast mode* there |
 | `?big` | Demo meshes A and B at about a million triangles each; `?big=N` at about N |
 | `?threads=N` | Ask for N engine threads |
+| `?history=N` | Undo memory of N MiB (256 by default). A step larger than all of it cannot be undone; a small N shows what the app then says without a huge mesh |
 
 The dev and preview servers send the cross-origin isolation headers (COOP/COEP, a middleware in
 `vite.config.ts`), so the Worker scene runs its multithreaded engine.
@@ -245,10 +250,11 @@ The dev and preview servers send the cross-origin isolation headers (COOP/COEP, 
 ```
 src/
   main.tsx       boot: engine, store, React root
-  app/           App.tsx; ux/ (shortcuts, file drop, loading, display settings); state/ (app state,
-                 tool state, readouts); testing/ (window.__showcase)
+  app/           App.tsx; ui/ (the parts that load on demand); ux/ (shortcuts, file drop, loading,
+                 display settings, the feature chunks); state/ (app state, tool state, readouts);
+                 testing/ (window.__showcase, a chunk of its own)
   shell/         ribbon, status bar, command search, help and tour
-  shared/        units, persisted settings, mesh centres, LengthInput
+  shared/        units, persisted settings, mesh centres, LengthInput, chunks and lazy parts
   viewport/      the canvas (ui/Viewport.tsx); ux/: selection clicks, the sculpt stroke and mask paint
                  drivers, camera and gizmo control, raycasts, the view registry, touch, clip planes
   engine/        the workbench op bridge and the lazy wasm loader
@@ -276,6 +282,27 @@ src/
     ct/          volume rendering, MPR slices
     collision/   contact heatmap, group mode, named groups
 ```
+
+The page's own chunk (`index`) has what the first frame needs: the shell, the canvas, the mesh list
+and the app state. Everything else loads on demand, one chunk per feature:
+`features/<area>/ui/<area>-chunk.ts` exports the area's panels, layers and dialogs,
+`app/ux/feature-chunks.ts` says when they load, and `app/ui/feature-parts.tsx` wraps them, so that
+the shell uses them as if it had imported them.
+
+- **When.** The first screen's chunks load while the engine starts. The others follow one at a time
+  once the page is idle and the mesh it boots onto is here. A ribbon tab's load at once when it is
+  hovered, focused or opened, and a dialog's when it opens. Every panel is mounted once its chunk is
+  here, the hidden ones too.
+- **Until then.** A panel's heading holds its place at about its height, a layer draws nothing, and a
+  dialog that was opened can be closed. A chunk that does not load (offline, or a newer deploy) says
+  so and offers Retry.
+- **What must not wait for a chunk** is in `index`: state and its defaults, undo, keyboard shortcuts,
+  the command palette's entries. A heavy `ux/` module keeps such parts in a file of its own
+  (`align-state.ts` beside `align-tools.ts`, say). A command that presses a panel's control waits for
+  the panel (`whenPresent`, `shell/ux/panel-triggers.ts`).
+
+`test/lazy-chunk.test.ts` follows the static imports from `main.tsx` and fails if one brings a
+feature chunk back; the build warns when `index` passes 1,000 kB.
 
 Tests live in `test/`.
 

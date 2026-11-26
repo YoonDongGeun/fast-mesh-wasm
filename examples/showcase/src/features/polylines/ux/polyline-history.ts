@@ -1,83 +1,89 @@
-// Polyline edits in the scene's undo history (#268). The history is the
-// engine's and knows meshes, not polylines, so each state of the polyline
-// list has a marker in it: an empty mesh that is in the scene exactly while
-// the list is in that state. An edit swaps the markers (an undoable removal
-// and an undoable add) as one step, or as part of the open one; undo and redo
-// swap them back, in order with every other edit, and the list follows the
-// marker it finds. Markers are never listed or drawn. A state goes with its
-// marker, once the history has dropped the step that could bring it back.
-import type { MeshHandle } from "fast-mesh-wasm";
+// Polyline edits in the scene's undo history (#268, #282). The history is the
+// engine's and knows meshes, not polylines, so each edit is an application
+// entry in it: a step of its own or part of the open one, undone and redone in
+// order with every other edit. An entry holds what its edit changed, by id,
+// and makes that change to the list as it finds it. Display settings (name,
+// colour, visibility) are not undone: a polyline that stays keeps its own.
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { Polyline } from "./polyline";
 
-/** The scene calls the history makes. */
-export type HistoryStore = Pick<SceneStore, "addMesh" | "removeMesh" | "beginStep" | "endStep" | "isRestorable" | "getSnapshot">;
+/** The scene call the history makes. */
+export type HistoryStore = Pick<SceneStore, "recordEntry">;
 
-export class PolylineHistory {
-  /** The list's state by marker: the current one, and those undo or redo can bring back. */
-  readonly #states = new Map<MeshHandle, readonly Polyline[]>();
-  /** The marker of the list's current state (`null` before the first edit). */
-  #current: MeshHandle | null = null;
+type List = readonly Polyline[];
 
-  /** Makes the edit from `before` to `after` an undo step, or part of the open one. */
-  record(store: HistoryStore, before: readonly Polyline[], after: readonly Polyline[]): void {
-    if (this.#current === null || !store.getSnapshot().meshes.has(this.#current)) {
-      // The state undo goes back to: not a step of its own.
-      this.#current = marker(store, false);
-    }
-    const from = this.#current;
-    this.#states.set(from, before);
-    store.beginStep();
-    try {
-      store.removeMesh(from, { undoable: true });
-      this.#current = marker(store, true);
-      this.#states.set(this.#current, after);
-    } finally {
-      store.endStep();
-    }
-    this.#prune(store);
-  }
+/** Bytes an entry counts for each polyline in its lists, beside the points it changes. */
+const REF_BYTES = 8;
 
-  /** The list's state after an undo, a redo or a cancelled step, or `null` while it has not changed. */
-  follow(store: HistoryStore): readonly Polyline[] | null {
-    if (this.#current === null) {
-      return null;
+/** `list` with what differs between `from` and `to` as `to` has it: polylines that went, came or changed shape. */
+export function applyEdit(list: List, from: List, to: List): Polyline[] {
+  const before = new Map(from.map((p) => [p.id, p]));
+  const after = new Map(to.map((p) => [p.id, p]));
+  const kept = list.flatMap((p): Polyline[] => {
+    const [a, b] = [before.get(p.id), after.get(p.id)];
+    if (a === undefined) {
+      return [p];
     }
-    const { meshes } = store.getSnapshot();
-    if (meshes.has(this.#current)) {
-      return null;
+    if (b === undefined) {
+      return [];
     }
-    for (const [m, state] of this.#states) {
-      if (m !== this.#current && meshes.has(m)) {
-        this.#current = m;
-        this.#prune(store);
-        return state;
-      }
-    }
-    return null;
-  }
-
-  /** Forgets every state, and takes the marker out for good: the list is replaced, as by opening a project. */
-  reset(store: HistoryStore): void {
-    const current = this.#current;
-    this.#current = null;
-    this.#states.clear();
-    if (current !== null && store.getSnapshot().meshes.has(current)) {
-      store.removeMesh(current, { undoable: false });
+    return [a.points === b.points && a.closed === b.closed ? p : { ...p, closed: b.closed, points: b.points }];
+  });
+  // Each that came goes after the one it follows in `to`, or first.
+  const listed = new Set(kept.map((p) => p.id));
+  const came = new Map<number | null, Polyline[]>([[null, []]]);
+  let follows: number | null = null;
+  for (const p of to) {
+    if (listed.has(p.id)) {
+      follows = p.id;
+    } else if (!before.has(p.id)) {
+      came.set(follows, [...(came.get(follows) ?? []), p]);
     }
   }
-
-  /** Forgets the states nothing can bring back any more. */
-  #prune(store: HistoryStore): void {
-    for (const m of [...this.#states.keys()]) {
-      if (m !== this.#current && !store.getSnapshot().meshes.has(m) && !store.isRestorable(m)) {
-        this.#states.delete(m);
-      }
-    }
-  }
+  return [...(came.get(null) ?? []), ...kept.flatMap((p) => [p, ...(came.get(p.id) ?? [])])];
 }
 
-/** Adds an empty mesh; with `undoable` as an undo step, or part of the open one. */
-function marker(store: HistoryStore, undoable: boolean): MeshHandle {
-  return store.addMesh(new Float64Array(0), new Uint32Array(0), undoable ? { undoable: true } : {});
+/** About the bytes an edit's entry keeps alive: the points only one of its lists has, and the lists. */
+export function editBytes(before: List, after: List): number {
+  const only = (a: List, b: List) => {
+    const shared = new Set(b.map((p) => p.points));
+    return a.reduce((n, p) => n + (shared.has(p.points) ? 0 : p.points.byteLength), 0);
+  };
+  return only(before, after) + only(after, before) + REF_BYTES * (before.length + after.length);
+}
+
+export class PolylineHistory {
+  /** Goes up when the list is replaced for good: entries recorded before do nothing. */
+  #epoch = 0;
+
+  /**
+   * Makes the edit from `before` to `after` an undo step, or part of the open
+   * one. Undo and redo call `change` with what to make of the list.
+   */
+  record(store: HistoryStore, before: List, after: List, change: (edit: (list: List) => Polyline[]) => void): void {
+    const epoch = this.#epoch;
+    // The lists around the edit, as it was last made. They change when it is
+    // made again on another list: on a Worker, an undo can still be on its way
+    // when the edit is recorded, and then comes before it.
+    let [from, to] = [before, after];
+    const run = (edit: (list: List) => Polyline[]) => () => {
+      if (epoch === this.#epoch) {
+        change(edit);
+      }
+    };
+    store.recordEntry({
+      undo: run((list) => applyEdit(list, to, from)),
+      redo: run((list) => {
+        const made = applyEdit(list, before, after);
+        [from, to] = [list, made];
+        return made;
+      }),
+      bytes: editBytes(before, after),
+    });
+  }
+
+  /** The list is replaced for good, as by opening a project: no entry before this changes it any more. */
+  reset(): void {
+    this.#epoch++;
+  }
 }

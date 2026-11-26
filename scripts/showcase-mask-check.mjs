@@ -49,7 +49,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchChrome, startServer } from "./chrome-cdp.mjs";
+import { launchChrome, SHOWCASE_READY, startServer } from "./chrome-cdp.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const example = join(root, "examples", "showcase");
@@ -179,7 +179,7 @@ const A = "A · blobby sphere";
 const B = "B · rounded box";
 
 try {
-  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/`, SHOWCASE_READY);
   const bootHead = await waitFor(`__showcase.items().find((m) => m.name.includes("headsq") && m.drawn)?.name`, 90_000);
   await clickOn(`[data-mesh=${q(bootHead)}] button.danger`);
   await clickOn("[data-action=demo-meshes]");
@@ -768,7 +768,7 @@ try {
   if (flag("--big")) {
     // A fresh page, with load-time decimation out of the way: the point is a
     // mesh that stays at 1M triangles.
-    await browser.goto(`http://127.0.0.1:${port}/?decimate-tris=2000000000`, "window.__showcase !== undefined");
+    await browser.goto(`http://127.0.0.1:${port}/?decimate-tris=2000000000`, SHOWCASE_READY);
     const head = await waitFor(`__showcase.items().find((m) => m.name.includes("headsq") && m.drawn)?.name`, 90_000);
     await clickOn(`[data-mesh=${q(head)}] button.danger`);
     const dir = mkdtempSync(join(tmpdir(), "fast-mesh-mask-"));

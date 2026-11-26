@@ -7,11 +7,12 @@
  */
 import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
 import type { AppState, WorkbenchTab } from "../../app/state/app-state";
+import { preloadTab } from "../../app/ux/feature-chunks";
 import { ARRANGE_SCOPE, CLONE_COPIES, toggleBuildPlate } from "../../features/build-plate/ux/build-plate-commands";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 import { reliefDialogOf } from "../../features/mesh-edit/ux/relief-dialog-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
-import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
+import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup-commands";
 import { DYNTOPO_MODE_OPTIONS } from "../../features/sculpt/ux/sculpt";
 import { DIAGNOSTIC_SHADING_OPTIONS } from "../../features/view/ui/shading";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
@@ -169,6 +170,8 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               data-ribbon-tab={tab.id}
               aria-selected={activeTab === tab.id}
               title={tab.title}
+              onPointerEnter={() => preloadTab(tab.id)}
+              onFocus={() => preloadTab(tab.id)}
               onClick={() => app.setActiveTab(tab.id)}
             >
               {tab.label}

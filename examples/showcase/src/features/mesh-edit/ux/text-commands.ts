@@ -4,7 +4,7 @@
 import type { AppState } from "../../../app/state/app-state";
 import type { CommandPaletteItem } from "../../../shell/ux/command-registry";
 import { textDialogOf } from "./text-dialog-state";
-import { armTextStamp } from "./text-stamp";
+import { armTextStamp } from "./text-stamp-arm";
 
 export function textCommands(app: AppState): CommandPaletteItem[] {
   const words = "text letters lettering label font word type 3d";

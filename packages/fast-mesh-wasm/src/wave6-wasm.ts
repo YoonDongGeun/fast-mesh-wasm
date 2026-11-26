@@ -5,13 +5,16 @@ import { call, ensureInitialized, FastMeshError } from "./core.js";
 import { checkU32Int, codeIn, normalizeVec3 } from "./options.js";
 import * as wasm from "./wasm/fast_mesh_wasm.js";
 import {
+  checkBooleanArg,
   checkPositiveArg,
   cloudBuffer,
+  cloudOrigin,
   CONTOUR_EXPORT_CODES,
   type ContourExportFormat,
   type ContourSlice,
   encodeContourSlices,
   type PackedPointCloud,
+  type ParsePointCloudOptions,
   POINT_CLOUD_FORMAT_CODES,
   type PointCloudFilterResult,
   type PointCloudFormat,
@@ -22,7 +25,7 @@ function invalid(message: string): FastMeshError {
   return new FastMeshError("INVALID_ARGUMENT", message);
 }
 
-function decodeOutlierResult(raw: Float64Array): PointCloudFilterResult {
+function decodeOutlierResult(raw: Float64Array, origin: Vec3 | undefined): PointCloudFilterResult {
   return {
     report: {
       keptCount: raw[0],
@@ -31,8 +34,21 @@ function decodeOutlierResult(raw: Float64Array): PointCloudFilterResult {
       stdDev: raw[3],
       threshold: raw[4],
     },
-    cloud: wrapPackedPointCloud(Float32Array.from(raw.subarray(5))),
+    cloud: wrapPackedPointCloud(Float32Array.from(raw.subarray(5)), origin),
   };
+}
+
+/** Whether a parser is to keep the positions around their centre. */
+function centerOption(options: ParsePointCloudOptions | undefined): boolean {
+  if (options !== undefined && (options === null || typeof options !== "object")) {
+    throw invalid("options must be an object");
+  }
+  return checkBooleanArg(options?.center, false, "options.center");
+}
+
+/** The cloud of a binding's `[center x, y, z, ...packedCloud]`. */
+function decodeCenteredCloud(raw: Float64Array): PackedPointCloud {
+  return wrapPackedPointCloud(Float32Array.from(raw.subarray(3)), [raw[0], raw[1], raw[2]]);
 }
 
 /** Serializes contour slices to SVG, JSON, or CSV. */
@@ -47,21 +63,35 @@ export function sliceContoursExport(
   return call(() => wasm.sliceContoursExport(packed, code));
 }
 
-/** Parses ASCII point cloud text (`"xyz"`, `"pcd"`, or `"ply"`). */
-export function parsePointCloudText(text: string, format: PointCloudFormat = "xyz"): PackedPointCloud {
+/**
+ * Parses ASCII point cloud text (`"xyz"`, `"pcd"`, or `"ply"`). Positions are
+ * read in `f32`, which far from zero loses digits (0.004 at 1e5);
+ * `options.center` keeps them.
+ */
+export function parsePointCloudText(
+  text: string,
+  format: PointCloudFormat = "xyz",
+  options?: ParsePointCloudOptions,
+): PackedPointCloud {
   ensureInitialized("parsePointCloudText()");
   if (typeof text !== "string") {
     throw invalid("text must be a string");
   }
   const code = codeIn(POINT_CLOUD_FORMAT_CODES, format, "format");
+  if (centerOption(options)) {
+    return decodeCenteredCloud(call(() => wasm.parsePointCloudTextCentered(text, code)));
+  }
   return wrapPackedPointCloud(call(() => wasm.parsePointCloudText(text, code)));
 }
 
-/** Parses binary/ASCII `.ply` point cloud bytes. */
-export function parsePointCloudBytes(bytes: Uint8Array): PackedPointCloud {
+/** Parses binary/ASCII `.ply` point cloud bytes, as {@link parsePointCloudText} reads text. */
+export function parsePointCloudBytes(bytes: Uint8Array, options?: ParsePointCloudOptions): PackedPointCloud {
   ensureInitialized("parsePointCloudBytes()");
   if (!(bytes instanceof Uint8Array)) {
     throw invalid("bytes must be a Uint8Array");
+  }
+  if (centerOption(options)) {
+    return decodeCenteredCloud(call(() => wasm.parsePointCloudBytesCentered(bytes)));
   }
   return wrapPackedPointCloud(call(() => wasm.parsePointCloudBytes(bytes)));
 }
@@ -80,7 +110,7 @@ export function pointCloudSor(
       checkPositiveArg(stdRatio, "stdRatio"),
     ),
   );
-  return decodeOutlierResult(raw);
+  return decodeOutlierResult(raw, cloudOrigin(cloud));
 }
 
 /** Runs Radius Outlier Removal (ROR) on a point cloud. */
@@ -97,7 +127,7 @@ export function pointCloudRor(
       checkU32Int(minNeighbors, "minNeighbors"),
     ),
   );
-  return decodeOutlierResult(raw);
+  return decodeOutlierResult(raw, cloudOrigin(cloud));
 }
 
 /** Voxel-grid downsamples a point cloud. */
@@ -108,18 +138,25 @@ export function pointCloudVoxelDownsample(
   ensureInitialized("pointCloudVoxelDownsample()");
   return wrapPackedPointCloud(
     call(() => wasm.pointCloudVoxelDownsample(cloudBuffer(cloud), checkPositiveArg(voxelSize, "voxelSize"))),
+    cloudOrigin(cloud),
   );
 }
 
-/** Estimates and orients normals on a point cloud. */
+/** Estimates and orients normals on a point cloud; `cameraHint` is a world point they face. */
 export function pointCloudEstimateNormals(
   cloud: PackedPointCloud | Float32Array,
   kNeighbors = 12,
   cameraHint?: Readonly<Vec3>,
 ): PackedPointCloud {
   ensureInitialized("pointCloudEstimateNormals()");
-  const hint = cameraHint === undefined ? undefined : Float64Array.from(normalizeVec3(cameraHint, "cameraHint"));
+  const origin = cloudOrigin(cloud);
+  const at = origin ?? [0, 0, 0];
+  const hint =
+    cameraHint === undefined
+      ? undefined
+      : Float64Array.from(normalizeVec3(cameraHint, "cameraHint"), (c, k) => c - at[k]);
   return wrapPackedPointCloud(
     call(() => wasm.pointCloudEstimateNormals(cloudBuffer(cloud), checkU32Int(kNeighbors, "kNeighbors"), hint)),
+    origin,
   );
 }

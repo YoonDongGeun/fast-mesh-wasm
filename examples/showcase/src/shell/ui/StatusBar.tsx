@@ -5,6 +5,7 @@
 import { useSceneStatus } from "fast-mesh-wasm/react";
 import type { Engine } from "../../app/App";
 import { type AppState, useApp } from "../../app/state/app-state";
+import { useHistoryNotice } from "../ux/use-history-notice";
 import { useSceneRestart } from "../ux/use-scene-restart";
 
 export function StatusBar(props: { engine: Engine; app: AppState }) {
@@ -13,6 +14,7 @@ export function StatusBar(props: { engine: Engine; app: AppState }) {
   const items = useApp(app, (s) => s.items);
   const loading = useApp(app, (s) => s.jobs.filter((j) => j.phase !== "done" && j.phase !== "error").length);
   const { restarting, restart } = useSceneRestart();
+  const { notice, dismiss } = useHistoryNotice(app);
   // The persisted display settings, and the reset that restores them.
   const theme = useApp(app, (s) => s.theme);
   const leftVisible = useApp(app, (s) => s.leftVisible);
@@ -32,6 +34,16 @@ export function StatusBar(props: { engine: Engine; app: AppState }) {
       <span>
         {items.length} {items.length === 1 ? "mesh" : "meshes"}
       </span>
+      {notice !== null ? (
+        <span className="history-notice" data-history-notice>
+          <span className="warn" title={notice}>
+            {notice}
+          </span>
+          <button type="button" data-action="dismiss-history-notice" onClick={dismiss}>
+            Dismiss
+          </button>
+        </span>
+      ) : null}
       <span className="spacer" />
       {error !== undefined ? (
         <span className="error" title={error.code}>

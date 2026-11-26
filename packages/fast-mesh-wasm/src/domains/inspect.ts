@@ -154,11 +154,23 @@ export interface InspectDomain<Async extends boolean = false> {
    * `sources` to every vertex slot, in world units: `Infinity` where no
    * source reaches, on unused slots and past `maxDistance`.
    *
+   * `"dijkstra"` gives the length of the shortest way along the edges, which
+   * is longer than the one over the faces, and much longer where triangles
+   * are stretched. `"heatMethod"` gives the distance over the faces, whatever
+   * the triangles are like (stretched, obtuse, fans, or of all sizes), off by
+   * about 1 % on average. On the meshes it is tested with, against exact
+   * distances, the mean error of the distances above a tenth of the largest
+   * one is below 3 %, and no distance is off by more than 4 % of the largest
+   * one. Distances of a few edge lengths are relatively further off, by up to
+   * about the mean edge length.
+   *
    * `"heatMethod"` first prepares operators of the mesh, about half the time
-   * of a query. They are kept (about 130 bytes a triangle) for later queries
-   * of the same mesh, until it changes, another mesh is queried, or
-   * {@link InspectDomain.releaseGeodesics}. On a `WorkerScene` a query runs
-   * in steps and can be cancelled (`options.signal`).
+   * of a query, and more where the mesh has triangles such as these: the
+   * surface is then cut into better ones, inside the operators only. They are
+   * kept (about 130 bytes a triangle, up to about 190 with such triangles)
+   * for later queries of the same mesh, until it changes, another mesh is
+   * queried, or {@link InspectDomain.releaseGeodesics}. On a `WorkerScene` a
+   * query runs in steps and can be cancelled (`options.signal`).
    */
   geodesicDistances(
     mesh: MeshHandle,

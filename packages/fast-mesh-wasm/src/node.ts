@@ -60,6 +60,12 @@ export {
   MAX_HEIGHT_MAP_PIXELS,
 } from "./height-map.js";
 export { generateHeightfield } from "./height-map-wasm.js";
+export {
+  DEFAULT_HISTORY_BUDGET,
+  type HistoryEntry,
+  type PermanentListener,
+  type PermanentStep,
+} from "./history.js";
 export type { ConvexHullOptions, ConvexHullPoints, ConvexHullResult } from "./hull.js";
 export {
   DEFAULT_LATTICE_MAX_VOXELS,
@@ -365,6 +371,7 @@ export {
   type MaterialMemory,
   type OutlierReport,
   type PackedPointCloud,
+  type ParsePointCloudOptions,
   type PlaceMeshOptions,
   type PlaceMeshReport,
   type PlaceMode,

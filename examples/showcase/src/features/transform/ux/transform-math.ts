@@ -1,6 +1,7 @@
 // Pure transform & mesh-local scaling math for TransformPanel and Scale gizmo mode (#195).
-// Scene placements are rigid [rotation, translation]; scaling updates local vertex positions
-// via `store.edit` (`setPositions`) so every scale operation integrates cleanly with undo/redo.
+// The panel and the gizmo set a placement's rotation and translation and keep its scale; their
+// scaling updates local vertex positions via `store.edit` (`setPositions`) so every scale
+// operation integrates cleanly with undo/redo.
 import type { EditResult, MeshHandle, Placement, PlacementInput } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import * as THREE from "three";
@@ -70,12 +71,22 @@ export function placementToValues(placement: Placement): TransformValues {
   };
 }
 
-/** Builds a rigid PlacementInput from world translation and Euler XYZ degrees. */
-export function valuesToPlacement(values: TransformValues): PlacementInput {
+/** Builds a PlacementInput from world translation and Euler XYZ degrees, with the scale of `placement` if it has one. */
+export function valuesToPlacement(values: TransformValues, placement?: Pick<Placement, "scale">): PlacementInput {
+  const scale = placement?.scale;
   return {
     translation: [values.position[0], values.position[1], values.position[2]],
     rotation: eulerDegToMat3(values.rotationDeg),
+    ...(scale === undefined ? {} : { scale: [scale[0], scale[1], scale[2]] }),
   };
+}
+
+/** The factor a scale gizmo took an object from `start` to `end` by, per axis. */
+export function scaleFactor(
+  start: { x: number; y: number; z: number },
+  end: { x: number; y: number; z: number },
+): [number, number, number] {
+  return [end.x / start.x, end.y / start.y, end.z / start.z];
 }
 
 /** Computes axis-aligned bounds across live triangles (falling back to all vertex slots if none live). */

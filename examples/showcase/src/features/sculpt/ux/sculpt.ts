@@ -637,7 +637,8 @@ function rotateByQuat(
  * A grab dab's drag vector in the mesh's local frame: the screen delta
  * (`pixelDx`, `pixelDy`, y down) at `wpp` world units per pixel, along the
  * camera's `camRight`/`camUp`, carried by `meshQuatConj` (the conjugate of
- * the mesh's world quaternion).
+ * the mesh's world quaternion) and taken out of `meshScale` (its world scale),
+ * so that the surface follows the pointer.
  */
 export function grabLocalDelta(
   pixelDx: number,
@@ -646,6 +647,7 @@ export function grabLocalDelta(
   camRight: readonly [number, number, number],
   camUp: readonly [number, number, number],
   meshQuatConj: readonly [number, number, number, number],
+  meshScale: readonly [number, number, number] = [1, 1, 1],
 ): [number, number, number] {
   const sx = pixelDx * wpp;
   const sy = -pixelDy * wpp;
@@ -654,7 +656,8 @@ export function grabLocalDelta(
     camRight[1] * sx + camUp[1] * sy,
     camRight[2] * sx + camUp[2] * sy,
   ];
-  return rotateByQuat(world, meshQuatConj);
+  const local = rotateByQuat(world, meshQuatConj);
+  return [local[0] / meshScale[0], local[1] / meshScale[1], local[2] / meshScale[2]];
 }
 
 /** The falloff weight at normalized distance `t`, as the engine's brushes compute it. */

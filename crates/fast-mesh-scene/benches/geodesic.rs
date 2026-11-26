@@ -10,8 +10,11 @@
 //! The meshes are an icosphere (1.3M triangles), the same with jittered
 //! vertices and everything in a scrambled order, as a scan might come, and a
 //! UV sphere (1.0M triangles) queried from its equator, whose needles at the
-//! poles are the hard case for the diffusion. Their sizes, the memory the
-//! operators take and the error against the great circles are printed once.
+//! poles are the hard case for the diffusion. Two more have to be cut into
+//! other triangles first: the icosphere drawn out twenty times, queried from
+//! its tip, and a cylinder whose caps are fans (1.0M triangles). Their sizes,
+//! the memory the operators take and the error against the great circles (or
+//! the meridians) are printed once.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -77,6 +80,68 @@ fn uv_sphere() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
     }))
 }
 
+/// The icosphere, 20 times as long along Y.
+fn stretched() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    let (mut p, t) = icosphere();
+    for v in &mut p {
+        v[1] *= 20.0;
+    }
+    (p, t)
+}
+
+/// A cylinder along Z whose caps are fans around one vertex each.
+fn fan_cylinder() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    let (segments, rings) = (1024u32, 488u32);
+    let mut p = Vec::new();
+    let mut t = Vec::new();
+    for k in 0..=rings {
+        for s in 0..segments {
+            let a = s as f32 / segments as f32 * std::f32::consts::TAU;
+            p.push([a.cos(), a.sin(), 3.0 * k as f32 / rings as f32]);
+        }
+    }
+    let (low, high) = (p.len() as u32, p.len() as u32 + 1);
+    p.extend([[0.0, 0.0, 0.0], [0.0, 0.0, 3.0]]);
+    for s in 0..segments {
+        let n = (s + 1) % segments;
+        for k in 0..rings {
+            let (a, b) = (k * segments + s, k * segments + n);
+            t.push([a, b, b + segments]);
+            t.push([a, b + segments, a + segments]);
+        }
+        t.push([low, n, s]);
+        t.push([high, rings * segments + s, rings * segments + n]);
+    }
+    (p, t)
+}
+
+/// Mean relative error against the meridians of the stretched sphere from
+/// its tip, beyond a tenth of the way to the other one.
+fn meridian_error(m: &Mesh, distances: &[f32]) -> f64 {
+    // The length of a meridian up to so many steps from the tip.
+    let steps = 100_000;
+    let angle = |k: f64| k * std::f64::consts::PI / f64::from(steps);
+    let mut length = vec![0.0];
+    for k in 0..steps {
+        let a = angle(f64::from(k) + 0.5);
+        let step = angle(1.0) * a.cos().hypot(20.0 * a.sin());
+        length.push(length[k as usize] + step);
+    }
+    let far = length[steps as usize];
+    let (mut sum, mut count) = (0.0, 0);
+    for (p, &d) in m.positions().iter().zip(distances) {
+        let [x, y, z] = p.map(f64::from);
+        let at = x.hypot(z).atan2(y / 20.0) / angle(1.0);
+        let k = (at as usize).min(steps as usize - 1);
+        let exact = length[k] + (at - k as f64) * (length[k + 1] - length[k]);
+        if exact > 0.1 * far {
+            sum += (f64::from(d) - exact).abs() / exact;
+            count += 1;
+        }
+    }
+    sum / f64::from(count)
+}
+
 /// Mean relative error against the great circles, from a quarter radian on.
 fn sphere_error(m: &Mesh, source: u32, distances: &[f32]) -> f64 {
     let at = |v: usize| m.positions()[v].map(f64::from);
@@ -129,19 +194,30 @@ fn geodesics(c: &mut Criterion) {
         ("icosphere_1.3m", icosphere()),
         ("scan_1.3m", scan()),
         ("uv_sphere_1m", uv_sphere()),
+        ("stretched_1.3m", stretched()),
+        ("fan_cylinder_1m", fan_cylinder()),
     ] {
         let mesh = Mesh::from_buffers(p.as_flattened(), t.as_flattened()).unwrap();
         let n = mesh.vertex_slots() as u32;
         // (On the UV sphere: on the equator.)
-        let source = n / 2;
+        let mut source = n / 2;
+        if name.starts_with("stretched") {
+            let y = |v: &u32| p[*v as usize][1];
+            source = (0..n).max_by(|a, b| y(a).total_cmp(&y(b))).unwrap();
+        }
 
         let mut q = GeodesicQuery::new(&mesh, &[source], &HEAT).unwrap();
         while !q.step(&mesh, usize::MAX).unwrap() {}
+        let d = q.distances().unwrap();
+        let error = match name {
+            "stretched_1.3m" => format!("{:.2} %", 100.0 * meridian_error(&mesh, d)),
+            "fan_cylinder_1m" => "not known".into(),
+            _ => format!("{:.2} %", 100.0 * sphere_error(&mesh, source, d)),
+        };
         println!(
-            "{name}: {} triangles, {n} vertices; operators {} MB; mean error {:.2} %",
+            "{name}: {} triangles, {n} vertices; operators {} MB; mean error {error}",
             mesh.triangle_count(),
             q.solver().map_or(0, |s| s.byte_size()) / 1_000_000,
-            100.0 * sphere_error(&mesh, source, q.distances().unwrap()),
         );
         drop(q);
 

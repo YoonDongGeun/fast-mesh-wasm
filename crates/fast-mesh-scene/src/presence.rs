@@ -76,10 +76,11 @@ impl Scene {
     /// The kept mesh counts against the history budget (see
     /// [`SceneOptions::history_budget`](crate::SceneOptions::history_budget))
     /// while it is out, until the history drops the step and frees it for
-    /// good: by eviction or [`Scene::clear_history`]. A removal larger than the whole budget
-    /// is dropped as soon as its step closes, which makes it permanent.
-    /// [`Scene::is_restorable`] tells whether the history can still bring a
-    /// removed mesh back.
+    /// good: by eviction or [`Scene::clear_history`]. A removal larger than
+    /// the whole budget is dropped as soon as its step closes, which makes it
+    /// permanent: [`Scene::removal_bytes`] tells before, and
+    /// [`Scene::take_permanent`] after. [`Scene::is_restorable`] tells whether
+    /// the history can still bring a removed mesh back.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`](crate::SceneError::UnknownMesh) for a
@@ -121,6 +122,17 @@ impl Scene {
     /// across an FFI boundary.
     pub fn restorable_id(&self, index: u32, generation: u32) -> Option<MeshId> {
         self.entries.parked_id(index, generation)
+    }
+
+    /// What parking live mesh `id` takes from the registries, in bytes (see
+    /// [`ParkedLinks::byte_size`]).
+    pub(crate) fn links_byte_size(&self, id: MeshId) -> usize {
+        let rest = self.collision.rest_positions.get(&id);
+        let rules = self.collision.pair_rules.keys();
+        self.fields_byte_size(id)
+            + rest.map_or(0, |r| r.rest_positions.capacity() * 12)
+            + rules.filter(|&&(a, b)| a == id || b == id).count()
+                * size_of::<(MeshId, CollisionRule)>()
     }
 
     /// Records the undoable add of live mesh `id`. `History::reserve` must

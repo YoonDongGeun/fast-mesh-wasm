@@ -129,6 +129,17 @@ import {
   type SyncSculptDomain,
 } from "./domains/index.js";
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "./handles.js";
+import {
+  checkHistoryBudget,
+  checkHistoryEntry,
+  decodePermanent,
+  ENTRY_EVENTS,
+  EntryBook,
+  type HistoryEntry,
+  type PermanentListener,
+  type PermanentStep,
+  tellPermanent,
+} from "./history.js";
 import { checkInteractionPoints, copyRule, encodeRule } from "./rule.js";
 import type { SceneLike } from "./scene-like.js";
 import {
@@ -153,6 +164,7 @@ import {
   checkNonNegativeArg,
   checkU32Arg,
   cloudBuffer,
+  cloudOrigin,
   decodeCollisionRule,
   decodeCollisionStepReport,
   decodeContourSlices,
@@ -265,6 +277,7 @@ export {
   type MaterialMemory,
   type OutlierReport,
   type PackedPointCloud,
+  type ParsePointCloudOptions,
   type PlaceMeshOptions,
   type PlaceMeshReport,
   type PlaceMode,
@@ -486,6 +499,24 @@ export interface SceneOptions {
    * `debug`, views are plain typed arrays with no overhead.
    */
   debug?: boolean;
+  /**
+   * The most bytes the undo history may hold: {@link DEFAULT_HISTORY_BUDGET}
+   * (256 MiB) by default. What counts are the patches of edits, placement
+   * changes, meshes out of the scene that undo or redo can bring back (about
+   * 60 bytes a triangle), and what the application's entries say they hold
+   * ({@link HistoryEntry.bytes}). Past it the oldest steps go. A step larger
+   * than the whole budget goes as soon as it closes: the action is then
+   * permanent, and {@link Scene.onPermanent} tells. A number, 0 or more;
+   * at most 4 GiB, so `Infinity` means that. Change it later with
+   * {@link Scene.setHistoryBudget}.
+   *
+   * @example
+   * ```ts
+   * // Removing a mesh of 10M triangles stays undoable.
+   * const scene = new Scene({ historyBudget: 1024 ** 3 });
+   * ```
+   */
+  historyBudget?: number;
 }
 
 /** A ray hit from {@link Scene.raycast}, in world coordinates. */
@@ -701,8 +732,16 @@ export interface SectionContour {
   /**
    * World xyz, 3 floats per point. A copy. Where the plane passes exactly
    * through a vertex, the contour repeats that point (a zero-length segment).
+   * Rounded to `f32`: far from the world origin that is by up to half of its
+   * steps there (0.004 at 1e5). `points64` has them as precise as the mesh.
    */
   points: Float32Array;
+  /**
+   * The same points in `f64`, as precise as the mesh's own positions however
+   * far from the world origin it is. A copy. Always there on a result of this
+   * library.
+   */
+  points64?: Float64Array;
   closed: boolean;
 }
 
@@ -715,8 +754,12 @@ export interface SectionResult {
   length: number;
   /** Summed signed area of the closed, oriented contours (positive counter-clockwise about the normal). */
   area: number;
-  /** The filled cross-section, when the section has fill on and it was computed. */
-  fill?: { positions: Float32Array; indices: Uint32Array };
+  /**
+   * The filled cross-section, when the section has fill on and it was computed.
+   * `positions64` are its `positions` before they are rounded to `f32`, as
+   * `points64` are a contour's.
+   */
+  fill?: { positions: Float32Array; positions64?: Float64Array; indices: Uint32Array };
 }
 
 /** The closest pair between two meshes' contours, from {@link Scene.sectionGap}. */
@@ -803,6 +846,8 @@ export interface MeshComponent {
   area: number;
   /** No boundary and no non-manifold edge. */
   closed: boolean;
+  /** A void of a hollow solid: closed, wound inward, and inside the material of the components around it. */
+  cavity: boolean;
 }
 
 /**
@@ -1198,14 +1243,28 @@ export interface SliverOptions {
 
 /**
  * One repair operation for {@link Scene.repair}. Distances and areas are in
- * mesh units (equal to world units). They are converted to `f32`, so a
- * tolerance or area below the `f32` range rounds to 0.
+ * the mesh's own units: before its placement's scale, so equal to world units
+ * unless it has one. They are converted to `f32`, so a tolerance or area below
+ * the `f32` range rounds to 0.
  */
 export type RepairOp =
   | SculptOp
   | { op: "weld"; tolerance: number }
   | { op: "removeDegenerate"; areaEpsilon?: number; removeUnusedVertices?: boolean }
-  | { op: "removeSmallComponents"; minTriangles?: number; minArea?: number; keepLargest?: boolean }
+  | {
+      op: "removeSmallComponents";
+      minTriangles?: number;
+      minArea?: number;
+      /** Keep the largest component even when it is below a bound. Default `true`. */
+      keepLargest?: boolean;
+      /**
+       * Keep the cavities (see {@link MeshComponent.cavity}) of the components
+       * that stay, however small they are: removing one fills a void of a
+       * hollow solid. Default `true`. A cavity of a removed component goes
+       * with it.
+       */
+      keepCavities?: boolean;
+    }
   | { op: "orient" }
   | ({ op: "makeManifold" } & ManifoldOptions)
   | ({ op: "resolveSelfIntersections" } & SelfIntersectOptions)
@@ -1259,8 +1318,8 @@ export type RepairOp =
   | {
       op: "shell";
       /**
-       * Wall thickness in mesh units (equal to world units): the input
-       * surface stays and gains a reversed copy one thickness against its
+       * Wall thickness in the mesh's own units (before its placement's
+       * scale): the input surface stays and gains a reversed copy one thickness against its
        * smooth normals, with every boundary rim stitched shut. Must be
        * positive and finite.
        */
@@ -1794,11 +1853,20 @@ export interface BooleanOptions {
   op?: BooleanOp;
   /** Exact topological arrangement (`"manifold"`, default) or volumetric Marching Cubes fallback (`"bvhSdf"`, `"fhEdt"`). */
   method?: BooleanMethod;
-  /** Coplanar facet snap/classification tolerance in mesh units. */
+  /**
+   * Coplanar facet snap/classification tolerance, in the units of the mesh
+   * the result replaces (before its placement's scale); in world units for
+   * {@link Scene.booleanBatch}.
+   */
   coplanarTolerance?: number;
   /** Collapse needle/sliver triangles created along cut seams (default `true`). */
   snapSlivers?: boolean;
-  /** Voxel pitch for `"bvhSdf"` / `"fhEdt"` volumetric fallback (defaults to automatic pitch). */
+  /**
+   * Voxel pitch for `"bvhSdf"` / `"fhEdt"` volumetric fallback (defaults to
+   * automatic pitch), in the same units as `coplanarTolerance`. The voxels lie
+   * along the axes of the mesh the result replaces, or the world's for
+   * {@link Scene.booleanBatch}.
+   */
   voxelPitch?: number;
   /** Optional target triangle budget for post-boolean simplification. */
   maxTriangles?: number;
@@ -1920,11 +1988,18 @@ export type GeodesicMethod = "dijkstra" | "heatMethod";
 
 /** Options for surface geodesic distance evaluation via {@link Scene.geodesicDistances}. */
 export interface GeodesicOptions {
-  /** `"dijkstra"` (fast graph distance, default) or `"heatMethod"` (Crane PDE diffusion). */
+  /**
+   * `"dijkstra"` (fast graph distance, default) or `"heatMethod"` (Crane PDE
+   * diffusion); `inspect.geodesicDistances` says how far off each is.
+   */
   method?: GeodesicMethod;
   /** Optional maximum distance cutoff in world units. */
   maxDistance?: number;
-  /** Dimensionless time-step scale `m` (`t = m * h^2`) for `"heatMethod"`. */
+  /**
+   * Dimensionless time-step scale `m` (`t = m * h^2`) for `"heatMethod"`,
+   * where `h` is the mean edge length, or `sqrt(area / 2000)` where that is
+   * smaller.
+   */
   timeStepScale?: number;
   /**
    * Cancels the query: its promise rejects with the signal's reason at once,
@@ -1937,7 +2012,7 @@ export interface GeodesicOptions {
 
 /** Sample point along an intrinsic surface shortest path. */
 export interface SurfacePathPoint {
-  /** World-space position on the surface. */
+  /** World-space position on the surface, as precise as the mesh's local positions wherever it is. */
   position: Vec3;
   /** Triangle slot index containing this point. */
   triangle: number;
@@ -2303,9 +2378,9 @@ function invalid(message: string): FastMeshError {
 }
 
 /**
- * The mean stretch of a column-major 4x4's linear part: the cube root of
- * its determinant. World-space brush radii divide by it, exact for rigid
- * placements and a documented approximation under non-uniform scale.
+ * The stretch of a column-major 4x4's linear part, a rotation and a uniform
+ * scale: the cube root of its determinant. World-space brush radii divide by
+ * it.
  */
 function meanStretch(m: Float64Array): number {
   const det =
@@ -2719,6 +2794,7 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
           optional(o.minTriangles, "minTriangles"),
           optional(o.minArea, "minArea"),
           flagOf(o.keepLargest, true),
+          flagOf(o.keepCavities, true),
         );
         break;
       case "orient":
@@ -3167,7 +3243,7 @@ function decodeAnalysis(r: Reader): Analysis {
   const nonManifoldVertices = r.list();
   const pinchVertices = r.list();
   const components = r.many(
-    (): MeshComponent => ({ triangles: r.list(), area: r.next(), closed: r.flag() }),
+    (): MeshComponent => ({ triangles: r.list(), area: r.next(), closed: r.flag(), cavity: r.flag() }),
   );
   const orientationConflicts = r.next();
   const si = r.next();
@@ -3375,6 +3451,13 @@ export class Scene implements SceneLike {
   readonly #fields = new Map<number, FieldHandle>();
   readonly #sections = new Map<number, SectionHandle>();
   readonly #listeners = new Set<(changes: MeshChange[]) => void>();
+  readonly #permanentListeners = new Set<PermanentListener>();
+  /** The application's entries in the history. */
+  readonly #entries = new EntryBook();
+  /** The latest entry's `coalesce` and the number the engine knows it by. */
+  #coalesce: { key: string; id: number } = { key: "", id: 0 };
+  /** A {@link Scene.#settleHistory} is queued on a microtask. */
+  #settleQueued = false;
   /** History step nesting depth, mirrored from the calls made through this class. */
   #stepDepth = 0;
   #drag: ActiveDrag | undefined;
@@ -3522,7 +3605,12 @@ export class Scene implements SceneLike {
 
   constructor(options: SceneOptions = {}) {
     ensureInitialized("new Scene()");
-    this.#raw = call(() => new RawScene());
+    const budget = options.historyBudget === undefined ? undefined : checkHistoryBudget(options.historyBudget);
+    const raw = call(() => new RawScene());
+    this.#raw = raw;
+    if (budget !== undefined) {
+      call(() => raw.set_history_budget(budget));
+    }
     this.#guard = options.debug ? new ViewGuard() : undefined;
     finalizer.register(this, this.#raw, this);
   }
@@ -3536,6 +3624,7 @@ export class Scene implements SceneLike {
     this.#raw = undefined;
     this.#guard?.bump();
     this.#drag = undefined;
+    this.#entries.dropAll();
     finalizer.unregister(this);
     release(raw);
   }
@@ -3549,7 +3638,46 @@ export class Scene implements SceneLike {
   #scene(): WasmScene {
     const s = this.#peek();
     this.#guard?.bump();
+    if (!this.#settleQueued && (this.#permanentListeners.size > 0 || this.#entries.size > 0)) {
+      // Whatever the call records or drops, the app hears of it soon.
+      this.#settleQueued = true;
+      queueMicrotask(() => {
+        this.#settleQueued = false;
+        try {
+          this.#settleHistory();
+        } catch {
+          // A poisoned instance: nothing more to tell.
+        }
+      });
+    }
     return s;
+  }
+
+  /** Tells the application's entries and the listeners what the history did since the last call. */
+  #settleHistory(): void {
+    const s = this.#raw;
+    if (s === undefined) {
+      return;
+    }
+    // Before any callback, which may use the scene.
+    let permanent: PermanentStep[] = [];
+    if (call(() => s.has_permanent())) {
+      this.#guard?.bump();
+      const msg = call(() => s.take_permanent());
+      permanent = decodePermanent(msg, (index, generation) => {
+        const key = `${index}:${generation}`;
+        return this.#meshes.get(key) ?? this.#removed.get(key);
+      });
+    }
+    // One at a time: what a callback undoes itself comes after the rest.
+    while (this.#raw === s) {
+      const event = call(() => s.next_entry_event());
+      if (event < 0) {
+        break;
+      }
+      this.#entries.tell(Math.floor(event / 4), ENTRY_EVENTS[event % 4]);
+    }
+    tellPermanent(this.#permanentListeners, permanent);
   }
 
   /** The live raw scene, for a read-only call that leaves every view valid. */
@@ -3686,7 +3814,9 @@ export class Scene implements SceneLike {
    * meshes is cut as by any removal and does not come back: fields on other
    * meshes measured to it, and its section entries. The kept mesh counts
    * against the history's memory budget, and is freed once the history drops
-   * the step (see {@link Scene.isRestorable}).
+   * the step (see {@link Scene.isRestorable}). A removal larger than the
+   * whole budget is permanent: {@link Scene.removalBytes} tells before,
+   * {@link Scene.onPermanent} after.
    */
   removeMesh(mesh: MeshHandle, options: RemoveMeshOptions = {}): void {
     const { index, generation } = this.#id(mesh);
@@ -3697,6 +3827,7 @@ export class Scene implements SceneLike {
     if (options.undoable === true) {
       // Its handle stays known, for the way back.
       call(() => this.#scene().remove_mesh_undoable(index, generation));
+      this.#settleHistory();
       this.#prune = true;
       return;
     }
@@ -3704,6 +3835,7 @@ export class Scene implements SceneLike {
     const key = `${index}:${generation}`;
     this.#meshes.delete(key);
     this.#removed.set(key, mesh);
+    this.#settleHistory();
   }
 
   /** Whether the scene has `mesh`: `false` once it is removed, or its add is undone. */
@@ -3721,6 +3853,22 @@ export class Scene implements SceneLike {
   isRestorable(mesh: MeshHandle): boolean {
     const { index, generation } = this.#id(mesh);
     return this.#peek().is_restorable(index, generation);
+  }
+
+  /**
+   * About the bytes of history an undoable {@link Scene.removeMesh} of `mesh`
+   * takes. One larger than {@link Scene.historyBudget} is permanent.
+   *
+   * @example
+   * ```ts
+   * if (scene.removalBytes(mesh) <= scene.historyBudget() || confirm("Remove for good?")) {
+   *   scene.removeMesh(mesh, { undoable: true });
+   * }
+   * ```
+   */
+  removalBytes(mesh: MeshHandle): number {
+    const { index, generation } = this.#id(mesh);
+    return call(() => this.#peek().removal_bytes(index, generation));
   }
 
   /**
@@ -3752,6 +3900,7 @@ export class Scene implements SceneLike {
     const r = call(() =>
       this.#scene().join(ta.index, ta.generation, sb.index, sb.generation, Uint32Array.from(loops), maxEdges),
     );
+    this.#settleHistory();
     // Its handle stays known, for the way back.
     this.#prune = true;
     return { verticesAdded: r[0], trianglesAdded: r[1], bridgeTrianglesAdded: r[2] };
@@ -4691,6 +4840,8 @@ export class Scene implements SceneLike {
     // A coalesced drag's latest pose lands first, so the frame reports it.
     this.#drag?.applyPending();
     const s = this.#scene();
+    // Before the handles of meshes that are gone are dropped.
+    this.#settleHistory();
     const raw = decodeChanges(call(() => s.take_changes()));
     const out = raw.map(
       (c): MeshChange => ({
@@ -4785,6 +4936,7 @@ export class Scene implements SceneLike {
     this.#prune = true;
     const done = call(() => s.undo());
     this.#stepDepth = 0;
+    this.#settleHistory();
     return done;
   }
 
@@ -4795,6 +4947,7 @@ export class Scene implements SceneLike {
     this.#prune = true;
     const done = call(() => s.redo());
     this.#stepDepth = 0;
+    this.#settleHistory();
     return done;
   }
 
@@ -4817,6 +4970,111 @@ export class Scene implements SceneLike {
     this.#prune = true;
     call(() => s.clear_history());
     this.#stepDepth = 0;
+    this.#settleHistory();
+  }
+
+  /**
+   * Records an entry of the application's own in the history, in the open
+   * step or as a step of its own, for state that is not the scene's: a
+   * selection, a list of curves, a document's title. Make the change, then
+   * record how to take it back and make it again. The entry is undone, redone
+   * and cancelled in order with mesh edits and with its step, counts against
+   * the budget, and drops the steps undone before it.
+   *
+   * On undo its `undo` is called before {@link Scene.undo} returns, once
+   * every mesh of the step has changed; the entries of one step are called in
+   * reverse order, and in order on redo. A callback should not change the
+   * scene (that would be a new step); an error it throws is reported
+   * (`reportError`), and the undo stands.
+   *
+   * @throws `INVALID_ARGUMENT` for an entry without `undo` and `redo`, or with
+   * bytes below 0. Nothing is recorded then, and no function is called.
+   *
+   * @example
+   * ```ts
+   * const before = doc.title;
+   * const after = input.value;
+   * doc.title = after;
+   * scene.recordEntry({
+   *   undo: () => (doc.title = before),
+   *   redo: () => (doc.title = after),
+   *   bytes: 2 * (before.length + after.length),
+   * });
+   * ```
+   */
+  recordEntry(entry: HistoryEntry): void {
+    const { bytes, coalesce } = checkHistoryEntry(entry);
+    const s = this.#scene();
+    if (coalesce !== undefined && (this.#coalesce.id === 0 || coalesce !== this.#coalesce.key)) {
+      // Entries merge only with the one right before them, so a number is
+      // enough for each run of equal keys.
+      this.#coalesce = { key: coalesce, id: this.#coalesce.id + 1 };
+    }
+    const id = this.#entries.add(entry);
+    try {
+      call(() => s.record_entry(id, bytes, coalesce === undefined ? 0 : this.#coalesce.id));
+    } catch (e) {
+      this.#entries.forget(id);
+      throw e;
+    }
+    this.#settleHistory();
+  }
+
+  /** The most bytes the history may hold; see {@link SceneOptions.historyBudget}. */
+  historyBudget(): number {
+    return call(() => this.#peek().history_budget());
+  }
+
+  /**
+   * Changes the most bytes the history may hold
+   * ({@link SceneOptions.historyBudget}). A smaller budget is met at once:
+   * the oldest steps go first, then the undone steps furthest from being
+   * redone. The meshes in the scene stay as they are, and an open step is
+   * kept until it closes.
+   *
+   * @throws `INVALID_ARGUMENT` for anything but a number, 0 or more.
+   */
+  setHistoryBudget(bytes: number): void {
+    const budget = checkHistoryBudget(bytes);
+    const s = this.#scene();
+    this.#prune = true;
+    call(() => s.set_history_budget(budget));
+    this.#settleHistory();
+  }
+
+  /** The bytes the history holds now, the open step included. */
+  historyBytes(): number {
+    return call(() => this.#peek().history_bytes());
+  }
+
+  /**
+   * Registers a listener called with each step the history could not keep,
+   * since it is larger than the whole budget: an action that is permanent, or
+   * one just undone that cannot be redone. Steps dropped later, to make room
+   * for newer ones or by {@link Scene.setHistoryBudget}, are not reported.
+   * It is called by the history calls themselves (`removeMesh`, `join`,
+   * `endStep`, `undo`, ...), and within a microtask of any other. Returns a
+   * function that unregisters it.
+   *
+   * @example
+   * ```ts
+   * scene.onPermanent(({ lost, gone }) => {
+   *   if (lost === "undo") {
+   *     notify(gone.length > 0 ? "The removal cannot be undone." : "The change cannot be undone.");
+   *   }
+   * });
+   * ```
+   */
+  onPermanent(listener: PermanentListener): () => void {
+    this.#scene();
+    if (this.#permanentListeners.size === 0) {
+      // What was reported to no one.
+      call(() => this.#peek().take_permanent());
+    }
+    this.#permanentListeners.add(listener);
+    return () => {
+      this.#permanentListeners.delete(listener);
+    };
   }
 
   /**
@@ -4845,9 +5103,14 @@ export class Scene implements SceneLike {
     if (this.#drag !== undefined && this.#stepDepth < this.#drag.depth) {
       this.#drag.abandon();
     }
+    this.#settleHistory();
   }
 
-  /** Reverts and discards the open step, however deeply nested. Throws `STEP_NOT_OPEN` when none is open. */
+  /**
+   * Reverts and discards the open step, however deeply nested. The
+   * application's entries in it are undone and dropped. Throws `STEP_NOT_OPEN`
+   * when none is open.
+   */
   cancelStep(): void {
     const s = this.#scene();
     this.#prune = true;
@@ -4855,6 +5118,7 @@ export class Scene implements SceneLike {
     this.#stepDepth = 0;
     // The drag's step is gone with it: later moves must not record steps.
     this.#drag?.abandon();
+    this.#settleHistory();
   }
 
   /**
@@ -5436,12 +5700,19 @@ export class Scene implements SceneLike {
       case "brush": {
         let center = spec.center;
         let radius = spec.radius;
+        let stretch: Float64Array | undefined;
         if (spec.space === "world") {
-          const inv = invertMatrix4(this.matrix4(mesh));
-          center = transformPoint(inv, spec.center);
-          radius = spec.radius / meanStretch(this.matrix4(mesh));
+          const matrix = this.matrix4(mesh);
+          center = transformPoint(invertMatrix4(matrix), spec.center);
+          const { scale } = this.placement(mesh);
+          if (scale === undefined || (scale[0] === scale[1] && scale[1] === scale[2])) {
+            radius = spec.radius / meanStretch(matrix);
+          } else {
+            // The world's ball is none in the mesh: distances are the world's.
+            stretch = matrix;
+          }
         }
-        ids = brushPick(positions, topology.used, center, radius);
+        ids = brushPick(positions, topology.used, center, radius, stretch);
         break;
       }
       case "lasso":
@@ -5920,7 +6191,8 @@ export class Scene implements SceneLike {
     let at = 4;
     for (let k = 0; k < r[3]; k++) {
       const n = 3 * r[at + 1];
-      contours.push({ closed: r[at] === 1, points: Float32Array.from(r.subarray(at + 2, at + 2 + n)) });
+      const points64 = r.slice(at + 2, at + 2 + n);
+      contours.push({ closed: r[at] === 1, points: Float32Array.from(points64), points64 });
       at += 2 + n;
     }
     const result: SectionResult = {
@@ -5931,10 +6203,11 @@ export class Scene implements SceneLike {
     };
     if (r[at] === 1) {
       const np = 3 * r[at + 1];
-      const positions = Float32Array.from(r.subarray(at + 2, at + 2 + np));
+      const positions64 = r.slice(at + 2, at + 2 + np);
+      const positions = Float32Array.from(positions64);
       at += 2 + np;
       const indices = Uint32Array.from(r.subarray(at + 1, at + 1 + 3 * r[at]));
-      result.fill = { positions, indices };
+      result.fill = { positions, positions64, indices };
     }
     return result;
   }
@@ -5961,7 +6234,10 @@ export class Scene implements SceneLike {
 
   // ---- #233 Face Selection ----
 
-  /** Selects triangles enclosed by or intersecting a screen-space rectangle or lasso in NDC. */
+  /**
+   * Selects triangles enclosed by or intersecting a screen-space rectangle or lasso in NDC. The
+   * camera is in world coordinates and taken in `f64`: see {@link ScreenSelectOptions.viewProj}.
+   */
   selectFacesScreen(mesh: MeshHandle, shape: ScreenSelectionShape, options: ScreenSelectOptions): Uint32Array {
     const { index, generation } = this.#id(mesh);
     const n = normalizeScreenSelectArgs(shape, options);
@@ -6197,7 +6473,10 @@ export class Scene implements SceneLike {
 
   // ---- #193 Free-Form Deformation ----
 
-  /** Builds a zero-offset world-aligned FFD lattice around `mesh`. */
+  /**
+   * Builds a zero-offset FFD lattice around `mesh`, in its local coordinates
+   * and along its own axes; `padding` is in its own units.
+   */
   buildFfdLattice(
     mesh: MeshHandle,
     dims: readonly [number, number, number],
@@ -6391,7 +6670,10 @@ export class Scene implements SceneLike {
 
   // ---- #234 Primitive Fit, Contours & Point Cloud ----
 
-  /** Fits a geometric primitive (`plane`, `sphere`, `cylinder`, `cone`, or `auto`) in world space. */
+  /**
+   * Fits a geometric primitive (`plane`, `sphere`, `cylinder`, `cone`, or
+   * `auto`) in world space, as precisely far from the world origin as near it.
+   */
   fitPrimitive(mesh: MeshHandle, options: FitPrimitiveOptions = {}): FittedPrimitiveReport {
     const { index, generation } = this.#id(mesh);
     const n = normalizeFitPrimitiveArgs(options);
@@ -6427,14 +6709,18 @@ export class Scene implements SceneLike {
     );
   }
 
-  /** Slices world-space planar contours through `mesh`. */
+  /**
+   * Slices world-space planar contours through `mesh`, as precisely far from
+   * the world origin as near it: take the points from `points3d64` there
+   * (`points3d` is `f32`). `origin` may be anywhere on the plane.
+   */
   sliceContours(mesh: MeshHandle, origin: Readonly<Vec3>, normal: Readonly<Vec3>): ContourSlice {
     const { index, generation } = this.#id(mesh);
     const n = normalizeSliceContoursArgs(origin, normal);
     return decodeContourSlices(call(() => this.#peek().slice_contours(index, generation, n.origin, n.normal)))[0];
   }
 
-  /** Slices an evenly spaced stack of `count` parallel contours through `mesh`. */
+  /** Slices an evenly spaced stack of `count` parallel contours through `mesh`, each as {@link Scene.sliceContours}. */
   sliceContourStack(
     mesh: MeshHandle,
     origin: Readonly<Vec3>,
@@ -6453,15 +6739,22 @@ export class Scene implements SceneLike {
    * Reconstructs a triangle mesh from a packed point cloud and adds it to the
    * scene, as one undo step: {@link Scene.undo} removes it and
    * {@link Scene.redo} brings it back with the same handle.
+   *
+   * The cloud's `origin` is the mesh's {@link Scene.origin}. Without one, and
+   * for a bare buffer, the positions are world positions in `f32`, which far
+   * from the world origin are off by up to half of its steps (0.004 at 1e5):
+   * see {@link PackedPointCloud} for clouds there.
    */
   reconstructPointCloud(
     cloud: PackedPointCloud | Float32Array,
     options: SurfaceReconstructOptions = {},
   ): MeshHandle {
     const buf = cloudBuffer(cloud);
+    const at = cloudOrigin(cloud);
+    const origin = at === undefined ? undefined : Float64Array.from(at);
     const n = normalizeReconstructArgs(options);
     const id = call(() =>
-      this.#scene().reconstruct_point_cloud(buf, n.method, n.voxelSize, n.ballRadius, n.kNeighbors, n.normals),
+      this.#scene().reconstruct_point_cloud(buf, n.method, n.voxelSize, n.ballRadius, n.kNeighbors, n.normals, origin),
     );
     return this.#meshHandle(id[0], id[1]);
   }
@@ -6605,6 +6898,12 @@ export class Scene implements SceneLike {
    * in one undo step. Kept separate, the placed stamp is a new mesh with the hit point as its
    * {@link Scene.origin}, which {@link Scene.undo} removes and {@link Scene.redo} brings back with
    * the same handle.
+   *
+   * The zero of the stamp's own coordinates goes to the hit point, or `options.stampAnchor`, which
+   * says what happens with a stamp far from that zero. A `stampAnchor` far from the stamp puts it
+   * as far from the hit point: kept separate (and not conforming) it is placed as precisely there,
+   * around an origin of its own; merged into a target it has the precision of that mesh's `f32`
+   * positions at that distance.
    */
   placeMesh(target: MeshHandle, stamp: MeshHandle, options: PlaceMeshOptions): PlaceMeshReport {
     const t = this.#id(target);
@@ -6627,6 +6926,7 @@ export class Scene implements SceneLike {
         n.conformToSurface,
         n.booleanMethod,
         normals,
+        n.stampAnchor,
       ),
     );
     return decodePlaceMeshReport(raw, (i, g) => this.#meshHandle(i, g));

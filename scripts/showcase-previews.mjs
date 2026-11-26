@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchChrome, startServer } from "./chrome-cdp.mjs";
+import { launchChrome, SHOWCASE_READY, startServer } from "./chrome-cdp.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const example = join(root, "examples", "showcase");
@@ -43,7 +43,7 @@ async function waitFor(expr, ms = 90_000) {
 
 let failed = false;
 try {
-  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  await browser.goto(`http://127.0.0.1:${port}/`, SHOWCASE_READY);
   await waitFor(`__showcase.items().some((m) => m.drawn)`);
   const actions = await browser.evaluate(`[...document.querySelectorAll(".model-card")].map((b) => b.dataset.action)`);
   if (actions.length === 0) {

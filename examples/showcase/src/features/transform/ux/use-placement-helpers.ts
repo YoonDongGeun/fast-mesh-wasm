@@ -97,11 +97,20 @@ export function usePlacementHelpers(
     setBusy(true);
     try {
       const done = await applyTransform(store, mesh);
+      const moved = store.scene.placement(mesh).translation.some((c) => c !== 0);
       if (done) {
         onBaked?.();
-        report("Transform applied: the placement is now the identity");
+        report(
+          moved
+            ? "Transform applied: so far from the mesh's origin, the placement keeps a translation"
+            : "Transform applied: the placement is now the identity",
+        );
       } else {
-        report("The placement already is the identity");
+        report(
+          moved
+            ? "The placement is only a translation, which stays so far from the mesh's origin"
+            : "The placement already is the identity",
+        );
       }
     } catch (e) {
       report(e instanceof Error ? e.message : String(e), true);

@@ -640,6 +640,7 @@ function AnalysisList(props: {
       className={stale ? "analysis stale" : "analysis"}
       data-holes={s.holes.length}
       data-components={s.components.length}
+      data-cavities={s.cavities}
     >
       <dt>Holes</dt>
       <dd className={bad(s.holes.length)}>
@@ -671,6 +672,7 @@ function AnalysisList(props: {
             .map((c) => `${c.triangles.toLocaleString("en")}${c.closed ? "" : " open"}`)
             .join(", ")}
           {s.components.length > 3 ? ", …" : ""} tris)
+          {s.cavities > 0 ? `, ${plural(s.cavities, "cavity", "cavities")}` : ""}
         </span>
       </dd>
       <dt>Non-manifold</dt>

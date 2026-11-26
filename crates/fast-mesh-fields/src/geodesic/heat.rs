@@ -1,11 +1,13 @@
 //! The heat method's operators and solves; see [`GeodesicHeatSolver`].
 
+use std::f64::consts::FRAC_1_SQRT_2;
 use std::ops::Range;
 
 use fast_mesh_store::{Mesh, par};
 
 use super::amg::{Amg, AmgBuild, Matrix, PAR_MIN_ROWS, Rows, Solve, sum_range};
 use super::diffuse::{Diffusion, Heat, Surface};
+use super::intrinsic::{Intrinsic, Layout, Survey, hypot, survey};
 use super::{GeodesicPhase, MeshState, validate_max_distance, validate_options};
 use crate::geom::{add, cross, dot, norm, scale, sub, triangle_normal, widen};
 use crate::grid::{allocation_allowed, filled, push, reserve, reserve_exact};
@@ -17,8 +19,11 @@ const MIN_EDGE_WEIGHT: f64 = 1e-6;
 /// The Poisson solve ends at this error, in the energy norm and relative to
 /// that of a distance field (whose gradient is 1 everywhere).
 const TOLERANCE: f64 = 1e-7;
+/// The diffusion's length is at most that of the sides of so many squares that
+/// make up the whole surface: a mesh with fewer vertices gets more.
+const RESOLUTION: f64 = 2000.0;
 /// Elements per chunk of the assembly's loops.
-const CHUNK: usize = 8192;
+pub(super) const CHUNK: usize = 8192;
 /// Triangles per step of the gradient.
 const GRADIENT_STEP: usize = 1 << 17;
 /// No component.
@@ -31,15 +36,17 @@ const OOM: fn() -> FieldsError = || FieldsError::OutOfMemory;
 /// neighbours in memory.
 #[derive(Debug, Clone)]
 struct Component {
-    /// The mesh's vertex per vertex.
+    /// The mesh's vertex per vertex, or [`NONE`] for one it has not got.
     vertices: Vec<u32>,
     positions: Vec<[f32; 3]>,
-    /// The triangles with an area, ordered by their first vertex.
+    /// The triangles with an area, ordered by their first vertex: those of
+    /// the mesh, and those that are cut otherwise.
     triangles: Vec<[u32; 3]>,
+    flat: Vec<Flat>,
     /// Lumped mass: a third of the area around each vertex.
     mass: Vec<f64>,
     area: f64,
-    /// The clamped cotangent Laplacian and its multigrid levels.
+    /// The cotangent Laplacian and its multigrid levels.
     amg: Amg,
 }
 
@@ -47,18 +54,54 @@ impl Component {
     fn byte_size(&self) -> usize {
         self.vertices.capacity() * size_of::<u32>()
             + (self.positions.capacity() + self.triangles.capacity()) * size_of::<[u32; 3]>()
+            + self.flat.capacity() * size_of::<Flat>()
             + self.mass.capacity() * size_of::<f64>()
             + self.amg.byte_size()
     }
 }
 
+/// A triangle that is not the mesh's, laid out flat: the length of its first
+/// side, and where its third corner is from there (as in [`Layout`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Flat {
+    pub(super) corners: [u32; 3],
+    shape: [f32; 3],
+}
+
+impl Flat {
+    pub(super) fn new(corners: [u32; 3], layout: Layout) -> Flat {
+        let [length, x, y] = [layout.length, layout.x, layout.y].map(|c| c as f32);
+        // (Never without an area, however small.)
+        Flat {
+            corners,
+            shape: [length.max(f32::MIN_POSITIVE), x, y.max(f32::MIN_POSITIVE)],
+        }
+    }
+
+    fn layout(&self) -> Layout {
+        let [length, x, y] = self.shape.map(f64::from);
+        Layout { length, x, y }
+    }
+
+    fn area(&self) -> f64 {
+        0.5 * f64::from(self.shape[0]) * f64::from(self.shape[2])
+    }
+}
+
 /// Precomputed solver for Crane et al. (2013) *Geodesics in Heat* on a fixed
-/// mesh and diffusion time step.
+/// mesh.
 ///
-/// Building the solver assembles the lumped mass matrix, the clamped cotangent
+/// Building the solver assembles the lumped mass matrix, the cotangent
 /// Laplacian and its multigrid levels per connected component, so subsequent
 /// [`GeodesicHeatSolver::solve`] calls for different source sets avoid
 /// rebuilding the operators.
+///
+/// The operators are those of the mesh's own triangles as long as these are
+/// good enough, and of an intrinsic Delaunay triangulation of the same
+/// surface otherwise: where an edge's opposite angles sum to more than π, or
+/// where a triangle is large next to the time step. See
+/// [`GeodesicMethod::HeatMethod`](super::GeodesicMethod::HeatMethod) for how
+/// far off the distances are.
 #[derive(Debug, Clone)]
 pub struct GeodesicHeatSolver {
     mesh: MeshState,
@@ -66,14 +109,16 @@ pub struct GeodesicHeatSolver {
     component_of: Vec<u32>,
     local_of: Vec<u32>,
     components: Vec<Component>,
-    mean_edge: f64,
+    /// The diffusion's length: its time step is the square of it.
+    length: f64,
     time_step_scale: f64,
 }
 
 impl GeodesicHeatSolver {
     /// Builds a reusable heat-method solver for `mesh` using diffusion time step
-    /// `t = time_step_scale * h_mean^2`, where `h_mean` is the mean edge length
-    /// across unique edges of live non-degenerate triangles.
+    /// `t = time_step_scale * h^2`, where `h` is the mean edge length across
+    /// unique edges of live non-degenerate triangles, or `sqrt(area / 2000)`
+    /// where that is smaller (on a mesh of less than about 2000 vertices).
     ///
     /// # Errors
     /// - [`FieldsError::InvalidInput`] if `time_step_scale` is non-finite or
@@ -156,6 +201,8 @@ impl GeodesicHeatSolver {
 pub(super) struct SolverBuild {
     solver: GeodesicHeatSolver,
     stage: BuildStage,
+    /// Whether the triangles may be cut otherwise.
+    recut: bool,
 }
 
 #[derive(Debug)]
@@ -174,8 +221,23 @@ enum BuildStage {
         /// Where each part starts in `vertices`, and where the last ends.
         starts: Vec<u32>,
     },
+    /// Look at the triangles.
+    Survey(Numbered),
     /// Assemble the Laplacian of every part.
-    Assemble(Numbered),
+    Assemble {
+        numbered: Numbered,
+        corners: Corners,
+        cots: Vec<[f64; 3]>,
+        /// What the mesh's own triangles are like.
+        survey: Option<Survey>,
+    },
+    /// Flip edges until the triangulation is Delaunay.
+    Flip {
+        intrinsic: Box<Intrinsic>,
+        area: f64,
+    },
+    /// Put vertices into the triangles that are too large.
+    Refine(Box<Intrinsic>),
     /// Cut it into its parts.
     Split {
         numbered: Numbered,
@@ -192,12 +254,90 @@ enum BuildStage {
 
 /// The triangles in the solver's numbering, part after part.
 #[derive(Debug)]
-struct Numbered {
-    vertices: Vec<u32>,
-    starts: Vec<u32>,
-    positions: Vec<[f32; 3]>,
-    /// Ordered by their smallest vertex.
-    triangles: Vec<[u32; 3]>,
+pub(super) struct Numbered {
+    /// The mesh's vertex per vertex, or [`NONE`] for one it has not got.
+    pub(super) vertices: Vec<u32>,
+    /// Where each part's vertices start, and where the last part's end.
+    pub(super) starts: Vec<u32>,
+    pub(super) positions: Vec<[f32; 3]>,
+    /// Those of the mesh, ordered by their smallest vertex.
+    pub(super) triangles: Vec<[u32; 3]>,
+    /// Those cut otherwise, likewise.
+    pub(super) flat: Vec<Flat>,
+}
+
+impl Numbered {
+    pub(super) fn parts(&self) -> usize {
+        self.starts.len() - 1
+    }
+
+    /// The part a vertex is in.
+    pub(super) fn part_of(&self, v: u32) -> usize {
+        self.starts.partition_point(|&s| s <= v) - 1
+    }
+
+    /// How many triangles there are, flat ones and others.
+    fn count(&self) -> usize {
+        self.triangles.len() + self.flat.len()
+    }
+
+    /// The corners of a triangle, the flat ones numbered after the others.
+    fn corners(&self, t: usize) -> [u32; 3] {
+        match self.triangles.get(t) {
+            Some(&tri) => tri,
+            None => self.flat[t - self.triangles.len()].corners,
+        }
+    }
+
+    pub(super) fn layout(&self, t: usize) -> Layout {
+        match self.triangles.get(t) {
+            Some(tri) => Layout::of(tri.map(|v| self.positions[v as usize])),
+            None => self.flat[t - self.triangles.len()].layout(),
+        }
+    }
+}
+
+/// The triangles around each vertex.
+#[derive(Debug)]
+pub(super) struct Corners {
+    /// Where each vertex's start.
+    start: Vec<u32>,
+    /// `3 t + k` for corner `k` of triangle `t`, ascending.
+    around: Vec<u32>,
+}
+
+impl Corners {
+    fn of(mesh: &Numbered) -> Result<Corners> {
+        let (n, count) = (mesh.vertices.len(), mesh.count());
+        if 3 * count as u64 >= u64::from(NONE) {
+            return Err(FieldsError::OutOfMemory);
+        }
+        let mut start = filled(n + 1, 0u32)?;
+        for t in 0..count {
+            for v in mesh.corners(t) {
+                start[v as usize + 1] += 1;
+            }
+        }
+        for v in 0..n {
+            start[v + 1] += start[v];
+        }
+        let mut at = filled(n, 0u32)?;
+        at.copy_from_slice(&start[..n]);
+        let mut around = filled(3 * count, 0u32)?;
+        for t in 0..count {
+            for (k, v) in mesh.corners(t).into_iter().enumerate() {
+                let slot = &mut at[v as usize];
+                around[*slot as usize] = (3 * t + k) as u32;
+                *slot += 1;
+            }
+        }
+        Ok(Corners { start, around })
+    }
+
+    pub(super) fn around(&self, v: u32) -> &[u32] {
+        let v = v as usize;
+        &self.around[self.start[v] as usize..self.start[v + 1] as usize]
+    }
 }
 
 /// A connected part before its multigrid levels are built.
@@ -206,6 +346,7 @@ struct Part {
     vertices: Vec<u32>,
     positions: Vec<[f32; 3]>,
     triangles: Vec<[u32; 3]>,
+    flat: Vec<Flat>,
     mass: Vec<f64>,
     area: f64,
     laplacian: Option<Rows>,
@@ -221,10 +362,11 @@ impl SolverBuild {
                 component_of: Vec::new(),
                 local_of: Vec::new(),
                 components: Vec::new(),
-                mean_edge: 0.0,
+                length: 0.0,
                 time_step_scale,
             },
             stage: BuildStage::Triangles,
+            recut: true,
         })
     }
 
@@ -266,31 +408,100 @@ impl SolverBuild {
                 work = triangles.len();
                 let renumber =
                     |v: u32| starts[s.component_of[v as usize] as usize] + s.local_of[v as usize];
-                let triangles = renumber_triangles(triangles, vertices.len(), renumber)?;
+                let mut triangles = triangles;
+                for tri in &mut triangles {
+                    *tri = tri.map(renumber);
+                }
+                let triangles = by_first_corner(&triangles, vertices.len(), |t| *t)?;
                 let mut positions: Vec<[f32; 3]> = Vec::new();
                 reserve_exact(&mut positions, vertices.len())?;
                 positions.extend(vertices.iter().map(|&v| mesh.positions()[v as usize]));
-                BuildStage::Assemble(Numbered {
+                BuildStage::Survey(Numbered {
                     vertices,
                     starts,
                     positions,
                     triangles,
+                    flat: Vec::new(),
                 })
             }
-            BuildStage::Assemble(numbered) => {
-                work = 4 * numbered.triangles.len();
-                let (laplacian, mean_edge) = assemble(&numbered, &s.component_of)?;
-                s.mean_edge = mean_edge;
-                BuildStage::Split {
-                    numbered,
-                    laplacian,
+            BuildStage::Survey(numbered) => {
+                work = 2 * numbered.count();
+                let corners = Corners::of(&numbered)?;
+                let cots = half_cotangents(&numbered)?;
+                let survey = survey(&numbered, &corners, &cots)?;
+                if survey.delaunay || !self.recut {
+                    BuildStage::Assemble {
+                        numbered,
+                        corners,
+                        cots,
+                        survey: Some(survey),
+                    }
+                } else {
+                    flip_stage(numbered, &corners, &cots, survey.area)?
+                }
+            }
+            BuildStage::Assemble {
+                numbered,
+                corners,
+                cots,
+                survey,
+            } => {
+                work = 2 * numbered.count();
+                let (laplacian, mean) = assemble(&numbered, &corners, &cots)?;
+                match survey {
+                    Some(survey) => {
+                        let (length, size) = length_and_size(mean, survey.area);
+                        s.length = if self.recut { length } else { mean };
+                        if self.recut && survey.radius > size {
+                            flip_stage(numbered, &corners, &cots, survey.area)?
+                        } else {
+                            BuildStage::Split {
+                                numbered,
+                                laplacian,
+                            }
+                        }
+                    }
+                    None => BuildStage::Split {
+                        numbered,
+                        laplacian,
+                    },
+                }
+            }
+            BuildStage::Flip {
+                mut intrinsic,
+                area,
+            } => {
+                work = 1 << 18;
+                if intrinsic.flip()? {
+                    let (length, size) = length_and_size(intrinsic.mean_edge(), area);
+                    s.length = length;
+                    intrinsic.begin_refining(size)?;
+                    BuildStage::Refine(intrinsic)
+                } else {
+                    BuildStage::Flip { intrinsic, area }
+                }
+            }
+            BuildStage::Refine(mut intrinsic) => {
+                work = 1 << 18;
+                if intrinsic.refine()? {
+                    let numbered = intrinsic.finish(&mut s.local_of)?;
+                    let corners = Corners::of(&numbered)?;
+                    let cots = half_cotangents(&numbered)?;
+                    BuildStage::Assemble {
+                        numbered,
+                        corners,
+                        cots,
+                        survey: None,
+                    }
+                } else {
+                    BuildStage::Refine(intrinsic)
                 }
             }
             BuildStage::Split {
                 numbered,
                 laplacian,
             } => {
-                work = numbered.triangles.len();
+                work = numbered.count();
                 let parts = split(numbered, laplacian)?;
                 reserve_exact(&mut s.components, parts.len())?;
                 BuildStage::Levels {
@@ -308,6 +519,7 @@ impl SolverBuild {
                             vertices: part.vertices,
                             positions: part.positions,
                             triangles: part.triangles,
+                            flat: part.flat,
                             mass: part.mass,
                             area: part.area,
                             amg: amg.finish(),
@@ -343,6 +555,28 @@ impl SolverBuild {
     pub(super) fn finish(self) -> GeodesicHeatSolver {
         self.solver
     }
+}
+
+/// The length of the diffusion on a surface whose edges have a mean length of
+/// `mean`, and the largest circumradius its triangles may have.
+fn length_and_size(mean: f64, area: f64) -> (f64, f64) {
+    let side = (area / RESOLUTION).sqrt();
+    (mean.min(side), mean.min(side * FRAC_1_SQRT_2))
+}
+
+/// Starts to cut the surface otherwise.
+fn flip_stage(
+    mesh: Numbered,
+    corners: &Corners,
+    cots: &[[f64; 3]],
+    area: f64,
+) -> Result<BuildStage> {
+    // (About what it takes: triangles of the largest size allowed.)
+    let extra = 4.0 * RESOLUTION;
+    Ok(BuildStage::Flip {
+        intrinsic: Box::new(Intrinsic::new(mesh, corners, cots, area, extra)?),
+        area,
+    })
 }
 
 /// Which vertex slots can be sources: the live ones with a finite position.
@@ -434,7 +668,7 @@ fn number(
     *component_of = filled(slots, NONE)?;
     *local_of = filled(slots, 0u32)?;
     let mut sizes: Vec<u32> = Vec::new();
-    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    let (mut lo, mut hi) = NOWHERE;
     let mut live = 0usize;
     for v in 0..slots {
         if parent[v] == NONE {
@@ -450,10 +684,7 @@ fn number(
         component_of[v] = c;
         sizes[c as usize] += 1;
         live += 1;
-        for k in 0..3 {
-            lo[k] = lo[k].min(positions[v][k]);
-            hi[k] = hi[k].max(positions[v][k]);
-        }
+        include(&mut lo, &mut hi, positions[v]);
     }
     drop(parent);
 
@@ -482,8 +713,27 @@ fn number(
     Ok((vertices, starts))
 }
 
+/// A box without a point in it.
+const NOWHERE: ([f32; 3], [f32; 3]) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+
+fn include(lo: &mut [f32; 3], hi: &mut [f32; 3], p: [f32; 3]) {
+    for k in 0..3 {
+        lo[k] = lo[k].min(p[k]);
+        hi[k] = hi[k].max(p[k]);
+    }
+}
+
+/// The box around some points.
+pub(super) fn bounds(points: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
+    let (mut lo, mut hi) = NOWHERE;
+    for &p in points {
+        include(&mut lo, &mut hi, p);
+    }
+    (lo, hi)
+}
+
 /// A point's place along a Morton curve through the box, 21 bits per axis.
-fn morton(p: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> u64 {
+pub(super) fn morton(p: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> u64 {
     let mut code = 0u64;
     for k in 0..3 {
         let (l, h) = (f64::from(lo[k]), f64::from(hi[k]));
@@ -500,26 +750,28 @@ fn morton(p: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> u64 {
     code
 }
 
-/// The triangles with their corners renumbered, ordered by their smallest
-/// corner, then as before.
-fn renumber_triangles(
-    mut triangles: Vec<[u32; 3]>,
+/// Triangles ordered by their smallest corner, then as before.
+pub(super) fn by_first_corner<T: Copy>(
+    triangles: &[T],
     vertices: usize,
-    renumber: impl Fn(u32) -> u32,
-) -> Result<Vec<[u32; 3]>> {
-    for tri in &mut triangles {
-        *tri = tri.map(&renumber);
-    }
-    let first = |t: &[u32; 3]| t[0].min(t[1]).min(t[2]) as usize;
+    corners: impl Fn(&T) -> [u32; 3],
+) -> Result<Vec<T>> {
+    let first = |t: &T| {
+        let [a, b, c] = corners(t);
+        a.min(b).min(c) as usize
+    };
+    let Some(&any) = triangles.first() else {
+        return Ok(Vec::new());
+    };
     let mut at = filled(vertices + 1, 0u32)?;
-    for t in &triangles {
+    for t in triangles {
         at[first(t) + 1] += 1;
     }
     for v in 0..vertices {
         at[v + 1] += at[v];
     }
-    let mut out = filled(triangles.len(), [0u32; 3])?;
-    for t in &triangles {
+    let mut out = filled(triangles.len(), any)?;
+    for t in triangles {
         let slot = &mut at[first(t)];
         out[*slot as usize] = *t;
         *slot += 1;
@@ -527,42 +779,30 @@ fn renumber_triangles(
     Ok(out)
 }
 
-/// Half the cotangent at each corner of a triangle, and its area.
-fn half_cotangents(corners: [[f32; 3]; 3]) -> ([f64; 3], f64) {
-    let [a, b, c] = corners.map(widen);
-    let area2 = norm(triangle_normal(corners));
-    let inv = 1.0 / area2;
-    (
-        [
-            0.5 * dot(sub(b, a), sub(c, a)) * inv,
-            0.5 * dot(sub(c, b), sub(a, b)) * inv,
-            0.5 * dot(sub(a, c), sub(b, c)) * inv,
-        ],
-        0.5 * area2,
-    )
+/// Half the cotangent at each corner of every triangle.
+fn half_cotangents(mesh: &Numbered) -> Result<Vec<[f64; 3]>> {
+    let mut cots = filled(mesh.count(), [0.0f64; 3])?;
+    par::for_each_chunk_mut(&mut cots, CHUNK, 2 * CHUNK, |c, part| {
+        for (i, out) in part.iter_mut().enumerate() {
+            let t = c * CHUNK + i;
+            *out = match mesh.triangles.get(t) {
+                Some(tri) => half_cotangents_of(tri.map(|v| mesh.positions[v as usize])),
+                None => mesh.layout(t).half_cotangents(),
+            };
+        }
+    });
+    Ok(cots)
 }
 
-/// The triangles around each vertex: where each vertex's start, and the
-/// triangles, ascending.
-fn incidence(vertices: usize, triangles: &[[u32; 3]]) -> Result<(Vec<u32>, Vec<u32>)> {
-    let mut start = filled(vertices + 1, 0u32)?;
-    for &v in triangles.iter().flatten() {
-        start[v as usize + 1] += 1;
-    }
-    for v in 0..vertices {
-        start[v + 1] += start[v];
-    }
-    let mut at = filled(vertices, 0u32)?;
-    at.copy_from_slice(&start[..vertices]);
-    let mut around = filled(3 * triangles.len(), 0u32)?;
-    for (t, tri) in triangles.iter().enumerate() {
-        for &v in tri {
-            let slot = &mut at[v as usize];
-            around[*slot as usize] = t as u32;
-            *slot += 1;
-        }
-    }
-    Ok((start, around))
+/// Half the cotangent at each corner of a triangle.
+fn half_cotangents_of(corners: [[f32; 3]; 3]) -> [f64; 3] {
+    let [a, b, c] = corners.map(widen);
+    let inv = 1.0 / norm(triangle_normal(corners));
+    [
+        0.5 * dot(sub(b, a), sub(c, a)) * inv,
+        0.5 * dot(sub(c, b), sub(a, b)) * inv,
+        0.5 * dot(sub(a, c), sub(b, c)) * inv,
+    ]
 }
 
 /// Off-diagonal Laplacian rows of the vertices of a range, columns local to
@@ -574,36 +814,37 @@ struct RowsPart {
     edges: usize,
 }
 
-/// The off-diagonal entries of the clamped cotangent Laplacian, columns
-/// numbered within each part, and the mean edge length.
-fn assemble(mesh: &Numbered, component_of: &[u32]) -> Result<(Rows, f64)> {
+/// The off-diagonal entries of the cotangent Laplacian, columns numbered
+/// within each part, and the mean length of the edges (if they are straight).
+fn assemble(mesh: &Numbered, corners: &Corners, cots: &[[f64; 3]]) -> Result<(Rows, f64)> {
     let n = mesh.vertices.len();
-    let triangles = &mesh.triangles;
-    let (start, around) = incidence(n, triangles)?;
-    let mut cots = filled(triangles.len(), [0.0f64; 3])?;
-    par::for_each_chunk_mut(&mut cots, CHUNK, 2 * CHUNK, |c, part| {
-        for (out, tri) in part.iter_mut().zip(&triangles[c * CHUNK..]) {
-            *out = half_cotangents(tri.map(|v| mesh.positions[v as usize])).0;
-        }
-    });
     allocation_allowed()?;
     let parts = par::map_range(n, CHUNK, 2 * CHUNK, OOM, |range| {
         let mut part = RowsPart::default();
         reserve_exact(&mut part.rows.ptr, range.len())?;
-        // Column, triangle, weight: the triangle keeps the order fixed.
+        // Column, side, weight: the side keeps the order fixed, and the same
+        // in the rows of both its ends.
         let mut entries: Vec<(u32, u32, f64)> = Vec::new();
+        let mut of = mesh.part_of(range.start as u32);
         for v in range {
+            while mesh.starts[of + 1] as usize <= v {
+                of += 1;
+            }
+            let base = mesh.starts[of];
             entries.clear();
-            let incident = &around[start[v] as usize..start[v + 1] as usize];
-            for &t in incident {
-                let (tri, cot) = (triangles[t as usize], cots[t as usize]);
-                let k = tri.iter().position(|&c| c as usize == v).unwrap_or(0);
+            for &corner in corners.around(v as u32) {
+                let (t, k) = (corner as usize / 3, corner as usize % 3);
+                let (tri, cot) = (mesh.corners(t), cots[t]);
                 let (a, b) = ((k + 1) % 3, (k + 2) % 3);
-                push(&mut entries, (tri[a], t, cot[b]))?;
-                push(&mut entries, (tri[b], t, cot[a]))?;
+                // (A side can lead back to where it started.)
+                if tri[a] as usize != v {
+                    push(&mut entries, (tri[a], corner, cot[b]))?;
+                }
+                if tri[b] as usize != v {
+                    push(&mut entries, (tri[b], (3 * t + b) as u32, cot[a]))?;
+                }
             }
             entries.sort_unstable_by_key(|e| (e.0, e.1));
-            let base = mesh.starts[component_of[mesh.vertices[v] as usize] as usize];
             let p = widen(mesh.positions[v]);
             reserve(&mut part.rows.col, entries.len())?;
             reserve(&mut part.rows.val, entries.len())?;
@@ -659,11 +900,12 @@ fn split(mesh: Numbered, laplacian: Rows) -> Result<Vec<Part>> {
     let mut parts = Vec::new();
     reserve_exact(&mut parts, count)?;
     if count == 1 {
-        let (mass, area) = masses(&mesh.positions, &mesh.triangles)?;
+        let (mass, area) = masses(&mesh.positions, &mesh.triangles, &mesh.flat)?;
         parts.push(Part {
             vertices: mesh.vertices,
             positions: mesh.positions,
             triangles: mesh.triangles,
+            flat: mesh.flat,
             mass,
             area,
             laplacian: Some(laplacian),
@@ -677,19 +919,24 @@ fn split(mesh: Numbered, laplacian: Rows) -> Result<Vec<Part>> {
         Ok(v)
     }
     // (Ordered by their smallest vertex, the triangles come part after part.)
-    let mut t = 0;
+    let (mut t, mut f) = (0, 0);
     for k in 0..count {
         let range = mesh.starts[k] as usize..mesh.starts[k + 1] as usize;
-        let from = t;
+        let (from, from_flat) = (t, f);
         while t < mesh.triangles.len() && (mesh.triangles[t][0] as usize) < range.end {
             t += 1;
         }
+        while f < mesh.flat.len() && (mesh.flat[f].corners[0] as usize) < range.end {
+            f += 1;
+        }
         let mut triangles = copied(&mesh.triangles[from..t])?;
-        for v in triangles.iter_mut().flatten() {
+        let mut flat = copied(&mesh.flat[from_flat..f])?;
+        let own = triangles.iter_mut().flatten();
+        for v in own.chain(flat.iter_mut().flat_map(|f| &mut f.corners)) {
             *v -= range.start as u32;
         }
         let positions = copied(&mesh.positions[range.clone()])?;
-        let (mass, area) = masses(&positions, &triangles)?;
+        let (mass, area) = masses(&positions, &triangles, &flat)?;
         let entries = laplacian.ptr[range.start] as usize..laplacian.ptr[range.end] as usize;
         let mut ptr = copied(&laplacian.ptr[range.start..=range.end])?;
         for p in &mut ptr {
@@ -699,6 +946,7 @@ fn split(mesh: Numbered, laplacian: Rows) -> Result<Vec<Part>> {
             vertices: copied(&mesh.vertices[range])?,
             positions,
             triangles,
+            flat,
             mass,
             area,
             laplacian: Some(Rows {
@@ -712,15 +960,25 @@ fn split(mesh: Numbered, laplacian: Rows) -> Result<Vec<Part>> {
 }
 
 /// A third of the area around each vertex, and the whole area.
-fn masses(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Result<(Vec<f64>, f64)> {
+fn masses(
+    positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
+    flat: &[Flat],
+) -> Result<(Vec<f64>, f64)> {
     let mut mass = filled(positions.len(), 0.0f64)?;
     let mut total = 0.0;
-    for tri in triangles {
-        let area = 0.5 * norm(triangle_normal(tri.map(|v| positions[v as usize])));
+    let mut add = |tri: &[u32; 3], area: f64| {
         total += area;
         for &v in tri {
             mass[v as usize] += area / 3.0;
         }
+    };
+    for tri in triangles {
+        let corners = tri.map(|v| positions[v as usize]);
+        add(tri, 0.5 * norm(triangle_normal(corners)));
+    }
+    for f in flat {
+        add(&f.corners, f.area());
     }
     Ok((mass, total))
 }
@@ -833,7 +1091,7 @@ impl HeatSolve {
         solver: &GeodesicHeatSolver,
         work: usize,
     ) -> Result<Option<usize>> {
-        let time_step = self.time_step_scale * solver.mean_edge * solver.mean_edge;
+        let time_step = self.time_step_scale * solver.length * solver.length;
         let spent;
         self.stage = match std::mem::replace(&mut self.stage, SolveStage::Done) {
             SolveStage::Next => match self.todo.pop() {
@@ -890,10 +1148,11 @@ impl HeatSolve {
                 at,
             } => {
                 let c = &solver.components[component as usize];
-                let end = c.triangles.len().min(at + GRADIENT_STEP);
+                let count = c.triangles.len() + c.flat.len();
+                let end = count.min(at + GRADIENT_STEP);
                 add_divergence(c, &heat, at..end, &mut b)?;
                 spent = 2 * (end - at) + 1;
-                if end < c.triangles.len() {
+                if end < count {
                     SolveStage::Gradient {
                         component,
                         sources,
@@ -949,6 +1208,9 @@ impl HeatSolve {
             phi[s as usize] = 0.0;
         }
         for (&slot, &value) in c.vertices.iter().zip(&phi) {
+            if slot == NONE {
+                continue;
+            }
             let d = value as f32;
             self.result[slot as usize] = match self.max_distance {
                 Some(limit) if d > limit => f32::INFINITY,
@@ -963,11 +1225,13 @@ impl HeatSolve {
 }
 
 /// Adds to `b` what the unit field away from the heat flows out of some of a
-/// component's triangles.
+/// component's triangles, the flat ones numbered after the others.
 fn add_divergence(c: &Component, heat: &Heat, range: Range<usize>, b: &mut [f64]) -> Result<()> {
-    let triangles = &c.triangles[range];
+    let own = c.triangles.len();
+    let plain = &c.triangles[range.start.min(own)..range.end.min(own)];
+    let flat = &c.flat[range.start.max(own) - own..range.end.max(own) - own];
     allocation_allowed()?;
-    let parts = par::map_chunks(triangles, CHUNK, 2 * CHUNK, OOM, |_, chunk| {
+    let parts = par::map_chunks(plain, CHUNK, 2 * CHUNK, OOM, |_, chunk| {
         let mut out: Vec<[f64; 3]> = Vec::new();
         reserve_exact(&mut out, chunk.len())?;
         for tri in chunk {
@@ -976,10 +1240,26 @@ fn add_divergence(c: &Component, heat: &Heat, range: Range<usize>, b: &mut [f64]
         }
         Ok(out)
     })?;
-    for (tri, flux) in triangles.iter().zip(parts.iter().flatten()) {
+    let mut add = |tri: &[u32; 3], flux: &[f64; 3]| {
         for k in 0..3 {
             b[tri[k] as usize] += flux[k];
         }
+    };
+    for (tri, flux) in plain.iter().zip(parts.iter().flatten()) {
+        add(tri, flux);
+    }
+    allocation_allowed()?;
+    let parts = par::map_chunks(flat, CHUNK, 2 * CHUNK, OOM, |_, chunk| {
+        let mut out: Vec<[f64; 3]> = Vec::new();
+        reserve_exact(&mut out, chunk.len())?;
+        for f in chunk {
+            let u = heat.corners(f.corners.map(|v| v as usize));
+            out.push(flat_divergence(f.layout(), u));
+        }
+        Ok(out)
+    })?;
+    for (f, flux) in flat.iter().zip(parts.iter().flatten()) {
+        add(&f.corners, flux);
     }
     Ok(())
 }
@@ -1027,8 +1307,24 @@ fn divergence(corners: [[f32; 3]; 3], u: [f64; 3]) -> [f64; 3] {
     grad.map(|d| dot(d, x))
 }
 
+/// [`divergence`] of a triangle laid out flat.
+fn flat_divergence(layout: Layout, u: [f64; 3]) -> [f64; 3] {
+    let Layout { length, x, y } = layout;
+    let gx = (u[1] - u[0]) / length;
+    let gy = (u[2] - u[0] - gx * x) / y;
+    let len = hypot(gx, gy);
+    if !(len.is_finite() && len > 0.0) {
+        return [0.0; 3];
+    }
+    let (gx, gy) = (-0.5 * gx / len, -0.5 * gy / len);
+    let second = y * gx - x * gy;
+    let third = length * gy;
+    [-second - third, second, third]
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::intrinsic::Check;
     use super::*;
     use crate::grid::fail_allocations_after;
     use crate::test_util::{icosphere, mesh, terrain};
@@ -1093,6 +1389,14 @@ mod tests {
         mesh(&p, m.triangles())
     }
 
+    /// The solver of a mesh's own triangles, whatever they are like.
+    fn as_it_is(m: &Mesh, time_step_scale: f64) -> GeodesicHeatSolver {
+        let mut build = SolverBuild::new(m, time_step_scale).unwrap();
+        build.recut = false;
+        while build.step(m).unwrap().is_some() {}
+        build.finish()
+    }
+
     /// The heat of a component by a dense Cholesky solve, which is accurate
     /// at every vertex: all its sums are of positive terms.
     fn dense_heat(c: &Component, time_step: f64, sources: &[u32]) -> Vec<f64> {
@@ -1148,7 +1452,7 @@ mod tests {
             matrix: c.amg.fine(),
             mass: &c.mass,
             positions: &c.positions,
-            time_step: solver.time_step_scale * solver.mean_edge * solver.mean_edge,
+            time_step: solver.time_step_scale * solver.length * solver.length,
         };
         let mut d = Diffusion::new(c.vertices.len(), sources).unwrap();
         while d.step(&surface, 100).unwrap().is_some() {}
@@ -1172,8 +1476,8 @@ mod tests {
             ("flat cells", strip(60, 6, 0.1), 1.0),
             ("long strip", strip(150, 1, 1.0), 1.0),
         ] {
-            let solver = GeodesicHeatSolver::build(&m, scale).unwrap();
-            let t = scale * solver.mean_edge * solver.mean_edge;
+            let solver = as_it_is(&m, scale);
+            let t = scale * solver.length * solver.length;
             let n = solver.components[0].vertices.len() as u32;
             for sources in [vec![0], vec![n / 2], vec![0, n / 3, n - 1]] {
                 let (heat, passes) = diffuse(&solver, 0, &sources);
@@ -1247,7 +1551,7 @@ mod tests {
         }
         t.push([0, 0, 2]); // degenerate
         let m = mesh(&p, &t);
-        let solver = GeodesicHeatSolver::build(&m, 1.0).unwrap();
+        let solver = as_it_is(&m, 1.0);
         assert_eq!(solver.components.len(), 2);
         let mut seen = 0;
         for (k, c) in solver.components.iter().enumerate() {
@@ -1289,6 +1593,243 @@ mod tests {
         assert!(solver.byte_size() > 0);
     }
 
+    /// The triangulation the operators of `m` are assembled on, if it is not
+    /// the mesh's own, checked on the way.
+    fn recut(m: &Mesh) -> Option<(Check, f64)> {
+        let mut build = SolverBuild::new(m, 1.0).unwrap();
+        while build.step(m).unwrap().is_some() {
+            match &mut build.stage {
+                BuildStage::Flip { intrinsic, .. } => {
+                    intrinsic.check();
+                }
+                BuildStage::Refine(intrinsic) => {
+                    assert_eq!(intrinsic.check().negative, 0);
+                    while !intrinsic.refine().unwrap() {
+                        intrinsic.check();
+                    }
+                    return Some((intrinsic.check(), build.solver.length));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn area_of(m: &Mesh) -> f64 {
+        m.triangles()
+            .iter()
+            .map(|t| 0.5 * norm(triangle_normal(t.map(|v| m.positions()[v as usize]))))
+            .sum()
+    }
+
+    /// Pages that share one edge, each a stretched strip.
+    fn book(pages: u32) -> Mesh {
+        let mut p: Vec<[f32; 3]> = (0..=8).map(|k| [0.0, 0.0, k as f32 * 4.0]).collect();
+        let mut t = Vec::new();
+        for page in 0..pages {
+            let a = page as f32 / pages as f32 * std::f32::consts::TAU;
+            let base = p.len() as u32 - 9;
+            let at = |x: u32, z: u32| if x == 0 { z } else { base + 9 * x + z };
+            for x in 1..=6 {
+                for z in 0..=8 {
+                    let r = x as f32 * 0.3;
+                    let z = z as f32 * 4.0 + r * 5.0;
+                    p.push([a.cos() * r, a.sin() * r, z]);
+                }
+            }
+            for x in 0..6 {
+                for z in 0..8 {
+                    let (a, b, c, d) = (at(x, z), at(x + 1, z), at(x + 1, z + 1), at(x, z + 1));
+                    t.push([a, b, c]);
+                    t.push([a, c, d]);
+                }
+            }
+        }
+        mesh(&p, &t)
+    }
+
+    #[test]
+    fn a_good_triangulation_is_left_alone() {
+        let m = strip(60, 60, 1.0);
+        let p = m.positions().iter();
+        let p: Vec<_> = p.map(|v| [v[0] - 0.4 * v[1], v[1], v[2]]).collect();
+        let slanted = mesh(&p, m.triangles());
+        assert!(recut(&slanted).is_none());
+        // Rectangles are cut either way: rounding does not make a difference.
+        for x in [1.0, 0.7, 3.3] {
+            for shift in [0.0, 1000.0] {
+                let m = strip(90, 90, x);
+                let p: Vec<_> = m
+                    .positions()
+                    .iter()
+                    .map(|v| [v[0] * 0.1 + shift, v[1] * 0.1 - shift, v[2]])
+                    .collect();
+                assert!(recut(&mesh(&p, m.triangles())).is_none(), "{x} {shift}");
+            }
+        }
+        // The same operators, to the bit, as without looking.
+        let a = GeodesicHeatSolver::build(&slanted, 1.0).unwrap();
+        let b = as_it_is(&slanted, 1.0);
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let (a, b) = (&a.components[0].amg.fine(), &b.components[0].amg.fine());
+        assert_eq!(bits(&a.off.val), bits(&b.off.val));
+        assert_eq!(bits(&a.diag), bits(&b.diag));
+    }
+
+    #[test]
+    fn a_bad_triangulation_is_cut_again() {
+        // Across each other, in one mesh.
+        let two = |a: &Mesh, b: &Mesh| {
+            let mut p = a.positions().to_vec();
+            let mut t = a.triangles().to_vec();
+            let base = p.len() as u32;
+            p.extend(b.positions().iter().map(|v| [v[0] + 40.0, v[1], v[2]]));
+            t.extend(b.triangles().iter().map(|tri| tri.map(|v| v + base)));
+            mesh(&p, &t)
+        };
+        // Every other triangle the other way around.
+        let mixed = |m: &Mesh| {
+            let t = m.triangles().iter().enumerate();
+            let t: Vec<_> = t
+                .map(|(k, &[a, b, c])| if k % 2 == 0 { [a, b, c] } else { [a, c, b] })
+                .collect();
+            mesh(m.positions(), &t)
+        };
+        let sheared = |m: &Mesh| {
+            let p = m.positions().iter();
+            let p: Vec<_> = p.map(|v| [v[0] + 6.0 * v[1], v[1], v[2]]).collect();
+            mesh(&p, m.triangles())
+        };
+        for (name, m, kept, grows) in [
+            ("stretched", stretched(&icosphere(), 20.0), false, true),
+            (
+                "stretched further",
+                stretched(&icosphere(), 500.0),
+                false,
+                true,
+            ),
+            ("sheared", sheared(&strip(12, 12, 1.0)), true, true),
+            ("cylinder", fan_cylinder(64, 8, 2.0), false, true),
+            ("coarse cylinder", fan_cylinder(9, 1, 2.0), false, true),
+            ("cells", stretched(&strip(30, 30, 1.0), 9.0), true, true),
+            ("pages", book(3), true, true),
+            ("two pages", book(2), true, true),
+            ("many pages", book(11), true, true),
+            ("mixed", mixed(&stretched(&icosphere(), 5.0)), false, true),
+            (
+                "two parts",
+                two(&stretched(&icosphere(), 3.0), &fan_cylinder(20, 3, 1.0)),
+                false,
+                true,
+            ),
+        ] {
+            let (check, length) = recut(&m).expect(name);
+            let area = area_of(&m);
+            assert!(
+                (check.area - area).abs() < 1e-5 * area,
+                "{name}: {} of {area}",
+                check.area
+            );
+            assert_eq!(check.kept > 0, kept, "{name}: {check:?}");
+            assert_eq!(check.vertices > m.vertex_count(), grows, "{name}");
+            assert!(check.flat > 0, "{name}");
+            if !check.full {
+                assert_eq!(check.negative, 0, "{name}: {check:?}");
+                assert!(
+                    check.radius < 1.2 * length || kept,
+                    "{name}: {check:?}, {length}"
+                );
+            }
+            // The operators on it.
+            let solver = GeodesicHeatSolver::build(&m, 1.0).unwrap();
+            let mut total = 0.0;
+            for c in &solver.components {
+                total += c.area;
+                let mass: f64 = c.mass.iter().sum();
+                assert!((mass - c.area).abs() < 1e-9 * c.area, "{name}");
+                let l = c.amg.fine();
+                for i in 0..c.vertices.len() {
+                    for (j, v) in l.off.row(i) {
+                        assert!(v < 0.0 && j as usize != i, "{name}");
+                        let back = l.off.row(j as usize).find(|e| e.0 == i as u32);
+                        assert_eq!(back.map(|e| e.1.to_bits()), Some(v.to_bits()), "{name}");
+                    }
+                }
+                let known = c.vertices.iter().enumerate().filter(|(_, v)| **v != NONE);
+                for (local, &v) in known {
+                    assert_eq!(solver.local_of[v as usize], local as u32, "{name}");
+                    assert_eq!(c.positions[local], m.positions()[v as usize], "{name}");
+                }
+            }
+            assert!((total - area).abs() < 1e-5 * area, "{name}");
+            let known: usize = solver
+                .components
+                .iter()
+                .map(|c| c.vertices.iter().filter(|&&v| v != NONE).count())
+                .sum();
+            assert_eq!(known, m.vertex_count(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_part_grows_only_so_much() {
+        // A large plane among many small spheres: all it lacks is in the plane.
+        let s = icosphere();
+        let mut p: Vec<[f32; 3]> = vec![
+            [-1e4, -1e4, -9.0],
+            [1e4, -1e4, -9.0],
+            [1e4, 1e4, -9.0],
+            [-1e4, 1e4, -9.0],
+        ];
+        let mut t = vec![[0, 1, 2], [0, 2, 3]];
+        for k in 0..30 {
+            let base = p.len() as u32;
+            let x = k as f32 * 3.0;
+            p.extend(s.positions().iter().map(|v| [v[0] + x, v[1], v[2]]));
+            t.extend(s.triangles().iter().map(|tri| tri.map(|v| v + base)));
+        }
+        let m = mesh(&p, &t);
+        let (check, _) = recut(&m).unwrap();
+        assert!(check.full);
+        let most = 4.0 * RESOLUTION + 1.0;
+        assert!(check.vertices - m.vertex_count() < most as usize);
+    }
+
+    #[test]
+    fn running_out_of_memory_while_cutting_is_an_error() {
+        let parts = [
+            stretched(&icosphere(), 6.0),
+            strip(9, 4, 8.0),
+            fan_cylinder(24, 2, 1.0),
+            book(3),
+        ];
+        for m in &parts {
+            let mut at = 0;
+            loop {
+                let mut build = SolverBuild::new(m, 1.0).unwrap();
+                while !matches!(build.stage, BuildStage::Survey(_)) {
+                    build.step(m).unwrap();
+                }
+                fail_allocations_after(Some(at));
+                let done = loop {
+                    if let Err(e) = build.step(m) {
+                        break Err(e);
+                    }
+                    if matches!(build.stage, BuildStage::Assemble { survey: None, .. }) {
+                        break Ok(());
+                    }
+                };
+                fail_allocations_after(None);
+                match done {
+                    Ok(()) => break,
+                    Err(e) => assert_eq!(e, FieldsError::OutOfMemory),
+                }
+                at += 1;
+            }
+            assert!(at > 40, "only {at} allocations");
+        }
+    }
+
     #[test]
     fn running_out_of_memory_anywhere_is_an_error() {
         // Large enough for multigrid levels, and in two parts.
@@ -1299,15 +1840,21 @@ mod tests {
         p.extend(b.positions().iter().map(|v| [v[0] + 100.0, v[1], v[2]]));
         t.extend(b.triangles().iter().map(|tri| tri.map(|v| v + base)));
         let m = mesh(&p, &t);
+        // (Not cut again, which has a test of its own: it would be much larger.)
+        let build = || {
+            let mut build = SolverBuild::new(&m, 1.0)?;
+            build.recut = false;
+            while build.step(&m)?.is_some() {}
+            Ok::<_, FieldsError>(build.finish())
+        };
         let mut want = Vec::new();
-        let solver = GeodesicHeatSolver::build(&m, 1.0).unwrap();
-        solver.solve(&[0, base], None, &mut want).unwrap();
+        build().unwrap().solve(&[0, base], None, &mut want).unwrap();
 
         let mut at = 0;
         loop {
             let mut out = vec![7.5f32];
             fail_allocations_after(Some(at));
-            let built = GeodesicHeatSolver::build(&m, 1.0);
+            let built = build();
             let solved = match &built {
                 Ok(s) => s.solve(&[0, base], None, &mut out),
                 Err(e) => Err(e.clone()),

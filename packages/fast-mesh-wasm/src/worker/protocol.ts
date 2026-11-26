@@ -7,6 +7,7 @@ import type { Range } from "../changes.js";
 import type { DelaunayFlipOptions, DenoiseOptions } from "../denoise.js";
 import type { ExtrudeBaseOptions, ExtrudeFacesOptions } from "../extrude.js";
 import type { CheckedHeightfield, CheckedHeightfieldPlacement, HeightMap, HeightMapFrame } from "../height-map.js";
+import type { EntryEvent, PermanentStep } from "../history.js";
 import type { EncodedPrimitive, PrimitiveMesh } from "../primitives.js";
 import type { LatticeOptions, LatticePlan, LatticePreview } from "../lattice.js";
 import type { WrapOptions, WrapPlan } from "../wrap.js";
@@ -78,6 +79,9 @@ export type PlaceMeshReportWire = Omit<PlaceMeshReport, "added"> & { added: Clie
 
 /** A mesh, field or section id allocated on the main side. Unique per kind. */
 export type ClientId = number;
+
+/** A {@link PermanentStep} naming its meshes by client id. */
+export type PermanentStepWire = Omit<PermanentStep, "meshes" | "gone"> & { meshes: ClientId[]; gone: ClientId[] };
 
 /** A {@link ColorRule} naming its field by client id. */
 export type ColorRuleWire = Omit<ColorRule, "field"> & { field: ClientId };
@@ -194,6 +198,13 @@ export type Request =
   | { kind: "undo" | "redo"; rev: number; key?: string }
   /** Drops every undo and redo step (the end of a `restart()` replay). */
   | { kind: "clearHistory"; rev: number; key?: string }
+  /**
+   * `Scene.recordEntry`: the main side keeps the entry under `id`, and hears
+   * what becomes of it through `Result.entries`.
+   */
+  | { kind: "entry"; rev: number; id: number; bytes: number; coalesce?: string }
+  /** `Scene.setHistoryBudget`, with a checked budget. */
+  | { kind: "historyBudget"; rev: number; bytes: number; key?: string }
   /** Opens, closes, or cancels a history step matching `Scene.beginStep`/`endStep`/`cancelStep`. */
   | { kind: "step"; rev: number; phase: "begin" | "end" | "cancel" }
   | {
@@ -341,7 +352,16 @@ export type Request =
   | { kind: "moveWithCollision"; rev: number; id: ClientId; placement: PlacementInput; isRelease: boolean; qid: number }
   | { kind: "commitCollisionInteraction"; rev: number; id: ClientId; qid: number }
   | { kind: "alignToFittedPrimitive"; rev: number; id: ClientId; primitive: FittedPrimitive; targetAxis: Vec3; targetOrigin: Vec3; qid: number }
-  | { kind: "reconstructPointCloud"; rev: number; addedId: ClientId; cloud: Float32Array; options: SurfaceReconstructOptions; qid: number }
+  /** `Scene.reconstructPointCloud` of a cloud's buffer, around its `origin` if it has one. */
+  | {
+      kind: "reconstructPointCloud";
+      rev: number;
+      addedId: ClientId;
+      cloud: Float32Array;
+      origin?: Vec3;
+      options: SurfaceReconstructOptions;
+      qid: number;
+    }
   /** `Scene.addHeightfield` of heights that are transferred; replies with the relief's counts. */
   | { kind: "addHeightfield"; rev: number; addedId: ClientId; field: CheckedHeightfield; placement: CheckedHeightfieldPlacement; qid: number }
   /** `Scene.convexHull`; replies with the hull's counts. */
@@ -440,6 +460,7 @@ export interface QueryMap {
   };
   /** A relief, generated in the Worker (no scene state); its buffers are transferred. */
   generateHeightfield: { args: CheckedHeightfield; value: PrimitiveMesh };
+  removalBytes: { args: { mesh: ClientId }; value: number };
   latticePlan: { args: { mesh: ClientId; options: LatticeOptions }; value: LatticePlan };
   /** `Scene.latticePreview`; its buffers are transferred. */
   latticePreview: { args: { mesh: ClientId; options: LatticeOptions }; value: LatticePreview };
@@ -534,6 +555,19 @@ export interface Result {
    */
   sections: { section: ClientId; mesh: ClientId; result: SectionResultWire | null }[];
   history: { canUndo: boolean; canRedo: boolean };
+  /** The bytes the history holds. Omitted by poisoned results. */
+  historyBytes?: number;
+  /**
+   * What happened to the application's entries in this batch, in order: each
+   * was undone, redone or dropped, by the request of revision `rev`. Omitted
+   * when there is none.
+   */
+  entries?: { id: number; what: EntryEvent; rev: number }[];
+  /**
+   * The steps of this batch the history could not keep (`Scene.onPermanent`),
+   * in order. Omitted when there is none.
+   */
+  permanent?: PermanentStepWire[];
   /**
    * Where each mesh that an undoable add or removal, or its undo or redo,
    * moved in this batch now is: in the scene (`"live"`), out of it but kept
@@ -587,6 +621,8 @@ export interface InitMessage {
   crashChannel?: string;
   /** `WorkerSceneOptions.backgroundAddTriangles`, when set. */
   backgroundAddTriangles?: number;
+  /** The history budget, when it is not the default. */
+  historyBudget?: number;
 }
 
 /**
@@ -691,6 +727,7 @@ export function keyOf(req: Request): string | undefined {
     case "undo":
     case "redo":
     case "clearHistory":
+    case "historyBudget":
       return "history";
     case "field":
       return `field:${req.field}`;

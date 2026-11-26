@@ -8,7 +8,7 @@
 //! The default scale `[1, 1, 1]` is the rigid placement the scene used
 //! before scales existed; every snapshot and default keeps working.
 
-use fast_mesh_query::{QueryError, Rigid};
+use fast_mesh_query::{Plane, QueryError, Rigid};
 
 use crate::{Result, SceneError};
 
@@ -92,7 +92,10 @@ impl Placement {
     }
 
     /// Maps a world point back to the mesh: `(scale⁻¹ * rotationᵀ) * (q -
-    /// translation)`.
+    /// translation)`. Like the points [`Placement::apply`] takes, the result
+    /// has the mesh's origin in it: stored positions do not, and
+    /// [`Scene::world_to_local`](crate::Scene::world_to_local) gives the point
+    /// in their coordinates.
     pub fn inverse_apply(&self, q: [f64; 3]) -> [f64; 3] {
         let t = &self.translation;
         let d = [q[0] - t[0], q[1] - t[1], q[2] - t[2]];
@@ -166,6 +169,23 @@ pub(crate) fn local_to_world(p: &Placement, origin: [f64; 3], local: [f64; 3]) -
 pub(crate) fn world_to_local(p: &Placement, origin: [f64; 3], q: [f64; 3]) -> [f64; 3] {
     let w = p.inverse_apply(q);
     [w[0] - origin[0], w[1] - origin[1], w[2] - origin[2]]
+}
+
+/// A world plane in a mesh's stored local coordinates (its origin taken
+/// off). The axes are the world `(u, v)` mapped through the placement's linear
+/// inverse (`S⁻¹ Rᵀ`), which takes the plane to the plane, then
+/// re-orthonormalised: a placement's rotation is only orthonormal within
+/// `1e-6`, and a non-uniform scale skews the frame. So the local plane's zero
+/// set is the preimage of the world's, with matching sides. (Mapped as normals
+/// are, by `S Rᵀ`, the axes would span another plane under a non-uniform
+/// scale.)
+pub(crate) fn plane_to_local(p: &Placement, origin: [f64; 3], plane: &Plane) -> Result<Plane> {
+    let at = world_to_local(p, origin, plane.origin());
+    let u = unit(p.inverse_direction(plane.u()));
+    let v = p.inverse_direction(plane.v());
+    let d = dot(v, u);
+    let v = unit(std::array::from_fn(|k| v[k] - d * u[k]));
+    Ok(Plane::with_axes(at, u, v)?)
 }
 
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {

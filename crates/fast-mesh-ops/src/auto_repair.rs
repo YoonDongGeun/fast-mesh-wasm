@@ -574,6 +574,7 @@ mod tests {
                         min_triangles: Some(o.min_triangles),
                         keep_largest: true,
                         min_area: None,
+                        keep_cavities: true,
                     },
                 )?,
                 fill: crate::fill_holes(

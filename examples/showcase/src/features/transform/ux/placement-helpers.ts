@@ -3,12 +3,16 @@
 // Apply transform bakes the placement into the vertices: it sets the
 // identity placement and then writes the world positions the old one put
 // the vertices at (an edit's positions are world positions), both inside one
-// history step, so one undo puts the placement and the vertices back.
+// history step, so one undo puts the placement and the vertices back. Where
+// the mesh is too far from its origin for that, a translation stays.
 import type { MeshHandle, PlacementInput, SceneLike, Vec3 } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
+import { meshOrigin } from "../../../shared/ux/mesh-center";
 import {
   bakedPositions,
   isIdentityPlacement,
+  isTranslation,
+  keptTranslation,
   type PlacedMesh,
   samePlacement,
   triangleNormal,
@@ -51,6 +55,10 @@ export function placeMesh(
  * Apply transform: the placement becomes the identity and the vertices keep
  * their world positions, as one undo step. Resolves `false` when the
  * placement already is the identity.
+ *
+ * A mesh further than 1024 times its size from its origin, which is for good,
+ * keeps a translation: without it the `f32` positions would lose the shape
+ * (0.008 at 1e5). Resolves `false` when it already has no other placement.
  */
 export async function applyTransform(store: SceneStore, mesh: MeshHandle): Promise<boolean> {
   const placed = readPlacedMesh(store.scene, mesh);
@@ -58,9 +66,13 @@ export async function applyTransform(store: SceneStore, mesh: MeshHandle): Promi
     return false;
   }
   const { vertices, positions } = bakedPositions(placed);
+  const translation = keptTranslation(positions, meshOrigin(store.scene, mesh));
+  if (translation.some((c) => c !== 0) && isTranslation(placed.placement)) {
+    return false;
+  }
   store.beginStep();
   try {
-    store.setPlacement(mesh, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0, 0, 0] });
+    store.setPlacement(mesh, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation });
     if (vertices.length > 0) {
       // Under the identity placement these world positions are the new local ones.
       await store.edit(mesh, [{ op: "setPositions", vertices, positions }]);

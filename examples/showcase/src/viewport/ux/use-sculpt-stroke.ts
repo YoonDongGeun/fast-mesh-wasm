@@ -567,6 +567,7 @@ export function useSculptStroke(params: {
       const fov = camera instanceof THREE.PerspectiveCamera ? camera.fov : 45;
       const e = camera.matrixWorld.elements;
       const q = binding.object.getWorldQuaternion(new THREE.Quaternion()).invert();
+      const scale = binding.object.getWorldScale(new THREE.Vector3());
       dirRef.current = grabLocalDelta(
         x - from.x,
         y - from.y,
@@ -574,6 +575,7 @@ export function useSculptStroke(params: {
         [e[0], e[1], e[2]],
         [e[4], e[5], e[6]],
         [q.x, q.y, q.z, q.w],
+        [scale.x, scale.y, scale.z],
       );
     };
 

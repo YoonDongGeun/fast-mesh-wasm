@@ -34,7 +34,7 @@ function analysis(patch: Partial<Analysis>): Analysis {
     nonManifoldEdgeList: [],
     nonManifoldVertices: new Uint32Array(),
     pinchVertices: new Uint32Array(),
-    components: [{ triangles: new Uint32Array(12), area: 6, closed: true }],
+    components: [{ triangles: new Uint32Array(12), area: 6, closed: true, cavity: false }],
     orientationConflicts: 0,
     selfIntersects: null,
     ...patch,
@@ -50,10 +50,11 @@ const loop = (vertices: number[], perimeter: number, closed = true) => ({
   clean: true,
 });
 
-const component = (triangles: number[], closed = true) => ({
+const component = (triangles: number[], closed = true, cavity = false) => ({
   triangles: Uint32Array.from(triangles),
   area: triangles.length,
   closed,
+  cavity,
 });
 
 /** A unit square in z=0: corners 0..3. */
@@ -134,6 +135,15 @@ describe("smallComponentTris", () => {
 
   it("ties_keep_the_first_largest", () => {
     expect(smallComponentTris([component([0]), component([1])]).length).toBe(1);
+  });
+
+  it("cavities_are_not_small_components", () => {
+    const hollow = [component([0, 1, 2, 3]), component([4, 5], true, true)];
+    expect(smallComponentTris(hollow).length).toBe(0);
+    expect(Array.from(smallComponentTris([...hollow, component([6])]))).toEqual([6]);
+    // Nor is a cavity with more triangles than its solid the largest part.
+    const fine = [component([0]), component([1, 2, 3], true, true), component([4, 5])];
+    expect(Array.from(smallComponentTris(fine))).toEqual([0]);
   });
 
   it("one_component_highlights_nothing", () => {

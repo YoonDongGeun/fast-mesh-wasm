@@ -16,7 +16,7 @@ import type {
   PlaceUpAxis,
   SoftDeformSolver,
 } from "fast-mesh-wasm";
-import { DEFAULT_TEXT_PARAMS, type TextParams } from "../../features/mesh-edit/ux/text-mesh";
+import { DEFAULT_TEXT_PARAMS, type TextParams } from "../../features/mesh-edit/ux/text-params";
 
 export interface Wave6SelectState {
   activeTool: null | "lasso" | "box" | "brush" | "crease" | "shell";

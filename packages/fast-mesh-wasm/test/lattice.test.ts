@@ -186,6 +186,13 @@ describe("lattice infill on Scene & WorkerScene", () => {
     expect((await s.measure(id)).volume).toBeCloseTo(r.solidVolume, 3);
     expect(r.solidVolume).toBeGreaterThan(8 - 1.6 ** 3);
     await checkClean(s, id);
+    // One solid with voids: no repair takes them for loose parts.
+    const parts = (await s.analyze(id)).components;
+    expect(parts.length).toBeGreaterThan(1);
+    expect(parts.map((c) => c.cavity)).toEqual(parts.map((_, k) => k > 0));
+    expect((await s.repair.orient(id)).flippedTriangles).toBe(0);
+    await settle(s);
+    expect(liveTriangles(s, id)).toBe(12 + r.triangles);
     s.undo();
     await settle(s);
 
